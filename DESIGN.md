@@ -1,183 +1,321 @@
 # FocusStage 架构设计文档
 
-## 1. 设计目标与问题根源
-
-### 1.1 我们真正想解决什么问题
-在桌面 AI Agent 协作场景下，理想的人机共处体验是：
-1. **平时无感使用**：软件以独立原生窗口形态摆在你的日常桌面上，大小、位置、任务栏排队与普通程序一致，文件直接读写真实工作目录。
-2. **随时收入后台独立操作**：当你把某个窗口「收入后台」交给 AI 时，它在后台保持全速渲染，AI 拥有**该窗口专属的虚拟鼠标、键盘、焦点与剪贴板**；你的物理鼠标、当前正在打字的窗口和宿主剪贴板**零干扰**。
-3. **多窗口真并发**：可以同时把窗口 A 交给 AI 1、窗口 B 交给 AI 2，同时自己在主桌面操作窗口 C，三者互不抢焦点。
-4. **随时释放与恢复**：任务完成（或用户主动点接管）后，窗口按收入前的桌面坐标、尺寸原地恢复，画面与登录态 100% 连续，不需要重连、同步或二次回放动作。
-
-### 1.2 为什么选择「Win11 宿主壳 + WSL2 自研 Wayland 合成器」
-- **放弃纯 Win32 消息/UIA 劫持**：现代浏览器（Chrome/Electron）与自绘客户端不理会后台 `PostMessage`，UIA 覆盖面不足，DLL 注入 Hook 极易触发反注入风控或崩溃。
-- **放弃重型 Windows 虚拟机底座**：同一个 Windows 会话内部依然是全局单焦点（人机不能并发），且跨界文件、内存占用和桌面套娃体验很重。
-- **选择 WSL2 Wayland Multi-Seat 合成器**：
-  - Linux 显示架构（Wayland）天然把“窗口合成”与“内核驱动”解耦；
-  - 合成器是用户态程序，可由我们完全掌控：**一套内核驱动之上，同时挂载一个绑定真实交互的物理/宿主 Seat，以及 N 个分别绑定单窗口的虚拟 AI Seat**；
-  - 跑在 Win11 的 WSL2 内时，由 Win11 外层接管电源、休眠、Wi-Fi、双显卡调度与偶尔需要的 Windows 原生软件；核心代码本身不绑定 Windows，未来可直接切换到 Linux DRM/KMS 后端独立开机运行。
-
-> **为什么不直接用 WSLg？**  
-> WSLg 本质上只是在 WSL2 里跑了一个面向整个 Linux 桌面的单焦点 Weston/RDP 合成器，它本身依然把所有 WSL 窗口塞进同一套鼠标/焦点中，无法实现“按窗口分配独立虚拟 Seat + 离屏渲染托管 + 一键从桌面收进/放回”。因此需要自研一个**轻量专用的 Wayland 合成器**取代 WSLg 的窗口管理职责（仅在 WSL2 内监听独立 `WAYLAND_DISPLAY` Socket）。
+> 本文档描述 FocusStage 的目标、核心模型、模块划分、AI 控制接口与分阶段路线。
+> 标注 **【待验证】** 的结论尚未经过实测，由对应里程碑负责证实或推翻。
 
 ---
 
-## 2. 核心生命周期：单窗三态模型
+## 1. 目标与问题根源
 
-FocusStage 对每一个纳入管理的顶层应用窗口分配全局唯一 `window_id`，它在任意时刻处于以下三种状态之一：
+### 1.1 要解决的问题
 
-```text
-                 [1] 用户点击「收入窗口 / 交给 AI」
-  ┌───────────────────┐ ─────────────────────────────► ┌──────────────────────────┐
-  │  HumanAttached    │                                │        AiStaged          │
-  │ （Win11 桌面使用）│ ◄───────────────────────────── │（后台离屏 + 独立 Seat 操作）│
-  └───────────────────┘   [2] AI 完成 / 用户点「接管」 └──────────────────────────┘
-          │                                                       │
-          └──────────────► (共享同一个活着的 Wayland Surface) ◄───┘
-```
+传统桌面系统只有**一个全局鼠标、一个前台焦点、一个剪贴板**。AI Agent 想操作某个窗口，就必须抢走用户的鼠标和焦点——人和 AI 只能轮流用电脑。
 
-### 状态 A：`HumanAttached`（真机桌面使用态）
-- **Win11 侧**：`FocusStage.Host` 为该 `window_id` 创建一个原生无边框（带极简顶栏条）的宿主窗口，保留收入前的坐标 `(x, y, width, height)`，占独立任务栏项。
-- **合成器侧**：将该窗口绑定到 **Human Seat（`seat_human`）**；Win11 宿主壳捕获的鼠标移动、点击、滚轮、键盘和拖拽事件经由轻量 IPC 实时注入 `seat_human`，合成器将窗口画面帧回传给宿主壳渲染。
+FocusStage 要实现的体验：
 
-### 状态 B：`AiStaged`（收入后台独立操作态）
-- **Win11 侧**：
-  - 原先占屏幕的大窗口立即隐藏（仅隐藏壳窗体，保留原坐标快照 `SavedRect`）；
-  - 可选地收入统一的「AI 后台工作台 / 只读围观画中画小窗」中供用户随时余光观察进度（默认禁止宿主鼠键误触透传）。
-- **合成器侧**：
-  - **关键机制（离屏持续渲染）**：合成器**绝对不向目标应用发送“最小化 / 失焦 / 不可见”通知**，而是将该窗口的 Surface 挂入离屏舞台（Offscreen Stage），维持正常 `wl_surface.frame` 回调驱动（如 30~60fps 按需节拍），欺骗应用认为自己仍处于完整激活显示状态；
-  - 为该窗口解绑 `seat_human`，绑定专属的 **虚拟 AI Seat（`seat_ai_<window_id>`）**，并向该窗口发送激活态（`activated`），使其内部输入框、悬停态、弹出菜单正常工作；
-  - 所有 AI 视觉截屏与输入动作仅作用于该 `window_id` 及其对应的 `seat_ai_<window_id>`。
+1. **平时无感使用**：软件以普通窗口的形态出现在 Win11 桌面上，文件直接读写真实工作目录。
+2. **随时交给 AI**：一键把某个窗口「收入后台」，它在后台继续正常运行，AI 独立操作它；用户的鼠标、正在打字的窗口和剪贴板**不受任何影响**。
+3. **多窗口真并发**：AI 1 操作窗口 A、AI 2 操作窗口 B、用户自己操作窗口 C，三者互不抢焦点。
+4. **随时收回**：AI 做完或用户按下接管热键，窗口回到原来的位置和大小，画面与登录态完全连续。
 
-### 状态 C：释放并恢复（`AiStaged` → `HumanAttached`）
-- **触发方式**：
-  1. AI 任务正常结束并调用 `release_window(window_id)`；
-  2. 用户在围观小窗随时点击 **「接管 / 释放恢复」**（支持触发硬中断信号，立刻冻结该窗口的 AI Seat 写入权，防止人机抢最后一帧点击）。
-- **切换动作**：
-  - 合成器立即断开或静默 `seat_ai_<window_id>`，重新激活 `seat_human` 并把最新画面帧推给 Win11 宿主壳；
-  - `FocusStage.Host` 按照 `SavedRect` 在桌面原位置、原大小瞬间弹出窗口，用户从 AI 停下的那一刻无缝接手。
+### 1.2 为什么是「WSL2 + 自研 Wayland 合成器」
 
----
-
-## 3. 总体架构与四大模块
-
-```text
-┌────────────────────────────────────────────────────────────────────────────┐
-│ Windows 11 宿主机                                                           │
-│                                                                            │
-│  ┌─────────────────────────┐    ┌───────────────────────────────────────┐  │
-│  │ FocusStage.Host (.NET 8)│    │ AI Agent (Claude / Cursor / 本地脚本) │  │
-│  │ - 一窗一壳原生窗口管理  │    └───────────────────┬───────────────────┘  │
-│  │ - 只读围观小窗/接管按钮 │                        │ MCP (stdio / SSE)    │
-│  │ - 宿主鼠键/拖放/IME转发 │                        ▼                      │
-│  └────────────┬────────────┘    ┌───────────────────────────────────────┐  │
-│               │                 │ FocusStage MCP Server (窗口级控制面)   │  │
-│               │                 └───────────────────┬───────────────────┘  │
-└───────────────┼─────────────────────────────────────┼──────────────────────┘
-                │ 本地高速通信 (Unix Socket / Loopback TCP / 共享内存映射)
-┌───────────────┼─────────────────────────────────────┼──────────────────────┐
-│ WSL2 (Ubuntu) │                                     │                      │
-│               ▼                                     ▼                      │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │ FocusStage Compositor (Rust / Smithay Wayland + XWayland)            │  │
-│  │                                                                      │  │
-│  │  • Window Registry (window_id 映射 TopLevel / Popup / SavedRect)     │  │
-│  │  • Seat Manager    (seat_human + 每窗口独立 seat_ai_<id>)             │  │
-│  │  • Offscreen Stage (无头渲染器，持续驱动 frame callback & 抓帧)       │  │
-│  │  • Clipboard Vault (AI 操作期间按 Seat 隔离剪贴板，不污染宿主)        │  │
-│  └──────────────────────────┬───────────────────────────┬───────────────┘  │
-│                             │ WAYLAND_DISPLAY=focus-0   │                  │
-│                             ▼                           ▼                  │
-│              [ Chromium / Web 应用 ]     [ 飞书 / 微信 / VS Code / 工具 ]   │
-│                                                                            │
-│  文件系统直通：/mnt/c/Users/HP/Desktop, Downloads, WorkBuddy ... (同一份文件) │
-└────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 模块一：WSL2 Wayland Multi-Seat 合成器（`compositor/`）
-- **推荐技术栈**：Rust + [`Smithay`](https://github.com/Smithay/smithay)（相比 C `wlroots`，Rust 类型安全且在动态创建/销毁 `Seat`、无头离屏渲染 `Renderer` 和多线程异步控制面通信上更易维护）。
-- **核心职责**：
-  1. **协议监听**：在 WSL2 内创建独立 Wayland Socket（例如 `WAYLAND_DISPLAY=focusstage-0`）及配套 `XWayland`（兼容 Electron / 旧版 X11 软件）。
-  2. **按窗口多 Seat 隔离**：
-     - 维护 `seat_human`（供所有处于 `HumanAttached` 状态的窗口共享）以及按窗口按需分配的 `seat_ai_<id>`；
-     - 注入点击/滚轮/键盘时，直接向目标窗口对应的 `seat_ai_<id>` 发送 `pointer_motion`、`button`、`key`、`axis` 事件，并确保 `wl_keyboard.enter` / `wl_pointer.enter` 只投递给该 `window_id` 及其子弹窗（Popup/Menu）。
-  3. **离屏帧合成（包含主窗 + 悬浮弹窗）**：
-     - 浏览器右键菜单、下拉列表在 Wayland 中往往是独立 `xdg_popup` 或子 Surface。合成器需要把主窗口与它的所有关联 `xdg_popup` 合成为一张以主窗口为原点的完整画布帧，这样 AI 截图和宿主壳显示都不会丢失右键菜单和下拉框。
-  4. **独立剪贴板与选区（Data Device Isolation）**：
-     - 在 Wayland 中剪贴板归属于 `wl_seat`（`wl_data_device`）。每个 `seat_ai_<id>` 天然拥有自己的剪贴板状态，AI 在窗口 A 里 Ctrl+C/V 完全不会覆盖宿主 Win11 剪贴板，也不会串到窗口 B。
-
-### 模块二：Win11 原生宿主壳（`host/`）
-- **推荐技术栈**：`.NET 8` + `WPF / Win32 P/Invoke`（本机已安装 `.NET 8.0.428`）。
-- **核心职责**：
-  1. **一窗一壳**：收到合成器上报的新顶层窗口事件后，在 Win11 创建独立窗口壳（可配置窄控制条：显示标题、图标、**「收入后台交给 AI」**按钮）。
-  2. **高效画面呈现**：使用 `WriteableBitmap` / D3DImage 或 SwapChain 渲染合成器推送的窗口增量帧（MVP 阶段可先走本地共享内存 / Loopback 原始 BGRA 帧或快速 PNG/LZ4 块，仅对有变化且正在显示/围观的窗口推帧）。
-  3. **AI 围观面板**：所有处于 `AiStaged` 状态的窗口汇总在宿主壳的「后台队列抽屉 / 只读画中画窗」中，显示实时缩略图与 AI 动作状态，并提供一键 **「释放并恢复到桌面」** 按钮。
-  4. **窗口定位与尺寸同步**：当用户拖拽缩放 Win11 壳窗口时，发回 `configure(width, height)` 给合成器通知目标程序重排布局（响应式重绘，而非简单图像拉伸）。
-
-### 模块三：跨界体验桥（`bridge/`）
-补齐“感觉就是真机窗口”的最后 10% 细节：
-1. **文件共享与拖放**：
-   - 引导 WSL 侧应用默认工作目录指向 `/mnt/c/Users/HP/Desktop`、`/mnt/c/Users/HP/Downloads` 等真机路径（或配置 XDG User Dirs 直接映射到 Win11 用户目录）。
-   - 当用户把文件从 Win11 资源管理器拖到壳窗口上时，宿主壳将 Windows 路径 `C:\...` 转换为 WSL 路径 `/mnt/c/...`，通过 Wayland `wl_data_device` 模拟拖放事件投递给目标窗口。
-2. **输入法（IME）策略**：
-   - **Phase 1（稳妥方案）**：在 WSL2 内启用 `Fcitx5`（挂载 `zwp_text_input_v3` / `input_method_v2`），由合成器把输入法候选窗口作为目标窗口的子图层一起合成输出——候选框永远精准跟随光标，且不与 Win11 输入法冲突。
-   - **Phase 3（可选体验增强）**：支持从 Win11 宿主壳捕获中文 IME 组合结果（`WM_IME_COMPOSITION`）直发 `text_input_v3` preedit/commit，实现外层单一输入法体验。
-3. **链接打开与文件关联（可选）**：
-   - WSL 侧应用点击外部链接或“在文件夹中显示”时，按策略路由给 WSL 托管浏览器或回调 Win11 原生程序。
-
-### 模块四：AI 窗口级控制面与 MCP 服务（`mcp/`）
-面向外部 AI Agent 提供简洁、确定的工具集（以 `window_id` 为一等公民，彻底摆脱全屏坐标和焦点抢占）：
-- `stage_list_windows()` — 列出当前所有窗口及状态（`HumanAttached` / `AiStaged`）、标题、尺寸与可用状态。
-- `stage_acquire(window_id)` — 请求将指定窗口收入后台（或仅操作已由用户主动收入 `AiStaged` 的窗口；支持权限策略开关）。
-- `stage_observe(window_id)` — 获取该窗口最新一帧画面（可选叠加轻量坐标网格 / MarkScreen 式标注），即使它不在桌面显示也能满帧抓图。
-- `stage_act(window_id, actions)` — 向 `seat_ai_<window_id>` 注入原子鼠键动作序列（点击、移动、拖拽、滚轮、键入文本、快捷键）；若期间窗口已被用户手动「接管释放」，立即返回中断状态并中止后续动作。
-- `stage_release(window_id)` — 操作完成，将窗口释放并恢复至用户 Win11 桌面原位。
-
----
-
-## 4. 与现有 MarkScreen 的关系
-
-- **设计理念继承**：沿用 [MarkScreen](C:/Users/HP/WorkBuddy/MarkScreen) 的视觉定位与“人随时可打断接管”原则，但把执行载体从“全局物理桌面的单钩子模式”升级为“**单窗口独立 Seat 的合成器隔离模式**”。
-- **互不阻塞**：MarkScreen 依然可留在 Win11 外层，处理极少数无法在 Linux 运行的原生 Windows 软件；FocusStage 作为新一代通用窗口容器，承载浏览器与跨平台客户端的后台并发操作。
-
----
-
-## 5. 分阶段实施路线（严格按最小可验证增量推进）
-
-### Phase 0：WSL2 合成器工具链验证（1~2 天）
-- 目标：在 WSL2 `Ubuntu 26.04.1 LTS` 中安装 Rust 工具链与 `Smithay` 编译依赖（`libwayland-dev`, `libxkbcommon-dev`, `libgbm-dev`, `libinput-dev` 等）。
-- 验收：编写一个极简无头 Wayland 合成器进程，能以 `WAYLAND_DISPLAY=focus-test` 启动一个标准 Linux GUI 程序（如 `foot` 终端或 `chromium`），并在后台完成离屏渲染抓出首张 PNG 截图。
-
-### Phase 1：单窗口「显示 ↔ 收入 ↔ 独立操作 ↔ 释放」最小闭环
-- 目标：打通单窗口完整三态。
-- 范围：
-  - WSL2 合成器支持 1 个窗口、`seat_human` 与 `seat_ai` 切换、离屏持续渲染及帧回传（Socket）；
-  - Win11 `.NET 8` 极简宿主壳显示该窗口并转发鼠键；
-  - 宿主壳提供「收入后台并运行测试脚本（AI Seat 自动点击/输入）」按钮和「释放恢复」按钮。
-- 验收：用户在壳里打字后点「收入后台」，壳窗消失变为角落小预览窗；后台脚本通过 `seat_ai` 在窗口内自动点击输入，期间用户在 Win11 记事本正常打字**零丢焦点、零鼠标抖动**；点「释放恢复」，窗口在 Win11 原位弹出且保留全部新内容。
-
-### Phase 2：多窗口并发隔离与 MCP 接入
-- 目标：支持同时托管 2 个以上窗口并发执行，并暴露标准 MCP 工具供 AI 直接调度。
-- 范围：
-  - 动态窗口注册与弹窗（`xdg_popup`）合成；
-  - 多 `seat_ai_<id>` 与独立剪贴板验证；
-  - 实现 `mcp/` 网关，验证 AI 同时独立操作后台浏览器窗口 A 与编辑器窗口 B。
-
-### Phase 3：跨界日常手感打磨
-- 目标：让日常使用接近 Win11 原生窗口体验。
-- 范围：XWayland 兼容（覆盖 Electron/Chrome 稳定运行）、Win11 → WSL 文件拖放转换、中文输入法（`Fcitx5` 或宿主 IME 桥接）、DPI 高分屏缩放与动态 resize 同步。
-
-### Phase 4：远期独立化（可选）
-- 目标：在物理 Linux 主机/专用设备直接启动。
-- 范围：为 `compositor/` 增加 DRM/KMS + `libinput` 后端，不再依赖 Win11 宿主壳，直接接管物理显示器与物理键鼠，演进为独立开机的 AI-Native 操作系统桌面。
-
----
-
-## 6. 已确认的关键技术风险与应对策略
-
-| 风险点 | 原因 | 应对策略 |
+| 路线 | 结论 | 原因 |
 | :--- | :--- | :--- |
-| **弹出菜单 / 下拉框丢失或坐标错位** | Chrome/GTK 的右键菜单是独立 `xdg_popup`，默认相对父窗口偏移 | 合成器按主窗口 `Surface` 树汇总边界，将激活中的子 `popup` 一并合成为单张窗口画布并同步边界扩展 |
-| **应用在离屏后降帧或暂停动画** | 部分应用检测不到 `wl_surface.frame` 回调或收到失焦后会节能休眠 | 合成器在 `AiStaged` 态持续按固定节拍（如 30Hz）触发 `frame_callback`，并始终对托管窗保持 `activated` 状态 |
-| **Win11 ↔ WSL2 传帧延迟或带宽过高** | 无脑全屏 60fps 传未压缩像素开销大 | 按窗口脏区（Damage Region）增量推帧；仅对处于 `HumanAttached` 或正在被用户围观/AI 观察的窗口保持活跃推帧 |
-| **Electron / Chrome 走 X11 还是 Wayland** | 部分旧版 Linux 客户端默认走 X11，不设参数不连 Wayland | 默认开启 `--ozone-platform=wayland` 启动现代 Chromium/Electron，并保留 `XWayland` 兜底兼容纯 X11 程序 |
+| Win32 消息 / UIA / DLL 注入 | 放弃 | Chrome/Electron/自绘客户端不理会后台 `PostMessage`，UIA 覆盖不全，注入易触发风控或崩溃 |
+| Windows 虚拟机 | 放弃 | VM 内部依然是单焦点，多个窗口不能并发；镜像与内存开销重 |
+| 直接用 WSLg | 不够 | WSLg 的 Weston 把所有窗口放在同一套焦点里，无法按窗口隔离输入，也无法把窗口离屏托管 |
+| **自研 Wayland 合成器（跑在 WSL2）** | **采用** | 合成器是用户态程序，**每个输入事件送给谁完全由我们决定**；核心不绑定 Windows，远期可换 DRM/KMS 后端独立开机 |
+
+### 1.3 设计原则
+
+1. **只自研不可替代的部分**：多焦点隔离与离屏托管必须自己写；显示到 Windows、窗口管理等能借现成方案的先借。
+2. **风险最高的假设最先验证**：每个里程碑都有明确的「不过就停」判据。
+3. **可替换的边界**：显示输出、输入来源都抽象成接口，第一版实现可以被整体替换而不动核心。
+4. **AI 价值先于桌面体验**：先让 AI 能在后台并发操作，再打磨人在桌面上的手感。
+
+---
+
+## 2. 核心模型
+
+### 2.1 Stage：隔离单位是进程，不是窗口
+
+**Stage（舞台）= 一个被托管的应用实例 = 一个独立的客户端进程**，包含它的所有顶层窗口、弹窗、子 surface。
+
+- 应用必须通过 FocusStage 启动（`stage.launch`），不能中途接管已经在 Win11 上运行的 `.exe`。
+- **一个 Stage 只对应一个进程**：
+  - Chromium / Electron：每个 Stage 使用独立的 `--user-data-dir`（或等价参数），避免多个窗口落在同一个浏览器进程里；
+  - X11 应用：每个 Stage 配一个独立的 rootless `Xwayland` 实例。
+- 同一应用内部的对话框、菜单、弹窗都属于同一个 Stage，进程内部的焦点切换由应用自己处理。
+
+> 为什么不按窗口隔离？同一进程的多个窗口共享一个 Wayland 连接，合成器无法让它们"同时都是前台"而不让客户端察觉矛盾。以进程为单位，矛盾就不存在了。
+
+### 2.2 虚拟焦点：所有 Stage 永远处于前台
+
+**不使用多 `wl_seat`**。原因：多 Seat 依赖客户端的支持，而 Chromium/Electron 对多 Seat 的支持很有限【待验证】，XWayland 则完全不支持多 Seat。
+
+替代方案：
+
+- 合成器只暴露**一个 `wl_seat`**；
+- 对**每一个** Stage，合成器都发送 `wl_keyboard.enter`、`wl_pointer.enter` 和 `xdg_toplevel` 的 `activated` 状态，并且**永不发送 leave / 失活**；
+- 每个 Stage 都以为自己是唯一的前台窗口。由于客户端之间互相看不到对方的 surface，这种"多个前台"不会被察觉；
+- 每个输入事件最终送给哪个 Stage，由合成器内部的 **Router** 根据路由表决定。
+
+修饰键状态（Ctrl/Shift 等）、键盘重复、指针位置都**按 Stage 分别维护**，AI 在 Stage A 按住 Ctrl 不会影响用户在 Stage B 里打字。
+
+【待验证 · M0】Chromium、Electron、GTK、Qt、X11 应用在"永远前台、从不失焦"的状态下能否正常接收键盘输入、弹出菜单、显示光标。
+
+### 2.3 状态：两个互相独立的维度
+
+每个 Stage 的状态由两个维度组合而成：
+
+```text
+显示位置 (display):   Desktop  |  Hidden
+输入归属 (input):     Human    |  Agent(lease_id)  |  Frozen
+```
+
+| 组合 | 含义 |
+| :--- | :--- |
+| Desktop + Human | 日常使用：窗口在 Win11 桌面上，用户正常操作 |
+| Hidden + Agent | 收入后台：窗口从桌面消失，AI 独立操作 |
+| Desktop + Agent | 当面操作：AI 在用户眼前操作，用户只能看，按接管热键可立即抢回 |
+| Hidden + Frozen | 挂起：暂时搁置，谁都不能输入 |
+| Desktop + Frozen | 只读展示：可以看，不能操作 |
+
+**状态切换只修改 Router 的路由表和显示开关，应用本身完全不知道发生了什么**——它始终是前台、始终在渲染、始终持有焦点。因此画面、登录态、未保存的输入天然连续，不需要任何同步或重放。
+
+切换规则：
+
+- **人永远优先**：任何状态下，用户按接管热键（或点击接管按钮）都会立刻把输入归属改为 Human，并作废当前 AI 租约。
+- 收入后台时记录窗口在桌面上的位置与大小（`SavedRect`），恢复时按 `SavedRect` 放回原处。
+- 输入归属为 Agent 时，来自用户的输入一律丢弃（接管热键除外），防止人机同时点击。
+
+---
+
+## 3. 总体架构
+
+```text
+                        Windows 11
+ ┌──────────────────────────────────────────────────────────────┐
+ │  AI Agent (Claude Code / Cursor / 脚本)                       │
+ │      │ MCP over stdio                                         │
+ │      ▼                                                        │
+ │  wsl.exe -e focusstage mcp   ──────────────┐                  │
+ │                                            │                  │
+ │  FocusStage Tray (.NET 8, 极薄)             │                  │
+ │   · 全局接管热键  · Stage 列表 / 状态       │                  │
+ │   · 通过 wsl.exe 调用控制命令               │                  │
+ └────────────────────────────────────────────┼──────────────────┘
+                                              │
+                        WSL2                  ▼
+ ┌──────────────────────────────────────────────────────────────┐
+ │  focusstaged  (Rust + Smithay, 单进程守护)                     │
+ │                                                              │
+ │   Stage Manager   启动应用 / 管理进程与 Xwayland 实例          │
+ │   Router          虚拟焦点 · 输入归属 · AI 租约               │
+ │   Offscreen Core  虚拟 wl_output · frame 节拍 · 按需截图       │
+ │   Clipboard       每个 Stage 一份选区，按策略与 Windows 互通    │
+ │   A11y            AT-SPI 无障碍树（按 PID 归属到 Stage）        │
+ │   Control API     Unix socket，供 MCP / Tray / 调试工具使用    │
+ │                                                              │
+ │   DisplaySink 接口 ──┬── WslgSink   第一版：嵌套进 WSLg        │
+ │                      ├── HostSink   备选：原生壳 + hvsocket    │
+ │                      └── DrmSink    远期：独立开机             │
+ │                                                              │
+ │        WAYLAND_DISPLAY=focusstage-0  /  每 Stage 一个 Xwayland │
+ │              ▼                ▼                ▼              │
+ │         [Chromium]      [Electron 应用]    [X11 应用]          │
+ │                                                              │
+ │   文件直通：/mnt/c/Users/<user>/...（与 Win11 同一份文件）       │
+ └──────────────────────────────────────────────────────────────┘
+```
+
+**业务逻辑全部集中在 WSL 内的 `focusstaged` 一个进程里**。Windows 侧只保留必须在 Windows 上做的事：全局热键（物理键盘在 Windows 那边）和一个状态入口。
+
+---
+
+## 4. 模块设计
+
+### 4.1 Stage Manager
+
+- 根据应用描述（命令、参数、类型 Wayland/X11）启动进程，设置 `WAYLAND_DISPLAY`、`DISPLAY`、Chromium 的 `--ozone-platform=wayland` 等环境；
+- X11 Stage：先拉起专属的 rootless `Xwayland`（合成器内置 XWM），再在该 `DISPLAY` 上启动应用；
+- 监控进程生命周期：进程退出则销毁 Stage，并通知 Tray 与持有租约的 Agent；
+- 通过客户端凭据（PID）把 Wayland 连接、Xwayland 实例、AT-SPI 对象归属到对应 Stage。
+
+### 4.2 Router（虚拟焦点与输入归属）
+
+- 维护 `stage_id → { input_owner, lease, per-stage 键盘/指针状态 }`；
+- 输入来源有三类：WslgSink 转来的**人工输入**、MCP 转来的 **AI 输入**、Tray 发来的**接管指令**；
+- 每个事件按"目标 Stage 当前的输入归属"校验后才投递，不符合的直接丢弃；
+- 接管指令是硬中断：立即切换归属、作废租约、丢弃该 Stage 队列中尚未执行的 AI 动作；
+- Stage 内部若有多个顶层窗口，键盘焦点给最近激活的顶层窗口或模态对话框。
+
+### 4.3 Offscreen Core（离屏托管与截图）
+
+- 合成器创建一个**虚拟 `wl_output`**（固定分辨率与缩放），所有 Stage 的 surface 都 `enter` 这个 output，应用因此认为自己是"可见的"；
+- **不做持续合成**：
+  - Hidden 状态的 Stage 只需按固定节拍（默认 30Hz，可配置）回复 `wl_surface.frame`，保证应用不降帧、不暂停；
+  - 只有当 AI 调用 `observe` 或需要显示缩略图时，才把主窗口 + 所有 `xdg_popup` + 子 surface 合成为一张以主窗口为原点的图像；
+- 渲染器默认使用 **Pixman 软件渲染**：WSL2 内没有 DRM render node，GBM 不可用，GLES 渲染能否工作【待验证】。应用自身的渲染（含 GPU 加速）不受影响；
+- 每次合成产生递增的 `frame_seq`，供 AI 接口做过期检测。
+
+### 4.4 DisplaySink（把 Stage 显示到 Win11 桌面）
+
+统一接口：`show(stage, rect)`、`hide(stage)`、`present(stage, damage)`、输入事件回调。
+
+**WslgSink（第一版）**
+
+- `focusstaged` 同时作为 WSLg 的客户端：每个 Desktop 状态 Stage 的每个顶层窗口，在 WSLg 中对应一个**代理窗口**；WSLg 负责把代理窗口变成 Win11 原生窗口（任务栏、拖动、缩放、Alt-Tab 都由它提供）；
+- 收入后台 = unmap 代理窗口；恢复 = 按 `SavedRect` 重新 map；
+- 代理窗口上的鼠标键盘事件转交 Router，作为人工输入；
+- 用户拖动缩放代理窗口时，向应用发送 `configure` 让其重新排版，而不是拉伸图像；
+- 代理窗口走 **X11 协议**连接 WSLg 的 Xwayland，因为 Wayland toplevel 无法指定屏幕坐标。【待验证 · M2】WSLg 的 RAIL 是否遵循 X11 窗口的指定位置。
+
+**HostSink（备选，仅当 WslgSink 不够用时实现）**
+
+- Win11 原生 .NET 壳 + hvsocket（AF_VSOCK）传输增量帧与输入；
+- 帧按脏区增量 + LZ4 压缩，只给 Desktop 状态或正在被观看的 Stage 推帧；
+- 触发条件：WSLg 无法原位恢复窗口，或输入法 / DPI / 延迟体验无法接受。
+
+**DrmSink（远期）**
+
+- DRM/KMS + libinput 后端，直接接管物理显示器与键鼠，脱离 Windows 独立开机。
+
+### 4.5 Clipboard
+
+- 每个 Stage 持有**自己的一份选区**（clipboard + primary）；合成器在向某个 Stage 投递焦点时，只向它提供它自己的选区；
+- 默认策略：
+  - Human 状态的 Stage 与 Windows 剪贴板**双向同步**（日常使用手感一致）；
+  - Agent 状态的 Stage **完全隔离**，AI 的复制粘贴不会污染 Windows 剪贴板，也不会串到别的 Stage；
+- AI 可通过 MCP 显式读写自己 Stage 的剪贴板；
+- 不依赖多 `wl_seat`：选区由合成器在各 Stage 之间转发，本来就由合成器掌控。
+
+### 4.6 A11y（无障碍树）
+
+- 读取 AT-SPI 会话总线，按 PID 把可访问对象归属到 Stage；
+- 为 AI 提供结构化的界面信息（控件角色、名称、文字、边界框），比纯截图定位更可靠；
+- Chromium/Electron 需加 `--force-renderer-accessibility`，由 Stage Manager 在启动时自动附加。
+
+### 4.7 文本输入
+
+- **AI 输入文字**：不需要输入法。优先通过 `zwp_text_input_v3` 直接 commit 字符串；不支持的应用（含 X11）回退为临时上传含目标字符 keysym 的键位映射再模拟按键；
+- **用户输入中文**：
+  - 第一阶段：在 WSL 内运行 `Fcitx5`，候选框作为 Stage 的子图层合成；
+  - 后续：把 Win11 输入法的提交结果直接转成 `text_input_v3` 的 preedit/commit，实现外层统一输入法。
+
+### 4.8 文件与外部集成
+
+- 引导应用的默认目录（XDG User Dirs）指向 `/mnt/c/Users/<user>/` 下的桌面、下载等目录；
+- 已知限制：`/mnt/c` 走 9P 文件系统，大量小文件读写（如 VS Code 打开大仓库）明显变慢；对性能敏感的项目建议放在 WSL 原生文件系统中；
+- 从资源管理器拖文件到代理窗口：路径 `C:\...` 转为 `/mnt/c/...`，经 `wl_data_device` 投递拖放；
+- 链接打开 / "在文件夹中显示"：按策略交给托管浏览器或 Win11 原生程序。
+
+---
+
+## 5. AI 控制接口（MCP）
+
+Windows 上的 Agent 以 **stdio** 方式连接：MCP 配置中把命令设为 `wsl.exe -e focusstage mcp` 即可，不需要网络端口，也不涉及跨 VM 的 socket。
+
+### 5.1 工具集
+
+```text
+stage.list()
+    → [{ stage_id, app, title, display, input_owner, size }]
+
+stage.launch(app, args?)
+    → stage_id
+
+stage.acquire(stage_id, ttl_s, hide?=true)
+    → lease                         # 同一 Stage 同时只有一个租约
+
+stage.observe(lease, { image?: bool, a11y?: bool })
+    → { frame_seq, png?, a11y_tree? }
+
+stage.act(lease, actions[], based_on?: frame_seq)
+    → ok | stale | preempted | expired
+
+stage.clipboard_get(lease) / stage.clipboard_set(lease, text)
+
+stage.release(lease, show_on_desktop?=true)
+```
+
+`actions[]` 支持：`move`、`click`、`double_click`、`drag`、`scroll`、`key`（含组合键）、`type_text`、`wait(ms)`。
+
+### 5.2 语义约定
+
+- **坐标**：一律使用 Stage 主窗口左上角为原点的逻辑像素，与桌面位置、DPI 无关；
+- **租约**：`acquire` 失败时返回当前持有者；租约到期未续自动释放；
+- **人永远优先**：用户接管后租约立即作废，之后的 `act` 返回 `preempted`，正在执行的动作序列中止；
+- **过期检测**：`act` 可携带 `based_on`，如果 Stage 画面在该帧之后已发生变化，返回 `stale`，避免 AI 对着旧画面点错；
+- **原子性**：一次 `act` 中的动作按顺序执行，任一步失败即中止，并返回已执行的步数。
+
+---
+
+## 6. 实施路线
+
+每个里程碑都有明确的验收标准与「不过就停」判据。
+
+### M0：多焦点隔离验证（2~3 天）
+
+- 范围：在 WSL2 中用 Rust + Smithay 写一个无头合成器（Pixman 渲染），不接入任何 Windows 显示。
+- 验收：
+  - 同时托管 1 个 Chromium（Wayland）、1 个 `foot` 终端、1 个 X11 应用（rootless Xwayland）；
+  - 脚本**同时**向三者持续输入文字，三者都正确收到且互不串扰；
+  - 分别对三个 Stage 截图，内容正确，右键菜单 / 下拉框能出现在截图中。
+- **不过就停**：若"永远前台"在 Chromium 或 X11 上无法稳定工作，暂停后续开发，回到第 2 章重新设计隔离方式。
+
+### M1：AI 后台并发可用
+
+- 范围：Control API + MCP 服务（`wsl.exe` stdio）+ 租约 + A11y + 调试用的 Stage 画面查看器。
+- 验收：Windows 上的 AI Agent 同时操作两个后台 Stage（如浏览器填表 + 编辑器写文字），用户在 Win11 上正常工作，**零焦点丢失、零鼠标抖动**。
+- 意义：**到这一步 AI 并发的核心价值已经可用**，尚未涉及桌面显示。
+
+### M2：桌面三态闭环
+
+- 范围：WslgSink + Tray（全局接管热键、Stage 列表）。
+- 验收：用户在桌面窗口里打字 → 一键收入后台 → AI 继续操作 → 按热键接管 → 窗口在原位置、原大小出现，内容包含 AI 的全部修改。
+- **不过就停**：若 WSLg 无法原位恢复窗口，或输入体验无法接受，转为实现 HostSink。
+
+### M3：日常手感
+
+- 剪贴板与 Windows 双向同步、中文输入（Fcitx5）、高 DPI 缩放、文件拖放、链接路由、窗口缩放时的重新排版。
+
+### M4 / M5：按需扩展
+
+- M4：HostSink（仅当 M2 判定 WslgSink 不够用）。
+- M5：DrmSink，脱离 Windows 独立开机。
+
+---
+
+## 7. 风险与应对
+
+| 风险 | 影响 | 应对 | 验证时机 |
+| :--- | :--- | :--- | :--- |
+| 应用在"永远前台"状态下行为异常 | 核心方案不成立 | M0 覆盖 Chromium / Electron / GTK / Qt / X11 各一个代表 | M0 |
+| 应用离屏后降帧或暂停 | AI 看到的画面停滞 | 虚拟 output + 固定节拍 frame callback，始终保持 `activated` | M0 |
+| 弹出菜单不在截图中或坐标错位 | AI 点不到下拉项 | 截图时按 surface 树合成主窗口 + popup + 子 surface | M0 |
+| 一个 Stage 被多个进程共享（如浏览器复用已有进程） | 虚拟焦点产生矛盾 | 强制独立 profile / 独立 Xwayland，Stage Manager 检测并拒绝 | M0 |
+| GLES 渲染器在 WSL2 中不可用 | 无法合成截图 | 默认 Pixman 软件渲染 | M0 |
+| WSLg 不遵循 X11 窗口坐标 | 无法原位恢复 | 转 HostSink | M2 |
+| 每个 X11 Stage 一个 Xwayland 带来内存开销 | 同时托管数量受限 | 每实例约数十 MB，可接受；空闲 Stage 可挂起 | M3 |
+| `/mnt/c` 9P 性能差 | 开发工具卡顿 | 文档说明，大仓库放 WSL 原生文件系统 | M3 |
+| AI 可读写真实用户目录 | 误删误改文件 | 后续为 Stage 增加可选沙箱（bubblewrap，目录白名单 / 只读挂载） | M3 之后 |
+
+---
+
+## 8. 明确不做的事
+
+- **不按窗口分配 `wl_seat`**：依赖客户端的多 Seat 支持，兼容性没有保证。
+- **不在早期自研传帧与输入转发**：WSLg 已经提供了把 Linux 窗口变成 Win11 窗口的能力。
+- **不做持续离屏合成**：只在 AI 观察或需要缩略图时合成。
+- **Windows 侧不承载业务逻辑**：Tray 只负责热键与入口，所有状态集中在 `focusstaged`。
+- **不接管已在 Win11 原生运行的 `.exe`**：纯 Windows 软件仍由 MarkScreen 等外层方案处理。
+
+---
+
+## 9. 与 MarkScreen 的关系
+
+- **理念继承**：沿用 MarkScreen 的视觉定位与"人随时可打断接管"原则，但把执行载体从"在全局物理桌面上抢鼠标键盘"升级为"在合成器里按 Stage 隔离输入"。
+- **分工**：MarkScreen 继续处理少量只能在 Windows 上运行的原生软件；FocusStage 承载浏览器与跨平台客户端的后台并发操作。
+- **定位说明**：纯浏览器任务用 CDP / Playwright 已经可以并发自动化；FocusStage 的主要价值在于**非浏览器桌面客户端**，以及"人和 AI 共用同一个正在使用的窗口"这一场景。

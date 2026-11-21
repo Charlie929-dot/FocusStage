@@ -1,48 +1,81 @@
 # FocusStage
 
-**FocusStage** 是一个面向人机并发协作的 **AI-Native 窗口虚拟化与多焦点调度引擎**（当前形态：**Windows 11 宿主壳 + WSL2 Wayland 多 Seat 合成器**；远期可脱离 Windows 作为独立桌面合成器运行）。
+**FocusStage** 让人和 AI 同时使用同一台电脑、互不抢焦点。
 
-它专门解决传统桌面操作系统“全局单鼠标、单前台焦点、单剪贴板”导致的**人机互斥死结**，实现如下日常使用闭环：
+它是一个跑在 WSL2 里的 **Wayland 合成器**：被它托管的应用平时像普通窗口一样出现在 Win11 桌面上；需要时一键「收入后台」交给 AI，AI 独立操作它，而你的鼠标、键盘、正在打字的窗口和剪贴板**完全不受影响**。
 
-> **正常使用中（真机独立窗口） → 一键「收入窗口」 → AI 针对该窗口独立后台操作（多窗真并发、不碰物理鼠键） → 操作完成或随时「释放并恢复」到原桌面位置**
-
----
-
-## 核心定位（为什么不再做传统 Windows 虚拟机底座）
-
-1. **跳过单焦点死结**：一个 Windows VM 内仍然只有一个鼠标和前台焦点，多个窗口无法在容器内真正并发。FocusStage 在 WSL2 Linux 内核上自研 **Wayland Multi-Seat 显示合成器**，天然支持为每个托管窗口分配独立的虚拟输入座位（`wl_seat`）与独立剪贴板。
-2. **跳过重型整机虚拟化开销**：不需要养一套完整 Win11 镜像和几十 GB 虚拟磁盘；WSL2 按需共享宿主 CPU/内存与 GPU 加速，并直接挂载 Win11 真实目录（`/mnt/c/Users/HP/...`），文件本身就是同一份。
-3. **平滑演进路线**：现阶段依赖 Win11 兜住笔记本电源、双显卡、休眠与偶发原生软件需求；当合成器完善后，只需切换底层后端（从嵌套推流切到 DRM/KMS），即可演进为独立启动的 AI-Native Linux 桌面系统。
+> **正常使用（桌面窗口） → 一键收入后台 → AI 独立操作（可多窗口并发） → 按热键接管，窗口原位恢复**
 
 ---
 
-## 适用边界
+## 它是怎么做到的
 
-- **原生覆盖**：所有浏览器与 Web 应用、网页版办公/业务后台、开发工具，以及提供 Linux 版本的桌面客户端（如微信、QQ、飞书、钉钉、WPS、VS Code 等）。
-- **使用前提**：需要支持“随时收入后台交给 AI 独立操作”的软件，需通过 FocusStage 引擎拉起并投影到 Win11 桌面，而不是半路吸纳已在 Win11 原生运行的 `.exe` 进程。
+传统桌面只有一个前台焦点，所以 AI 操作窗口必须抢走你的鼠标。FocusStage 换了一个思路：
+
+- **每个托管应用是一个 Stage（舞台）**，对应一个独立进程。
+- **所有 Stage 永远处于"前台"**：合成器让每个应用都以为自己拥有焦点，再由合成器决定每个按键、每次点击实际送给谁。
+- **状态切换对应用透明**：收入后台、交给 AI、收回桌面，都只是合成器内部改了路由表和显示开关，应用始终在运行、始终在渲染，画面与登录态完全连续。
+- **人永远优先**：任何时候按下接管热键，AI 的操作权立即作废。
+
+详细设计见 [DESIGN.md](DESIGN.md)。
 
 ---
 
-## 文档与目录规划
-
-- [DESIGN.md](DESIGN.md) — 完整架构设计、三态生命周期、Multi-Seat 协议、跨界桥接策略与分阶段实施路线。
-
-### 规划目录结构（按里程碑逐步落地）
+## 架构一览
 
 ```text
-FocusStage/
-├── README.md                 # 项目定位与交互闭环概述
-├── DESIGN.md                 # 详细技术架构设计文档
-├── compositor/               # [WSL2] Rust (Smithay) Wayland Multi-Seat 离屏合成器
-├── host/                     # [Win11] .NET 8 WPF + Win32 原生窗口壳与只读围观窗
-├── bridge/                   # [共享] 帧画面推流、输入转发、剪贴板/文件拖放与控制协议
-└── mcp/                      # 面向 AI Agent 的窗口级视觉与独立控制 MCP 服务
+Windows 11
+  AI Agent ──MCP(stdio)──► wsl.exe -e focusstage mcp
+  FocusStage Tray：全局接管热键 / Stage 列表
+
+WSL2
+  focusstaged (Rust + Smithay)
+    Stage Manager · Router(虚拟焦点+租约) · Offscreen Core
+    Clipboard · A11y(AT-SPI) · DisplaySink(第一版嵌套进 WSLg)
+        │
+        ├─ Chromium / Electron 应用 (Wayland)
+        └─ X11 应用 (每个 Stage 一个 rootless Xwayland)
 ```
 
 ---
 
-## 本机已确认的运行底座
+## 适用范围
 
-- **宿主机**：Windows 11（已具备 `.NET 8.0.428`、`Python 3.14.9`、`Git`）
-- **子系统**：WSL2 已就绪 `Ubuntu 26.04.1 LTS` 与 `WSLg`（`/mnt/wslg`）
-- **开发起步建议**：先按 [DESIGN.md](DESIGN.md) 的 **Phase 0 → Phase 1** 验证单窗口“Win11 显示使用 ↔ 收入后台由虚拟 Seat 独立操作 ↔ 原位释放恢复”最小闭环。
+- **支持**：浏览器与 Web 应用、开发工具，以及有 Linux 版本的桌面客户端（微信、QQ、飞书、钉钉、WPS、VS Code 等）。
+- **前提**：应用必须通过 FocusStage 启动，不能中途接管已经在 Win11 上运行的 `.exe`。
+- **不覆盖**：只有 Windows 版本的原生软件（交由 MarkScreen 等外层方案处理）。
+
+---
+
+## 路线
+
+| 里程碑 | 目标 | 状态 |
+| :--- | :--- | :--- |
+| **M0** | 无头合成器验证多焦点隔离：Chromium + 终端 + X11 应用同时输入互不干扰 | 未开始 |
+| **M1** | MCP 接入，AI 在后台并发操作多个 Stage | 未开始 |
+| **M2** | 嵌套 WSLg 显示到桌面，打通「桌面 ↔ 后台 ↔ 原位恢复」 | 未开始 |
+| **M3** | 剪贴板互通、中文输入、高 DPI、文件拖放 | 未开始 |
+| M4 / M5 | 按需：原生宿主壳 / 脱离 Windows 独立开机 | 远期 |
+
+M0 是整个方案能否成立的关键验证，未通过前不推进后续里程碑。
+
+---
+
+## 规划目录结构
+
+```text
+FocusStage/
+├── README.md        # 项目概述
+├── DESIGN.md        # 架构设计
+├── compositor/      # [WSL2] focusstaged：Rust + Smithay 合成器、Router、Stage Manager
+├── mcp/             # [WSL2] MCP 服务（通过 wsl.exe stdio 对外）
+└── tray/            # [Win11] .NET 8 托盘：全局接管热键与 Stage 列表
+```
+
+---
+
+## 运行环境
+
+- **宿主机**：Windows 11，已具备 `.NET 8`、`Git`
+- **子系统**：WSL2 + `Ubuntu 26.04.1 LTS`，已启用 `WSLg`
+- **开发起步**：从 [DESIGN.md](DESIGN.md) 的 **M0** 开始
