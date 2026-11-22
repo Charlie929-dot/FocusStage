@@ -68,6 +68,8 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         no_image: bool,
         #[arg(long, default_value_t = false)]
+        som: bool,
+        #[arg(long, default_value_t = false)]
         a11y: bool,
         #[arg(long)]
         out: Option<PathBuf>,
@@ -188,23 +190,36 @@ fn main() -> anyhow::Result<()> {
             lease,
             stage,
             no_image,
+            som,
             a11y,
             out,
         } => {
-            let resp = client.call(&ControlRequest::Observe {
+            let mut resp = client.call(&ControlRequest::Observe {
                 lease,
                 stage_id: stage,
                 image: !no_image,
                 a11y,
             })?;
-            if let Some(out_path) = out {
-                if let ControlResponse::Observed {
-                    png_base64: Some(ref b64),
-                    ..
-                } = resp
-                {
-                    let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
-                    std::fs::write(&out_path, bytes)?;
+            if let ControlResponse::Observed {
+                scale,
+                ref mut png_base64,
+                ..
+            } = resp
+            {
+                if som {
+                    if let Some(ref b64) = png_base64 {
+                        let raw = base64::engine::general_purpose::STANDARD.decode(b64)?;
+                        let ann = focusstage_mcp::som::annotate_png(&raw, scale)
+                            .map_err(anyhow::Error::msg)?;
+                        *png_base64 =
+                            Some(base64::engine::general_purpose::STANDARD.encode(ann.png_bytes));
+                    }
+                }
+                if let Some(out_path) = out {
+                    if let Some(ref b64) = png_base64 {
+                        let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
+                        std::fs::write(&out_path, bytes)?;
+                    }
                 }
             }
             print_resp(&resp, cli.json);

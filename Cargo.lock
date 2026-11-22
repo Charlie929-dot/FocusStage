@@ -538,6 +538,7 @@ dependencies = [
  "base64",
  "clap",
  "focusstage-compositor",
+ "png",
  "serde",
  "serde_json",
  "tracing",

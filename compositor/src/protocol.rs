@@ -259,6 +259,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_scale() -> f64 {
+    1.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ControlResponse {
@@ -289,6 +293,8 @@ pub enum ControlResponse {
         frame_seq: u64,
         width: u32,
         height: u32,
+        #[serde(default = "default_scale")]
+        scale: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         png_base64: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

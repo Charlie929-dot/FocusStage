@@ -32,6 +32,8 @@ WSL2
   focusstaged (Rust + Smithay)
     Stage Manager · Router(虚拟焦点+租约) · Offscreen Core
     Clipboard · A11y(AT-SPI) · DisplaySink(第一版嵌套进 WSLg)
+  focusstage mcp (Rust)
+    纯视觉 Set-of-Mark (SoM) 控件打标 + 双字母短码/坐标操作 (MarkScreen 方案)
         │
         ├─ Chromium / Electron 应用 (Wayland)
         └─ X11 应用 (每个 Stage 一个 rootless Xwayland)

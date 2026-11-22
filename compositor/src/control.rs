@@ -435,6 +435,7 @@ impl FocusStageState {
             };
         };
         let frame_seq = stage.frame_seq;
+        let scale = stage.scale.max(1.0);
         let xwm_id = stage.xwm_id;
         let x11_ovrs = xwm_id
             .map(|id| self.x11_override_windows_for(id))
@@ -476,6 +477,7 @@ impl FocusStageState {
             frame_seq,
             width,
             height,
+            scale,
             png_base64,
             a11y_tree,
         }
