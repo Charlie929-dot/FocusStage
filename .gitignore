@@ -1,0 +1,6 @@
+target/
+tray/bin/
+tray/obj/
+.tmp_test/
+*.user
+*.suo

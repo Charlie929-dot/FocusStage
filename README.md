@@ -51,13 +51,47 @@ WSL2
 
 | 里程碑 | 目标 | 状态 |
 | :--- | :--- | :--- |
-| **M0** | 无头合成器验证多焦点隔离：Chromium + 终端 + X11 应用同时输入互不干扰 | 未开始 |
-| **M1** | MCP 接入，AI 在后台并发操作多个 Stage | 未开始 |
-| **M2** | 嵌套 WSLg 显示到桌面，打通「桌面 ↔ 后台 ↔ 原位恢复」 | 未开始 |
-| **M3** | 剪贴板互通、中文输入、高 DPI、文件拖放 | 未开始 |
+| **M0** | 无头合成器验证多焦点隔离：Chromium + 终端 + X11 应用同时输入互不干扰 | 已实现并验证 |
+| **M1** | MCP 接入，AI 在后台并发操作多个 Stage | 已实现并验证 |
+| **M2** | 嵌套 WSLg 显示到桌面，打通「桌面 ↔ 后台 ↔ 原位恢复」 | 已实现并验证 |
+| **M3** | 剪贴板互通、中文输入（`text-input-v3` / Fcitx5）、高 DPI、文件拖放 | 已实现并验证 |
 | M4 / M5 | 按需：原生宿主壳 / 脱离 Windows 独立开机 | 远期 |
 
-M0 是整个方案能否成立的关键验证，未通过前不推进后续里程碑。
+---
+
+## 快速开始
+
+### 1. 构建并安装 WSL2 端（`focusstaged` + `focusstage`）
+
+```bash
+CARGO_TARGET_DIR=$HOME/.cache/focusstage-target cargo build --workspace
+sudo cp $HOME/.cache/focusstage-target/debug/focusstaged /usr/local/bin/focusstaged
+sudo cp $HOME/.cache/focusstage-target/debug/focusstage /usr/local/bin/focusstage
+```
+
+### 2. 启动合成器与使用 CLI / MCP
+
+```bash
+# 启动带 WSLg 窗口呈现的合成器（无头调试可加 --headless）
+focusstaged
+
+# 启动不同类型 Stage
+focusstage launch foot
+focusstage launch --kind x11 xterm
+focusstage launch --kind chromium chromium
+
+# MCP 客户端配置（stdio）
+wsl.exe -d Ubuntu -e focusstage mcp
+```
+
+### 3. 构建并运行 Windows 11 托盘（`FocusStageTray`）
+
+```powershell
+dotnet build tray/FocusStageTray.csproj -c Release
+dotnet run --project tray/FocusStageTray.csproj -c Release
+```
+
+默认全局接管热键为 `Ctrl+Alt+Space`，可立即作废所有 AI 租约并将后台 Stage 恢复至桌面。
 
 ---
 
