@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::time::Instant;
 
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatHandler, SeatState};
+use smithay::reexports::calloop::channel as calloop_channel;
 use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -87,8 +87,7 @@ pub struct FocusStageState {
     pub offscreen: OffscreenCore,
 
     pub clipboard_state: StageDataDeviceManagerState,
-    pub clipboard_update_tx: mpsc::Sender<(String, String)>,
-    pub clipboard_update_rx: mpsc::Receiver<(String, String)>,
+    pub clipboard_update_tx: calloop_channel::Sender<(String, String)>,
     pub text_input_state: StageTextInputManagerState,
 
     pub stages: HashMap<String, Stage>,
@@ -102,6 +101,7 @@ pub struct FocusStageState {
     pub pending_act_jobs: Vec<PendingActJob>,
     pub a11y: A11yCollector,
     pub wslg_sink: Option<Box<dyn DisplaySink>>,
+    pub wslg_time_anchor: Option<(u32, u32)>,
     pub should_quit: bool,
 }
 
@@ -131,7 +131,12 @@ impl FocusStageState {
         let clipboard_state = StageDataDeviceManagerState::new(dh);
         let text_input_state = StageTextInputManagerState::new(dh);
         let offscreen = OffscreenCore::new(dh, 1920, 1080, default_scale, frame_hz);
-        let (clipboard_update_tx, clipboard_update_rx) = mpsc::channel();
+        let (clipboard_update_tx, clipboard_update_rx) = calloop_channel::channel::<(String, String)>();
+        let _ = loop_handle.insert_source(clipboard_update_rx, |event, _, state| {
+            if let calloop_channel::Event::Msg((sid, text)) = event {
+                state.handle_clipboard_update_from_stage(&sid, text);
+            }
+        });
         let a11y = A11yCollector::spawn();
 
         let wslg_sink: Option<Box<dyn DisplaySink>> = if enable_wslg {
@@ -181,7 +186,6 @@ impl FocusStageState {
             offscreen,
             clipboard_state,
             clipboard_update_tx,
-            clipboard_update_rx,
             text_input_state,
             stages: HashMap::new(),
             next_stage_seq: 0,
@@ -192,6 +196,7 @@ impl FocusStageState {
             pending_act_jobs: Vec::new(),
             a11y,
             wslg_sink,
+            wslg_time_anchor: None,
             should_quit: false,
         }
     }

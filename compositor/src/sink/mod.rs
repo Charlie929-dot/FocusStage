@@ -65,5 +65,15 @@ pub trait DisplaySink {
     fn minimize(&mut self, _stage_id: &str) {}
     fn set_maximized(&mut self, _stage_id: &str, _maximized: bool) {}
     fn set_host_clipboard(&mut self, _text: &str) {}
+    fn event_fd(&self) -> Option<std::os::fd::OwnedFd> {
+        None
+    }
+    fn flush(&mut self) {}
+    fn is_frame_pending(&self, _stage_id: &str) -> bool {
+        false
+    }
+    fn take_frame_done_stages(&mut self) -> Vec<String> {
+        Vec::new()
+    }
     fn poll_events(&mut self) -> Vec<SinkInputEvent>;
 }

@@ -158,6 +158,31 @@ impl FocusStageState {
         self.start_time.elapsed().as_millis() as u32
     }
 
+    pub fn resolve_input_time(&mut self, sink_time: u32) -> u32 {
+        let now = self.now_ms();
+        if sink_time == 0 {
+            return now;
+        }
+        match self.wslg_time_anchor {
+            Some((base_sink, base_local)) => {
+                let delta = sink_time.wrapping_sub(base_sink) as i32;
+                let mapped_i64 = (base_local as i64).wrapping_add(delta as i64);
+                let mapped = if mapped_i64 >= 0 { mapped_i64 as u32 } else { 0 };
+                let drift = (mapped.wrapping_sub(now) as i32).abs();
+                if drift > 5000 {
+                    self.wslg_time_anchor = Some((sink_time, now));
+                    now
+                } else {
+                    mapped
+                }
+            }
+            None => {
+                self.wslg_time_anchor = Some((sink_time, now));
+                now
+            }
+        }
+    }
+
     fn set_keyboard_target(
         &mut self,
         stage_id: &str,
@@ -511,6 +536,11 @@ impl FocusStageState {
     }
 
     pub fn send_stage_pointer_motion(&mut self, stage_id: &str, x: f64, y: f64) {
+        let time = self.now_ms();
+        self.send_stage_pointer_motion_at(stage_id, x, y, time);
+    }
+
+    pub fn send_stage_pointer_motion_at(&mut self, stage_id: &str, x: f64, y: f64, time: u32) {
         self.ensure_virtual_focus(stage_id);
         let Some(toplevel) = self.stages.get(stage_id).and_then(|s| s.active_toplevel().cloned()) else {
             return;
@@ -520,7 +550,6 @@ impl FocusStageState {
         }
         let seat = self.seat.clone();
         let serial = SERIAL_COUNTER.next_serial();
-        let time = self.now_ms();
 
         match toplevel {
             StageToplevel::Wayland(tl) => {
@@ -584,7 +613,20 @@ impl FocusStageState {
     }
 
     pub fn send_stage_button(&mut self, stage_id: &str, x: f64, y: f64, button: u32, pressed: bool) {
-        self.send_stage_pointer_motion(stage_id, x, y);
+        let time = self.now_ms();
+        self.send_stage_button_at(stage_id, x, y, button, pressed, time);
+    }
+
+    pub fn send_stage_button_at(
+        &mut self,
+        stage_id: &str,
+        x: f64,
+        y: f64,
+        button: u32,
+        pressed: bool,
+        time: u32,
+    ) {
+        self.send_stage_pointer_motion_at(stage_id, x, y, time);
         let Some(toplevel) = self.stages.get(stage_id).and_then(|s| s.active_toplevel().cloned()) else {
             return;
         };
@@ -598,7 +640,6 @@ impl FocusStageState {
 
         let seat = self.seat.clone();
         let serial = SERIAL_COUNTER.next_serial();
-        let time = self.now_ms();
         let ev = ButtonEvent {
             serial,
             time,
@@ -641,6 +682,31 @@ impl FocusStageState {
     }
 
     pub fn send_stage_scroll(&mut self, stage_id: &str, x: f64, y: f64, dx: f64, dy: f64) {
+        let h120 = if dx.abs() > f64::EPSILON {
+            let steps = ((dx / 15.0) * 120.0).round() as i32;
+            if steps == 0 {
+                if dx > 0.0 { 1 } else { -1 }
+            } else {
+                steps
+            }
+        } else {
+            0
+        };
+        let v120 = if dy.abs() > f64::EPSILON {
+            let steps = ((dy / 15.0) * 120.0).round() as i32;
+            if steps == 0 {
+                if dy > 0.0 { 1 } else { -1 }
+            } else {
+                steps
+            }
+        } else {
+            0
+        };
+        let synth_v120 = if h120 != 0 || v120 != 0 {
+            Some((h120, v120))
+        } else {
+            None
+        };
         self.send_stage_scroll_frame(
             stage_id,
             x,
@@ -648,8 +714,9 @@ impl FocusStageState {
             dx,
             dy,
             Some(AxisSource::Wheel),
-            None,
+            synth_v120,
             (false, false),
+            None,
         );
     }
 
@@ -663,13 +730,23 @@ impl FocusStageState {
         source: Option<AxisSource>,
         v120: Option<(i32, i32)>,
         stop: (bool, bool),
+        time: Option<u32>,
     ) {
-        self.send_stage_pointer_motion(stage_id, x, y);
+        let time = time.unwrap_or_else(|| self.now_ms());
+        let need_motion = self.stages.get(stage_id).is_none_or(|s| {
+            s.input.current_pointer_target.as_ref().is_none_or(|t| !t.alive())
+                || (s.input.pointer_pos.x - x).abs() > 0.01
+                || (s.input.pointer_pos.y - y).abs() > 0.01
+        });
+        if need_motion {
+            self.send_stage_pointer_motion_at(stage_id, x, y, time);
+        } else {
+            self.ensure_virtual_focus(stage_id);
+        }
         let Some(toplevel) = self.stages.get(stage_id).and_then(|s| s.active_toplevel().cloned()) else {
             return;
         };
         let seat = self.seat.clone();
-        let time = self.now_ms();
         let resolved_source = source.unwrap_or(AxisSource::Wheel);
         let mut frame = AxisFrame::new(time).source(resolved_source);
 
@@ -687,25 +764,6 @@ impl FocusStageState {
             if vy != 0 {
                 frame = frame.v120(Axis::Vertical, vy);
             }
-        } else if matches!(resolved_source, AxisSource::Wheel | AxisSource::WheelTilt) {
-            if dx.abs() > f64::EPSILON {
-                let steps = ((dx / 15.0) * 120.0).round() as i32;
-                let h120 = if steps == 0 {
-                    if dx > 0.0 { 1 } else { -1 }
-                } else {
-                    steps
-                };
-                frame = frame.v120(Axis::Horizontal, h120);
-            }
-            if dy.abs() > f64::EPSILON {
-                let steps = ((dy / 15.0) * 120.0).round() as i32;
-                let v120_val = if steps == 0 {
-                    if dy > 0.0 { 1 } else { -1 }
-                } else {
-                    steps
-                };
-                frame = frame.v120(Axis::Vertical, v120_val);
-            }
         }
 
         if stop.0 {
@@ -717,7 +775,21 @@ impl FocusStageState {
 
         match toplevel {
             StageToplevel::Wayland(tl) => {
-                let (target, _) = self.hit_test_wayland_surface(tl.wl_surface(), x, y);
+                let (target, local) = self.hit_test_wayland_surface(tl.wl_surface(), x, y);
+                let same = self
+                    .stages
+                    .get(stage_id)
+                    .and_then(|s| s.input.current_pointer_target.as_ref())
+                    .is_some_and(|cur| cur.same_target(&StageInputTarget::Wayland(target.clone())));
+                if !same {
+                    self.set_pointer_target(
+                        stage_id,
+                        StageInputTarget::Wayland(target.clone()),
+                        local,
+                        SERIAL_COUNTER.next_serial(),
+                        time,
+                    );
+                }
                 PointerTarget::axis(&target, &seat, self, frame);
                 PointerTarget::frame(&target, &seat, self);
             }
@@ -746,6 +818,17 @@ impl FocusStageState {
     }
 
     pub fn send_stage_evdev_key(&mut self, stage_id: &str, evdev_code: u32, pressed: bool) {
+        let time = self.now_ms();
+        self.send_stage_evdev_key_at(stage_id, evdev_code, pressed, time);
+    }
+
+    pub fn send_stage_evdev_key_at(
+        &mut self,
+        stage_id: &str,
+        evdev_code: u32,
+        pressed: bool,
+        time: u32,
+    ) {
         self.ensure_virtual_focus(stage_id);
         let Some(toplevel) = self.stages.get(stage_id).and_then(|s| s.active_toplevel().cloned()) else {
             return;
@@ -762,7 +845,6 @@ impl FocusStageState {
 
         let seat = self.seat.clone();
         let serial = SERIAL_COUNTER.next_serial();
-        let time = self.now_ms();
         let wl_key_state = if pressed {
             WlKeyState::Pressed
         } else {

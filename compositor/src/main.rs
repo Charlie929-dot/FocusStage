@@ -1,12 +1,15 @@
+use std::cell::Cell;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use smithay::desktop::PopupManager;
+use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
-use smithay::reexports::calloop::EventLoop;
+use smithay::reexports::calloop::{channel as calloop_channel, EventLoop, Interest, Mode, PostAction};
 use smithay::reexports::wayland_server::{Display, ListeningSocket};
 use tracing::{info, warn};
 
@@ -29,7 +32,7 @@ struct Args {
     socket: Option<PathBuf>,
 
     /// Frame callback frequency in Hz for offscreen stages
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 60)]
     frame_hz: u32,
 
     /// Default HiDPI scale factor
@@ -207,7 +210,7 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&runtime_base)?;
 
     let mut event_loop: EventLoop<FocusStageState> = EventLoop::try_new()?;
-    let mut display: Display<FocusStageState> = Display::new()?;
+    let display: Display<FocusStageState> = Display::new()?;
     let dh = display.handle();
 
     let listener = ListeningSocket::bind(&args.wayland_display)
@@ -220,7 +223,7 @@ fn main() -> anyhow::Result<()> {
 
     let control_rx = spawn_control_server(&control_socket)?;
     let frame_hz = args.frame_hz.clamp(5, 120);
-    let tick_dur = Duration::from_millis((1000 / frame_hz).max(8) as u64);
+    let tick_dur = Duration::from_micros((1_000_000 / frame_hz) as u64);
 
     let mut state = FocusStageState::new(
         &dh,
@@ -239,10 +242,84 @@ fn main() -> anyhow::Result<()> {
         state.wslg_sink.is_some()
     );
 
+    event_loop
+        .handle()
+        .insert_source(
+            Generic::new(listener, Interest::READ, Mode::Level),
+            |_, listener, state| {
+                while let Ok(Some(stream)) = listener.accept() {
+                    let pid = get_peer_pid(&stream);
+                    let stage_id = pid.and_then(|p| state.resolve_stage_for_pid(p));
+                    let cdata = Arc::new(ClientState {
+                        compositor_state: Default::default(),
+                        stage_id: stage_id.clone(),
+                        pid,
+                    });
+                    match state.display_handle.insert_client(stream, cdata) {
+                        Ok(client) => {
+                            if let Some(ref sid) = stage_id {
+                                if let Some(stage) = state.stages.get_mut(sid) {
+                                    stage.wayland_clients.insert(client.id(), client);
+                                }
+                            }
+                        }
+                        Err(e) => warn!("Failed to insert Wayland client: {}", e),
+                    }
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("insert listening socket source: {e}"))?;
+
+    event_loop
+        .handle()
+        .insert_source(
+            Generic::new(display, Interest::READ, Mode::Level),
+            |_, display, state| {
+                // SAFETY: dispatch_clients does not drop/replace `Display` or alter its poll_fd.
+                let disp = unsafe { display.get_mut() };
+                if let Err(e) = disp.dispatch_clients(state) {
+                    warn!("Wayland dispatch_clients error: {}", e);
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("insert wayland display source: {e}"))?;
+
+    event_loop
+        .handle()
+        .insert_source(control_rx, |event, _, state| {
+            if let calloop_channel::Event::Msg(msg) = event {
+                state.handle_control_message(msg);
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("insert control channel source: {e}"))?;
+
+    if let Some(sink_fd) = state.wslg_sink.as_ref().and_then(|s| s.event_fd()) {
+        event_loop
+            .handle()
+            .insert_source(
+                Generic::new(sink_fd, Interest::READ, Mode::Level),
+                |readiness, _, state| {
+                    if readiness.error && !readiness.readable {
+                        return Ok(PostAction::Remove);
+                    }
+                    dispatch_sink_events(state);
+                    Ok(PostAction::Continue)
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("insert wslg sink source: {e}"))?;
+    }
+
+    let tick_due = Rc::new(Cell::new(false));
+    let tick_flag = tick_due.clone();
     let timer = Timer::from_duration(tick_dur);
     event_loop
         .handle()
-        .insert_source(timer, move |_, _, _| TimeoutAction::ToDuration(tick_dur))
+        .insert_source(timer, move |_, _, _| {
+            tick_flag.set(true);
+            TimeoutAction::ToDuration(tick_dur)
+        })
         .map_err(|e| anyhow::anyhow!("insert timer source: {e}"))?;
 
     loop {
@@ -250,152 +327,35 @@ fn main() -> anyhow::Result<()> {
             break;
         }
 
-        // 1. Accept any waiting Wayland clients
-        while let Ok(Some(stream)) = listener.accept() {
-            let pid = get_peer_pid(&stream);
-            let stage_id = pid.and_then(|p| state.resolve_stage_for_pid(p));
-            let cdata = Arc::new(ClientState {
-                compositor_state: Default::default(),
-                stage_id: stage_id.clone(),
-                pid,
-            });
-            match display.handle().insert_client(stream, cdata) {
-                Ok(client) => {
-                    if let Some(ref sid) = stage_id {
-                        if let Some(stage) = state.stages.get_mut(sid) {
-                            stage.wayland_clients.insert(client.id(), client);
-                        }
-                    }
-                }
-                Err(e) => warn!("Failed to insert Wayland client: {}", e),
-            }
-        }
+        // 1. Drain any WslgSink events queued internally (e.g. during roundtrip/show)
+        dispatch_sink_events(&mut state);
 
-        // 2. Drain Control API messages
-        while let Ok(msg) = control_rx.try_recv() {
-            state.handle_control_message(msg);
-        }
-
-        // 3. Drain clipboard updates from async client source readers
-        while let Ok((sid, text)) = state.clipboard_update_rx.try_recv() {
-            state.handle_clipboard_update_from_stage(&sid, text);
-        }
-
-        // 4. Poll WslgSink events (Human input, resize, close, host clipboard, Xdnd)
-        let sink_events = if let Some(ref mut sink) = state.wslg_sink {
-            sink.poll_events()
-        } else {
-            Vec::new()
-        };
-        for ev in sink_events {
-            match ev {
-                SinkInputEvent::PointerMotion {
-                    stage_id,
-                    x,
-                    y,
-                    time: _,
-                } => {
-                    if state.is_input_allowed(&stage_id, InputSource::Human, None) {
-                        state.send_stage_pointer_motion(&stage_id, x, y);
-                    }
-                }
-                SinkInputEvent::PointerButton {
-                    stage_id,
-                    button,
-                    pressed,
-                    x,
-                    y,
-                    time: _,
-                } => {
-                    if state.is_input_allowed(&stage_id, InputSource::Human, None) {
-                        state.send_stage_button(&stage_id, x, y, button, pressed);
-                    }
-                }
-                SinkInputEvent::PointerScroll {
-                    stage_id,
-                    dx,
-                    dy,
-                    source,
-                    v120,
-                    stop,
-                    time: _,
-                } => {
-                    if state.is_input_allowed(&stage_id, InputSource::Human, None) {
-                        if let Some(pos) = state.stages.get(&stage_id).map(|s| s.input.pointer_pos) {
-                            state.send_stage_scroll_frame(
-                                &stage_id,
-                                pos.x,
-                                pos.y,
-                                dx,
-                                dy,
-                                source,
-                                v120,
-                                stop,
-                            );
-                        }
-                    }
-                }
-                SinkInputEvent::Key {
-                    stage_id,
-                    evdev_keycode,
-                    pressed,
-                    time: _,
-                } => {
-                    if state.is_input_allowed(&stage_id, InputSource::Human, None) {
-                        state.send_stage_evdev_key(&stage_id, evdev_keycode, pressed);
-                    }
-                }
-                SinkInputEvent::Resized { stage_id, rect } => {
-                    state.resize_stage_from_sink(&stage_id, rect);
-                }
-                SinkInputEvent::CloseRequested { stage_id } => {
-                    let _ = state.close_stage(&stage_id);
-                }
-                SinkInputEvent::HostClipboardChanged { text } => {
-                    state.sync_from_host_clipboard(text);
-                }
-                SinkInputEvent::FilesDropped {
-                    stage_id,
-                    paths,
-                    x,
-                    y,
-                } => {
-                    let _ = state.drop_files_to_stage(
-                        &stage_id,
-                        &paths,
-                        Some((x, y).into()),
-                    );
-                }
-            }
-        }
-
-        // 5. Tick pending AI action sequences, expire leases, reap exited processes
+        // 2. Tick pending AI action sequences, expire leases, reap exited processes
         state.tick_pending_act_jobs();
         state.expire_leases();
         state.reap_exited_stages();
         state.popups.cleanup();
 
-        // 6. Send frame callbacks to ALL surfaces across ALL Stages (keeps hidden stages rendering!)
-        let now_ms = state.now_ms();
-        let surfaces: Vec<_> = state
-            .stages
-            .values()
-            .flat_map(|s| s.toplevels.iter().filter_map(|t| t.wl_surface()))
-            .collect();
-        for surf in surfaces {
-            send_frames_surface_tree(&surf, now_ms);
-            for (popup, _) in PopupManager::popups_for_surface(&surf) {
-                send_frames_surface_tree(popup.wl_surface(), now_ms);
-            }
-        }
+        // 3. Collect stages whose WSLg wl_surface.frame callback just completed
+        let frame_done_stages = if let Some(ref mut sink) = state.wslg_sink {
+            sink.take_frame_done_stages()
+        } else {
+            Vec::new()
+        };
 
-        // 7. Present dirty Desktop stages to WslgSink
+        // 4. Present dirty Desktop stages to WslgSink (paced by WSLg frame callback)
         if state.wslg_sink.is_some() {
             let desktop_dirty: Vec<String> = state
                 .stages
                 .iter()
-                .filter(|(_, s)| {
-                    s.display == DisplayState::Desktop && s.dirty_for_sink && s.has_live_surface()
+                .filter(|(sid, s)| {
+                    s.display == DisplayState::Desktop
+                        && s.dirty_for_sink
+                        && s.has_live_surface()
+                        && !state
+                            .wslg_sink
+                            .as_ref()
+                            .is_some_and(|sink| sink.is_frame_pending(sid))
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -420,13 +380,139 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // 8. Dispatch Wayland protocol & event loop
-        let _ = display.dispatch_clients(&mut state);
-        let _ = display.flush_clients();
-        event_loop.dispatch(Some(Duration::from_millis(8)), &mut state)?;
+        // 5. Send frame callbacks to surfaces:
+        //    - Desktop stages: immediately when WSLg frame callback completes, or on frame_hz tick if idle
+        //    - Hidden stages: on frame_hz tick (keeps offscreen stages rendering)
+        let is_tick = tick_due.replace(false);
+        if is_tick || !frame_done_stages.is_empty() {
+            let now_ms = state.now_ms();
+            let surfaces: Vec<_> = state
+                .stages
+                .iter()
+                .filter(|(sid, s)| {
+                    if s.display == DisplayState::Hidden {
+                        return is_tick;
+                    }
+                    let pending = state
+                        .wslg_sink
+                        .as_ref()
+                        .is_some_and(|sink| sink.is_frame_pending(sid));
+                    if pending {
+                        return false;
+                    }
+                    is_tick || frame_done_stages.iter().any(|d| d == *sid)
+                })
+                .flat_map(|(_, s)| s.toplevels.iter().filter_map(|t| t.wl_surface()))
+                .collect();
+            for surf in surfaces {
+                send_frames_surface_tree(&surf, now_ms);
+                for (popup, _) in PopupManager::popups_for_surface(&surf) {
+                    send_frames_surface_tree(popup.wl_surface(), now_ms);
+                }
+            }
+        }
+
+        // 6. Flush outgoing Wayland & WSLg buffers before sleeping
+        let _ = state.display_handle.backend_handle().flush(None);
+        if let Some(ref mut sink) = state.wslg_sink {
+            sink.flush();
+        }
+
+        // 7. Block until any registered FD or frame timer is ready
+        event_loop.dispatch(None, &mut state)?;
     }
 
     let _ = std::fs::remove_file(&control_socket);
     info!("focusstaged shut down cleanly");
     Ok(())
+}
+
+fn dispatch_sink_events(state: &mut FocusStageState) {
+    let sink_events = if let Some(ref mut sink) = state.wslg_sink {
+        sink.poll_events()
+    } else {
+        Vec::new()
+    };
+    for ev in sink_events {
+        match ev {
+            SinkInputEvent::PointerMotion {
+                stage_id,
+                x,
+                y,
+                time,
+            } => {
+                if state.is_input_allowed(&stage_id, InputSource::Human, None) {
+                    let t = state.resolve_input_time(time);
+                    state.send_stage_pointer_motion_at(&stage_id, x, y, t);
+                }
+            }
+            SinkInputEvent::PointerButton {
+                stage_id,
+                button,
+                pressed,
+                x,
+                y,
+                time,
+            } => {
+                if state.is_input_allowed(&stage_id, InputSource::Human, None) {
+                    let t = state.resolve_input_time(time);
+                    state.send_stage_button_at(&stage_id, x, y, button, pressed, t);
+                }
+            }
+            SinkInputEvent::PointerScroll {
+                stage_id,
+                dx,
+                dy,
+                source,
+                v120,
+                stop,
+                time,
+            } => {
+                if state.is_input_allowed(&stage_id, InputSource::Human, None) {
+                    if let Some(pos) = state.stages.get(&stage_id).map(|s| s.input.pointer_pos) {
+                        let t = state.resolve_input_time(time);
+                        state.send_stage_scroll_frame(
+                            &stage_id,
+                            pos.x,
+                            pos.y,
+                            dx,
+                            dy,
+                            source,
+                            v120,
+                            stop,
+                            Some(t),
+                        );
+                    }
+                }
+            }
+            SinkInputEvent::Key {
+                stage_id,
+                evdev_keycode,
+                pressed,
+                time,
+            } => {
+                if state.is_input_allowed(&stage_id, InputSource::Human, None) {
+                    let t = state.resolve_input_time(time);
+                    state.send_stage_evdev_key_at(&stage_id, evdev_keycode, pressed, t);
+                }
+            }
+            SinkInputEvent::Resized { stage_id, rect } => {
+                state.resize_stage_from_sink(&stage_id, rect);
+            }
+            SinkInputEvent::CloseRequested { stage_id } => {
+                let _ = state.close_stage(&stage_id);
+            }
+            SinkInputEvent::HostClipboardChanged { text } => {
+                state.sync_from_host_clipboard(text);
+            }
+            SinkInputEvent::FilesDropped {
+                stage_id,
+                paths,
+                x,
+                y,
+            } => {
+                let _ = state.drop_files_to_stage(&stage_id, &paths, Some((x, y).into()));
+            }
+        }
+    }
 }

@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use smithay::backend::input::AxisSource;
 use tracing::{info, warn};
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
+    wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
     wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
     wl_surface,
 };
@@ -111,6 +111,7 @@ struct WaylandStageWindow {
     wm_class: String,
     slots: Vec<ShmSlot>,
     last_frame: Option<(u32, u32, Vec<u8>)>,
+    pending_frame_cb: Option<(wl_callback::WlCallback, std::time::Instant)>,
 }
 
 struct WaylandClientState {
@@ -144,6 +145,7 @@ struct WaylandClientState {
     dnd_stage: Option<String>,
     dnd_pos: (f64, f64),
     just_configured: Vec<String>,
+    frame_done_stages: Vec<String>,
 
     events: Vec<SinkInputEvent>,
 }
@@ -219,6 +221,7 @@ impl WaylandClientState {
             dnd_stage: None,
             dnd_pos: (0.0, 0.0),
             just_configured: Vec::new(),
+            frame_done_stages: Vec::new(),
             events: Vec::new(),
         }
     }
@@ -386,6 +389,7 @@ impl WslgWaylandSink {
             wm_class: cls.to_string(),
             slots: Vec::new(),
             last_frame: None,
+            pending_frame_cb: None,
         });
 
         win.surface = Some(surface.clone());
@@ -394,6 +398,7 @@ impl WslgWaylandSink {
         win.decoration = decoration;
         win.configured = false;
         win.mapped = true;
+        win.pending_frame_cb = None;
         win.rect = rect;
         win.title = clean_title.to_string();
         win.wm_class = cls.to_string();
@@ -416,6 +421,7 @@ impl WslgWaylandSink {
         if let Some(win) = self.state.windows.get_mut(stage_id) {
             win.mapped = false;
             win.configured = false;
+            win.pending_frame_cb = None;
             if let Some(dec) = win.decoration.take() {
                 dec.destroy();
             }
@@ -463,10 +469,11 @@ impl DisplaySink for WslgWaylandSink {
         let Some(win) = self.state.windows.get_mut(stage_id) else {
             return;
         };
-        win.last_frame = Some((width, height, bgra.to_vec()));
         if !win.mapped || !win.configured {
+            win.last_frame = Some((width, height, bgra.to_vec()));
             return;
         }
+        win.last_frame = None;
         let Some(ref surface) = win.surface else {
             return;
         };
@@ -495,6 +502,8 @@ impl DisplaySink for WslgWaylandSink {
 
         win.slots[idx].write_bgra(bgra);
         win.slots[idx].busy = true;
+        let cb = surface.frame(&self.qh, stage_id.to_string());
+        win.pending_frame_cb = Some((cb, std::time::Instant::now()));
         surface.attach(Some(&win.slots[idx].buffer), 0, 0);
         surface.damage_buffer(0, 0, width as i32, height as i32);
         surface.commit();
@@ -585,10 +594,35 @@ impl DisplaySink for WslgWaylandSink {
         }
     }
 
+    fn event_fd(&self) -> Option<OwnedFd> {
+        self.conn.as_fd().try_clone_to_owned().ok()
+    }
+
+    fn flush(&mut self) {
+        let _ = self.conn.flush();
+    }
+
+    fn is_frame_pending(&self, stage_id: &str) -> bool {
+        const FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+        self.state
+            .windows
+            .get(stage_id)
+            .and_then(|w| w.pending_frame_cb.as_ref())
+            .is_some_and(|(_, since)| since.elapsed() < FRAME_TIMEOUT)
+    }
+
+    fn take_frame_done_stages(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.state.frame_done_stages)
+    }
+
     fn poll_events(&mut self) -> Vec<SinkInputEvent> {
         let _ = self.queue.dispatch_pending(&mut self.state);
         let _ = self.conn.flush();
-        if let Some(guard) = self.conn.prepare_read() {
+        for _ in 0..16 {
+            let Some(guard) = self.conn.prepare_read() else {
+                let _ = self.queue.dispatch_pending(&mut self.state);
+                continue;
+            };
             let fd = guard.connection_fd().as_raw_fd();
             let mut pfd = libc::pollfd {
                 fd,
@@ -597,9 +631,14 @@ impl DisplaySink for WslgWaylandSink {
             };
             let ready = unsafe { libc::poll(&mut pfd, 1, 0) };
             if ready > 0 && (pfd.revents & libc::POLLIN) != 0 {
-                let _ = guard.read();
+                match guard.read() {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
             } else {
                 drop(guard);
+                break;
             }
         }
         let _ = self.queue.dispatch_pending(&mut self.state);
@@ -745,6 +784,30 @@ impl Dispatch<wl_shm_pool::WlShmPool, ()> for WaylandClientState {
 
 impl Dispatch<wl_surface::WlSurface, ()> for WaylandClientState {
     fn event(_: &mut Self, _: &wl_surface::WlSurface, _: wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<wl_callback::WlCallback, String> for WaylandClientState {
+    fn event(
+        state: &mut Self,
+        callback: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        stage_id: &String,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            if let Some(win) = state.windows.get_mut(stage_id) {
+                if win
+                    .pending_frame_cb
+                    .as_ref()
+                    .is_some_and(|(cb, _)| cb.id() == callback.id())
+                {
+                    win.pending_frame_cb = None;
+                    state.frame_done_stages.push(stage_id.clone());
+                }
+            }
+        }
+    }
 }
 
 impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandClientState {

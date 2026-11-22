@@ -551,6 +551,15 @@ impl DisplaySink for WslgSink {
         WslgSink::set_host_clipboard(self, text);
     }
 
+    fn event_fd(&self) -> Option<std::os::fd::OwnedFd> {
+        use std::os::fd::AsFd;
+        self.conn.stream().as_fd().try_clone_to_owned().ok()
+    }
+
+    fn flush(&mut self) {
+        let _ = self.conn.flush();
+    }
+
     fn poll_events(&mut self) -> Vec<SinkInputEvent> {
         let mut out = Vec::new();
         while let Ok(Some(ev)) = self.conn.poll_for_event() {

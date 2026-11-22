@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use smithay::reexports::calloop::channel::{self, Channel, Sender as CalloopSender};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::utils::{Logical, Point};
 use tracing::{info, warn};
@@ -25,7 +26,7 @@ pub struct ControlServerMessage {
 
 pub fn spawn_control_server(
     socket_path: &Path,
-) -> std::io::Result<mpsc::Receiver<ControlServerMessage>> {
+) -> std::io::Result<Channel<ControlServerMessage>> {
     if socket_path.exists() {
         let _ = std::fs::remove_file(socket_path);
     }
@@ -34,7 +35,7 @@ pub fn spawn_control_server(
     }
 
     let listener = UnixListener::bind(socket_path)?;
-    let (tx, rx) = mpsc::channel::<ControlServerMessage>();
+    let (tx, rx) = channel::channel::<ControlServerMessage>();
 
     thread::Builder::new()
         .name("focusstage-ctrl".into())
@@ -57,7 +58,7 @@ pub fn spawn_control_server(
     Ok(rx)
 }
 
-fn handle_client(stream: UnixStream, tx: mpsc::Sender<ControlServerMessage>) {
+fn handle_client(stream: UnixStream, tx: CalloopSender<ControlServerMessage>) {
     let Ok(write_stream) = stream.try_clone() else {
         return;
     };

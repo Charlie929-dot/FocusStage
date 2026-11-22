@@ -8,7 +8,7 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::pixman::PixmanRenderer;
 use smithay::backend::renderer::utils::draw_render_elements;
 use smithay::backend::renderer::{
-    Bind, Color32F, ExportMem, Frame, Offscreen, Renderer,
+    Bind, Color32F, Frame, Offscreen, Renderer,
 };
 use smithay::desktop::PopupManager;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
@@ -210,21 +210,24 @@ impl OffscreenCore {
                 .finish()
                 .map_err(|e| format!("finish pixman frame: {e}"))?;
         }
+        drop(target);
 
-        let mapping = self
-            .renderer
-            .copy_framebuffer(
-                &target,
-                Rectangle::from_size(buf_size),
-                DrmFourcc::Argb8888,
-            )
-            .map_err(|e| format!("copy framebuffer: {e}"))?;
-
-        let bytes = self
-            .renderer
-            .map_texture(&mapping)
-            .map_err(|e| format!("map texture: {e}"))?
-            .to_vec();
+        let stride = img.stride();
+        let row_bytes = (phys_w as usize) * 4;
+        let height = img.height();
+        let raw = unsafe {
+            std::slice::from_raw_parts(img.data() as *const u8, stride * height)
+        };
+        let bytes = if stride == row_bytes {
+            raw.to_vec()
+        } else {
+            let mut out = Vec::with_capacity(row_bytes * (phys_h as usize));
+            for row in 0..(phys_h as usize).min(height) {
+                let start = row * stride;
+                out.extend_from_slice(&raw[start..start + row_bytes]);
+            }
+            out
+        };
 
         Ok((phys_w as u32, phys_h as u32, bytes))
     }
