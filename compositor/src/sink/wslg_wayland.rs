@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use smithay::backend::input::AxisSource;
 use tracing::{debug, info, warn};
+use wayland_client::backend::WaylandError;
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
     wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
@@ -23,7 +24,7 @@ use wayland_protocols::xdg::decoration::zv1::client::{
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 use crate::protocol::SavedRect;
-use crate::sink::{DisplaySink, SinkInputEvent};
+use crate::sink::{DisplaySink, SinkInputEvent, WindowInfo};
 
 struct ShmSlot {
     pool: wl_shm_pool::WlShmPool,
@@ -314,7 +315,8 @@ impl PendingScrollFrame {
         );
         if emitted {
             out.push(SinkInputEvent::PointerScroll {
-                stage_id: stage_id.to_string(),
+                window_id: stage_id.to_string(),
+                position: None,
                 dx,
                 dy,
                 source: self.source,
@@ -1086,12 +1088,10 @@ fn run_worker_loop(
                         publish_worker_outputs(&mut worker.state, &shared, &notify_main_fd);
                         break;
                     }
+                    Err(WaylandError::Io(err)) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) => {
-                        let msg = format!("{e}");
-                        if !msg.contains("WouldBlock") {
-                            warn!("wslg-wayland-io read error: {}", e);
-                            running = false;
-                        }
+                        warn!("wslg-wayland-io read error: {}", e);
+                        running = false;
                         break;
                     }
                 }
@@ -1104,7 +1104,8 @@ fn run_worker_loop(
 }
 
 impl DisplaySink for WslgWaylandSink {
-    fn show(&mut self, stage_id: &str, title: &str, wm_class: &str, rect: SavedRect) {
+    fn show(&mut self, window: WindowInfo<'_>) {
+        let WindowInfo { window_id: stage_id, title, wm_class, rect, .. } = window;
         {
             let mut guard = self.shared.lock().unwrap();
             guard.window_rects.insert(stage_id.to_string(), rect);
@@ -1261,7 +1262,7 @@ impl DisplaySink for WslgWaylandSink {
             .is_some_and(|since| since.elapsed() < FRAME_TIMEOUT)
     }
 
-    fn take_frame_done_stages(&mut self) -> Vec<String> {
+    fn take_frame_done_windows(&mut self) -> Vec<String> {
         let mut guard = self.shared.lock().unwrap();
         std::mem::take(&mut guard.frame_done_stages)
     }
@@ -1510,7 +1511,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandClientState {
                             win.rect.height = h;
                             state.updated_rects.push((sid.clone(), win.rect));
                             state.events.push(SinkInputEvent::Resized {
-                                stage_id: sid,
+                                window_id: sid,
                                 rect: win.rect,
                             });
                         }
@@ -1518,7 +1519,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandClientState {
                 }
             }
             xdg_toplevel::Event::Close => {
-                state.events.push(SinkInputEvent::CloseRequested { stage_id: sid });
+                state.events.push(SinkInputEvent::CloseRequested { window_id: sid });
             }
             _ => {}
         }
@@ -1579,7 +1580,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientState {
                     state.pointer_stage = Some(sid.clone());
                     state.pointer_pos = (surface_x, surface_y);
                     state.events.push(SinkInputEvent::PointerMotion {
-                        stage_id: sid,
+                        window_id: sid,
                         x: surface_x,
                         y: surface_y,
                         time: 0,
@@ -1602,7 +1603,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientState {
                 state.pointer_pos = (surface_x, surface_y);
                 if let Some(sid) = state.pointer_stage.clone() {
                     state.events.push(SinkInputEvent::PointerMotion {
-                        stage_id: sid,
+                        window_id: sid,
                         x: surface_x,
                         y: surface_y,
                         time,
@@ -1619,7 +1620,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientState {
                 state.last_input_serial = serial;
                 if let Some(sid) = state.pointer_stage.clone() {
                     state.events.push(SinkInputEvent::PointerButton {
-                        stage_id: sid,
+                        window_id: sid,
                         button,
                         pressed: btn_state == wl_pointer::ButtonState::Pressed,
                         x: state.pointer_pos.0,
@@ -1754,7 +1755,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientState {
                 if let Some(sid) = state.keyboard_stage.clone() {
                     if matches!(kstate, wl_keyboard::KeyState::Pressed | wl_keyboard::KeyState::Released) {
                         state.events.push(SinkInputEvent::Key {
-                            stage_id: sid,
+                            window_id: sid,
                             evdev_keycode: key,
                             pressed: kstate == wl_keyboard::KeyState::Pressed,
                             time,
@@ -1895,7 +1896,7 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientState {
                             .collect();
                         if !paths.is_empty() {
                             state.events.push(SinkInputEvent::FilesDropped {
-                                stage_id: sid,
+                                window_id: sid,
                                 paths,
                                 x: state.dnd_pos.0,
                                 y: state.dnd_pos.1,
@@ -1940,7 +1941,8 @@ mod tests {
         assert_eq!(out.len(), 1);
         match &out[0] {
             SinkInputEvent::PointerScroll {
-                stage_id,
+                window_id: stage_id,
+                position: None,
                 dx,
                 dy,
                 source,

@@ -14,7 +14,7 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
 use crate::protocol::SavedRect;
-use crate::sink::{DisplaySink, SinkInputEvent};
+use crate::sink::{DisplaySink, SinkInputEvent, WindowInfo};
 
 x11rb::atom_manager! {
     pub WslgAtoms: WslgAtomsCookie {
@@ -407,7 +407,8 @@ impl WslgSink {
 }
 
 impl DisplaySink for WslgSink {
-    fn show(&mut self, stage_id: &str, title: &str, wm_class: &str, rect: SavedRect) {
+    fn show(&mut self, window: WindowInfo<'_>) {
+        let WindowInfo { window_id: stage_id, title, wm_class, rect, .. } = window;
         let win = match self.ensure_proxy_window(stage_id, title, wm_class, rect) {
             Ok(w) => w,
             Err(e) => {
@@ -580,7 +581,7 @@ impl DisplaySink for WslgSink {
                 Event::MotionNotify(e) => {
                     if let Some(stage_id) = self.win_to_stage.get(&e.event).cloned() {
                         out.push(SinkInputEvent::PointerMotion {
-                            stage_id,
+                            window_id: stage_id,
                             x: e.event_x as f64,
                             y: e.event_y as f64,
                             time: e.time,
@@ -598,7 +599,7 @@ impl DisplaySink for WslgSink {
                     if let Some(stage_id) = self.win_to_stage.get(&win).cloned() {
                         match detail {
                             1 => out.push(SinkInputEvent::PointerButton {
-                                stage_id,
+                                window_id: stage_id,
                                 button: 0x110, // BTN_LEFT
                                 pressed,
                                 x,
@@ -606,7 +607,7 @@ impl DisplaySink for WslgSink {
                                 time,
                             }),
                             2 => out.push(SinkInputEvent::PointerButton {
-                                stage_id,
+                                window_id: stage_id,
                                 button: 0x112, // BTN_MIDDLE
                                 pressed,
                                 x,
@@ -614,7 +615,7 @@ impl DisplaySink for WslgSink {
                                 time,
                             }),
                             3 => out.push(SinkInputEvent::PointerButton {
-                                stage_id,
+                                window_id: stage_id,
                                 button: 0x111, // BTN_RIGHT
                                 pressed,
                                 x,
@@ -622,7 +623,8 @@ impl DisplaySink for WslgSink {
                                 time,
                             }),
                             4 if pressed => out.push(SinkInputEvent::PointerScroll {
-                                stage_id,
+                                window_id: stage_id,
+                                position: None,
                                 dx: 0.0,
                                 dy: -15.0,
                                 source: Some(smithay::backend::input::AxisSource::Wheel),
@@ -631,7 +633,8 @@ impl DisplaySink for WslgSink {
                                 time,
                             }),
                             5 if pressed => out.push(SinkInputEvent::PointerScroll {
-                                stage_id,
+                                window_id: stage_id,
+                                position: None,
                                 dx: 0.0,
                                 dy: 15.0,
                                 source: Some(smithay::backend::input::AxisSource::Wheel),
@@ -640,7 +643,8 @@ impl DisplaySink for WslgSink {
                                 time,
                             }),
                             6 if pressed => out.push(SinkInputEvent::PointerScroll {
-                                stage_id,
+                                window_id: stage_id,
+                                position: None,
                                 dx: -15.0,
                                 dy: 0.0,
                                 source: Some(smithay::backend::input::AxisSource::Wheel),
@@ -649,7 +653,8 @@ impl DisplaySink for WslgSink {
                                 time,
                             }),
                             7 if pressed => out.push(SinkInputEvent::PointerScroll {
-                                stage_id,
+                                window_id: stage_id,
+                                position: None,
                                 dx: 15.0,
                                 dy: 0.0,
                                 source: Some(smithay::backend::input::AxisSource::Wheel),
@@ -670,7 +675,7 @@ impl DisplaySink for WslgSink {
                     if let Some(stage_id) = self.win_to_stage.get(&win).cloned() {
                         if detail >= 8 {
                             out.push(SinkInputEvent::Key {
-                                stage_id,
+                                window_id: stage_id,
                                 evdev_keycode: (detail as u32) - 8,
                                 pressed,
                                 time,
@@ -691,7 +696,7 @@ impl DisplaySink for WslgSink {
                                 pw.rect.width != rect.width || pw.rect.height != rect.height;
                             pw.rect = rect;
                             if size_changed {
-                                out.push(SinkInputEvent::Resized { stage_id, rect });
+                                out.push(SinkInputEvent::Resized { window_id: stage_id, rect });
                             }
                         }
                     }
@@ -701,7 +706,7 @@ impl DisplaySink for WslgSink {
                         let data = e.data.as_data32();
                         if data[0] == self.atoms.WM_DELETE_WINDOW {
                             if let Some(stage_id) = self.win_to_stage.get(&e.window).cloned() {
-                                out.push(SinkInputEvent::CloseRequested { stage_id });
+                                out.push(SinkInputEvent::CloseRequested { window_id: stage_id });
                             }
                         }
                     } else if e.type_ == self.atoms.XdndEnter {
@@ -787,7 +792,7 @@ impl DisplaySink for WslgSink {
                                                 .collect();
                                             if !paths.is_empty() {
                                                 out.push(SinkInputEvent::FilesDropped {
-                                                    stage_id,
+                                                    window_id: stage_id,
                                                     paths,
                                                     x: self.xdnd_drop_pos.0,
                                                     y: self.xdnd_drop_pos.1,

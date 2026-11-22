@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use smithay::backend::renderer::utils::on_commit_buffer_handler;
-use smithay::desktop::{get_popup_toplevel_coords, PopupKind, PopupManager};
+use smithay::backend::renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state};
+use smithay::desktop::{find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::calloop::channel as calloop_channel;
@@ -18,10 +18,11 @@ use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     CompositorClientState, CompositorHandler, CompositorState,
 };
+use smithay::wayland::fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
-    PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+    PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
 };
 use smithay::wayland::shm::{ShmHandler, ShmState};
@@ -31,7 +32,7 @@ use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::xwm::XwmId;
 use smithay::xwayland::{X11Surface, X11Wm, XWaylandClientData};
 use smithay::{
-    delegate_compositor, delegate_output, delegate_seat, delegate_shm,
+    delegate_compositor, delegate_fractional_scale, delegate_output, delegate_seat, delegate_shm,
     delegate_single_pixel_buffer, delegate_viewporter, delegate_xdg_decoration,
     delegate_xdg_shell, delegate_xwayland_shell,
 };
@@ -39,11 +40,10 @@ use tracing::{debug, info};
 
 use crate::a11y::A11yCollector;
 use crate::clipboard::StageDataDeviceManagerState;
+use crate::dpi::VirtualOutputs;
 use crate::offscreen::OffscreenCore;
-use crate::protocol::{DisplayState, StageKind};
+use crate::protocol::{DisplayState, SavedRect, StageKind};
 use crate::router::{PendingActJob, StageTextInputManagerState};
-use crate::sink::wslg::WslgSink;
-use crate::sink::wslg_wayland::WslgWaylandSink;
 use crate::sink::DisplaySink;
 use crate::stage::{Stage, StageToplevel};
 
@@ -85,6 +85,7 @@ pub struct FocusStageState {
     pub seat: Seat<Self>,
     pub popups: PopupManager,
     pub offscreen: OffscreenCore,
+    pub virtual_outputs: VirtualOutputs,
 
     pub clipboard_state: StageDataDeviceManagerState,
     pub clipboard_update_tx: calloop_channel::Sender<(String, String)>,
@@ -96,11 +97,11 @@ pub struct FocusStageState {
 
     pub xwms: HashMap<XwmId, X11Wm>,
     pub xwm_to_stage: HashMap<XwmId, String>,
-    pub x11_override_windows: HashMap<XwmId, Vec<X11Surface>>,
+    pub x11_override_windows: HashMap<XwmId, Vec<(X11Surface, Option<u32>)>>,
 
     pub pending_act_jobs: Vec<PendingActJob>,
     pub a11y: A11yCollector,
-    pub wslg_sink: Option<Box<dyn DisplaySink>>,
+    pub display_sink: Option<Box<dyn DisplaySink>>,
     pub wslg_time_anchor: Option<(u32, u32)>,
     pub should_quit: bool,
 }
@@ -113,7 +114,8 @@ impl FocusStageState {
         runtime_base_dir: PathBuf,
         default_scale: f64,
         frame_hz: u32,
-        enable_wslg: bool,
+        primary_monitor: SavedRect,
+        display_sink: Option<Box<dyn DisplaySink>>,
     ) -> Self {
         let compositor_state = CompositorState::new::<Self>(dh);
         let xdg_shell_state = XdgShellState::new::<Self>(dh);
@@ -130,7 +132,9 @@ impl FocusStageState {
         let xwayland_shell_state = XWaylandShellState::new::<Self>(dh);
         let clipboard_state = StageDataDeviceManagerState::new(dh);
         let text_input_state = StageTextInputManagerState::new(dh);
-        let offscreen = OffscreenCore::new(dh, 1920, 1080, default_scale, frame_hz);
+        let offscreen = OffscreenCore::new();
+        let virtual_outputs = VirtualOutputs::new(dh, primary_monitor, default_scale, frame_hz);
+        FractionalScaleManagerState::new::<Self>(dh);
         let (clipboard_update_tx, clipboard_update_rx) = calloop_channel::channel::<(String, String)>();
         let _ = loop_handle.insert_source(clipboard_update_rx, |event, _, state| {
             if let calloop_channel::Event::Msg((sid, text)) = event {
@@ -138,32 +142,6 @@ impl FocusStageState {
             }
         });
         let a11y = A11yCollector::spawn();
-
-        let wslg_sink: Option<Box<dyn DisplaySink>> = if enable_wslg {
-            match WslgWaylandSink::connect() {
-                Ok(ws) => Some(Box::new(ws)),
-                Err(wl_err) => {
-                    let disp = std::env::var("WSLG_DISPLAY")
-                        .ok()
-                        .or_else(|| std::env::var("DISPLAY").ok());
-                    match disp.as_deref() {
-                        Some(d) if !d.is_empty() => match WslgSink::connect(Some(d)) {
-                            Ok(s) => Some(Box::new(s)),
-                            Err(e) => {
-                                info!("WSLg sink unavailable (wl: {}, x11: {}): running headless", wl_err, e);
-                                None
-                            }
-                        },
-                        _ => {
-                            info!("WSLg sink unavailable (wl: {}): running headless", wl_err);
-                            None
-                        }
-                    }
-                }
-            }
-        } else {
-            None
-        };
 
         Self {
             start_time: Instant::now(),
@@ -184,6 +162,7 @@ impl FocusStageState {
             seat,
             popups: PopupManager::default(),
             offscreen,
+            virtual_outputs,
             clipboard_state,
             clipboard_update_tx,
             text_input_state,
@@ -195,7 +174,7 @@ impl FocusStageState {
             x11_override_windows: HashMap::new(),
             pending_act_jobs: Vec::new(),
             a11y,
-            wslg_sink,
+            display_sink,
             wslg_time_anchor: None,
             should_quit: false,
         }
@@ -221,7 +200,7 @@ impl FocusStageState {
         // Fallback: auto-create an external Stage for manually launched Wayland clients
         self.next_stage_seq += 1;
         let sid = format!("stage-{}", self.next_stage_seq);
-        let disp = if self.wslg_sink.is_some() {
+        let disp = if self.display_sink.is_some() {
             DisplayState::Desktop
         } else {
             DisplayState::Hidden
@@ -243,17 +222,29 @@ impl FocusStageState {
         sid
     }
 
+    fn maximize_toplevel(&mut self, surface: ToplevelSurface, maximized: bool) {
+        if let Some(id) = self.window_id_for_toplevel(&StageToplevel::Wayland(surface.clone())) {
+            self.request_window_maximized(&id, maximized);
+        }
+        surface.with_pending_state(|state| {
+            if maximized {
+                state.states.set(xdg_toplevel::State::Maximized);
+            } else {
+                state.states.unset(xdg_toplevel::State::Maximized);
+            }
+        });
+        surface.send_configure();
+    }
+
     pub(crate) fn constrain_popup_geometry(
         &self,
         surface: &PopupSurface,
         positioner: PositionerState,
     ) -> Rectangle<i32, Logical> {
-        let stage_size = surface
-            .wl_surface()
-            .client()
-            .and_then(|c| self.stage_id_for_client(&c.id()))
-            .and_then(|sid| self.stages.get(&sid))
-            .map(|s| s.logical_size);
+        let stage_size = find_popup_root_surface(&PopupKind::Xdg(surface.clone()))
+            .ok()
+            .and_then(|root| self.window_for_surface(&root))
+            .map(|window| window.logical_size);
 
         let Some(stage_size) = stage_size else {
             return positioner.get_geometry();
@@ -297,15 +288,40 @@ impl CompositorHandler for FocusStageState {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
         self.popups.commit(surface);
-        self.offscreen.ensure_surface_entered(surface);
+        self.sync_surface_output(surface);
 
-        if let Some(client) = surface.client() {
-            let sid = self.stage_id_for_client(&client.id());
-            if let Some(stage_id) = sid {
+        if let Some(window) = self.window_for_surface(surface) {
+            let id = window.id.clone();
+            let (stage_id, _) = id.rsplit_once('/').unwrap();
+            let is_root = window.toplevel.wl_surface().as_ref() == Some(surface);
+            if is_root {
+                if let StageToplevel::Wayland(toplevel) = &window.toplevel {
+                    let mapped = with_renderer_surface_state(surface, |state| state.buffer().is_some())
+                        .unwrap_or(false);
+                    if !mapped && !toplevel.is_initial_configure_sent() {
+                        toplevel.send_configure();
+                    }
+                    if mapped && !window.mapped {
+                        let geometry = smithay::wayland::compositor::with_states(surface, |states| {
+                            states.cached_state.get::<SurfaceCachedState>().current().geometry
+                        });
+                        let size = geometry.map(|rect| rect.size).or_else(|| {
+                            with_renderer_surface_state(surface, |state| state.surface_size()).flatten()
+                        });
+                        if let Some(size) = size {
+                            self.stages.get_mut(stage_id).unwrap().window_mut(&id).unwrap().set_mapped_size(size);
+                        }
+                    }
+                    self.set_window_mapped(&id, mapped);
+                }
+            }
+            self.stages.get_mut(stage_id).unwrap().bump_window_frame(&id);
+        } else if let Some(client) = surface.client() {
+            if let Some(stage_id) = self.stage_id_for_client(&client.id()) {
                 if let Some(stage) = self.stages.get_mut(&stage_id) {
+                    // X11 override-redirect surfaces are composited with their owning window.
                     stage.bump_frame();
                 }
-                self.ensure_virtual_focus(&stage_id);
             }
         }
     }
@@ -321,38 +337,19 @@ impl XdgShellHandler for FocusStageState {
             return;
         };
         let stage_id = self.ensure_stage_for_client(&client);
-        let size = self
-            .stages
-            .get(&stage_id)
-            .map(|s| s.logical_size)
-            .unwrap_or_else(|| (1280, 800).into());
+        let stage = self.stages.get_mut(&stage_id).unwrap();
+        let size = (stage.initial_rect.width as i32, stage.initial_rect.height as i32).into();
+        let initial_size = stage.windows.is_empty().then_some(size);
+        stage.wayland_clients.insert(client.id(), client);
+        stage.add_window(StageToplevel::Wayland(surface.clone()), size);
 
         surface.with_pending_state(|state| {
-            state.size = Some(size);
+            state.size = initial_size;
             state.states.set(xdg_toplevel::State::Activated);
         });
         surface.send_configure();
-
-        let mut show_rect = None;
-        let mut show_title = String::new();
-        let mut show_wm_class = String::new();
-        if let Some(stage) = self.stages.get_mut(&stage_id) {
-            stage.wayland_clients.insert(client.id(), client.clone());
-            stage.toplevels.push(StageToplevel::Wayland(surface.clone()));
-            stage.bump_frame();
-            if stage.display == DisplayState::Desktop {
-                show_rect = stage.saved_rect;
-                show_title = stage.title.clone();
-                show_wm_class = stage.wm_class.clone();
-            }
-        }
-
-        self.offscreen.ensure_surface_entered(surface.wl_surface());
+        self.sync_surface_output(surface.wl_surface());
         self.ensure_virtual_focus(&stage_id);
-
-        if let (Some(ref mut sink), Some(rect)) = (&mut self.wslg_sink, show_rect) {
-            sink.show(&stage_id, &show_title, &show_wm_class, rect);
-        }
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
@@ -363,7 +360,7 @@ impl XdgShellHandler for FocusStageState {
         });
         let _ = self.popups.track_popup(PopupKind::Xdg(surface.clone()));
         let _ = surface.send_configure();
-        self.offscreen.ensure_surface_entered(surface.wl_surface());
+        self.sync_surface_output(surface.wl_surface());
     }
 
     fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
@@ -391,37 +388,28 @@ impl XdgShellHandler for FocusStageState {
                 .get::<XdgToplevelSurfaceData>()
                 .and_then(|d| d.lock().unwrap().title.clone())
         });
-        if let (Some(t), Some(client)) = (title, surface.wl_surface().client()) {
-            if let Some(stage_id) = self.stage_id_for_client(&client.id()) {
-                if let Some(stage) = self.stages.get_mut(&stage_id) {
-                    stage.title = t.clone();
-                }
-                if let Some(ref mut sink) = self.wslg_sink {
-                    sink.set_title(&stage_id, &t);
-                }
-            }
+        if let (Some(title), Some(id)) = (title, self.window_id_for_toplevel(&StageToplevel::Wayland(surface))) {
+            self.update_window_title(&id, title);
+        }
+    }
+
+    fn parent_changed(&mut self, surface: ToplevelSurface) {
+        let parent = surface.parent().and_then(|wl| self.window_for_surface(&wl)).map(|w| w.id.clone());
+        if let Some(id) = self.window_id_for_toplevel(&StageToplevel::Wayland(surface)) {
+            self.update_window_parent(&id, parent);
         }
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        if let Some(client) = surface.wl_surface().client() {
-            if let Some(stage_id) = self.stage_id_for_client(&client.id()) {
-                if let Some(stage) = self.stages.get_mut(&stage_id) {
-                    stage.toplevels.retain(|t| match t {
-                        StageToplevel::Wayland(w) => w.wl_surface() != surface.wl_surface(),
-                        _ => true,
-                    });
-                }
-            }
+        if let Some(id) = self.window_id_for_toplevel(&StageToplevel::Wayland(surface)) {
+            self.remove_window(&id);
         }
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
-        if let Some(client) = surface.wl_surface().client() {
-            if let Some(stage_id) = self.stage_id_for_client(&client.id()) {
-                if let Some(ref mut sink) = self.wslg_sink {
-                    sink.begin_move(&stage_id);
-                }
+        if let Some(id) = self.window_id_for_toplevel(&StageToplevel::Wayland(surface)) {
+            if let Some(sink) = self.display_sink.as_mut() {
+                sink.begin_move(&id);
             }
         }
     }
@@ -444,51 +432,27 @@ impl XdgShellHandler for FocusStageState {
             xdg_toplevel::ResizeEdge::Left => 7,
             _ => return,
         };
-        if let Some(client) = surface.wl_surface().client() {
-            if let Some(stage_id) = self.stage_id_for_client(&client.id()) {
-                if let Some(ref mut sink) = self.wslg_sink {
-                    sink.begin_resize(&stage_id, dir);
-                }
+        if let Some(id) = self.window_id_for_toplevel(&StageToplevel::Wayland(surface)) {
+            if let Some(sink) = self.display_sink.as_mut() {
+                sink.begin_resize(&id, dir);
             }
         }
     }
 
     fn minimize_request(&mut self, surface: ToplevelSurface) {
-        if let Some(client) = surface.wl_surface().client() {
-            if let Some(stage_id) = self.stage_id_for_client(&client.id()) {
-                if let Some(ref mut sink) = self.wslg_sink {
-                    sink.minimize(&stage_id);
-                }
+        if let Some(id) = self.window_id_for_toplevel(&StageToplevel::Wayland(surface)) {
+            if let Some(sink) = self.display_sink.as_mut() {
+                sink.minimize(&id);
             }
         }
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        surface.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Maximized);
-        });
-        surface.send_configure();
-        if let Some(client) = surface.wl_surface().client() {
-            if let Some(stage_id) = self.stage_id_for_client(&client.id()) {
-                if let Some(ref mut sink) = self.wslg_sink {
-                    sink.set_maximized(&stage_id, true);
-                }
-            }
-        }
+        self.maximize_toplevel(surface, true);
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        surface.with_pending_state(|state| {
-            state.states.unset(xdg_toplevel::State::Maximized);
-        });
-        surface.send_configure();
-        if let Some(client) = surface.wl_surface().client() {
-            if let Some(stage_id) = self.stage_id_for_client(&client.id()) {
-                if let Some(ref mut sink) = self.wslg_sink {
-                    sink.set_maximized(&stage_id, false);
-                }
-            }
-        }
+        self.maximize_toplevel(surface, false);
     }
 }
 
@@ -499,6 +463,14 @@ impl ShmHandler for FocusStageState {
 }
 
 impl OutputHandler for FocusStageState {}
+
+impl FractionalScaleHandler for FocusStageState {
+    fn new_fractional_scale(&mut self, surface: WlSurface) {
+        if self.window_for_surface(&surface).is_some() {
+            self.sync_surface_output(&surface);
+        }
+    }
+}
 
 impl SeatHandler for FocusStageState {
     type KeyboardFocus = WlSurface;
@@ -546,6 +518,7 @@ delegate_xdg_decoration!(FocusStageState);
 delegate_shm!(FocusStageState);
 delegate_seat!(FocusStageState);
 delegate_output!(FocusStageState);
+delegate_fractional_scale!(FocusStageState);
 delegate_viewporter!(FocusStageState);
 delegate_single_pixel_buffer!(FocusStageState);
 delegate_xwayland_shell!(FocusStageState);
@@ -556,7 +529,7 @@ mod tests {
     use std::ffi::CString;
     use std::os::fd::FromRawFd;
     use std::os::unix::net::UnixStream;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use smithay::reexports::calloop::EventLoop;
     use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner;
@@ -565,7 +538,10 @@ mod tests {
         wl_buffer, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
         wl_surface,
     };
-    use wayland_client::{Connection, Dispatch, QueueHandle};
+    use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+    use wayland_protocols::wp::fractional_scale::v1::client::{
+        wp_fractional_scale_manager_v1 as c_scale_manager, wp_fractional_scale_v1 as c_scale,
+    };
     use wayland_protocols::xdg::shell::client::{
         xdg_positioner as c_pos, xdg_popup as c_popup, xdg_surface as c_surface,
         xdg_toplevel as c_toplevel, xdg_wm_base as c_wm,
@@ -621,6 +597,10 @@ mod tests {
         shm: Option<wl_shm::WlShm>,
         seat: Option<wl_seat::WlSeat>,
         pointer_enters: Vec<(u32, f64, f64)>,
+        fractional_scale: Option<c_scale_manager::WpFractionalScaleManagerV1>,
+        preferred_scales: HashMap<u32, u32>,
+        window_configures: HashMap<u32, (i32, i32, Vec<u32>)>,
+        window_closes: Vec<u32>,
         toplevel_configured: bool,
         popup1_configs: Vec<(i32, i32, i32, i32)>,
         popup1_repositioned: Vec<u32>,
@@ -653,6 +633,9 @@ mod tests {
                     }
                     "wl_shm" => {
                         state.shm = Some(reg.bind(name, version.min(1), qh, ()));
+                    }
+                    "wp_fractional_scale_manager_v1" => {
+                        state.fractional_scale = Some(reg.bind(name, 1, qh, ()));
                     }
                     "wl_seat" => {
                         let seat: wl_seat::WlSeat = reg.bind(name, version.min(7), qh, ());
@@ -701,8 +684,28 @@ mod tests {
     impl Dispatch<c_pos::XdgPositioner, ()> for TestClient {
         fn event(_: &mut Self, _: &c_pos::XdgPositioner, _: c_pos::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
     }
+    impl Dispatch<c_scale_manager::WpFractionalScaleManagerV1, ()> for TestClient {
+        fn event(_: &mut Self, _: &c_scale_manager::WpFractionalScaleManagerV1, _: c_scale_manager::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<c_scale::WpFractionalScaleV1, u32> for TestClient {
+        fn event(state: &mut Self, _: &c_scale::WpFractionalScaleV1, event: c_scale::Event, id: &u32, _: &Connection, _: &QueueHandle<Self>) {
+            if let c_scale::Event::PreferredScale { scale } = event {
+                state.preferred_scales.insert(*id, scale);
+            }
+        }
+    }
     impl Dispatch<c_toplevel::XdgToplevel, ()> for TestClient {
-        fn event(_: &mut Self, _: &c_toplevel::XdgToplevel, _: c_toplevel::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+        fn event(state: &mut Self, window: &c_toplevel::XdgToplevel, event: c_toplevel::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+            let id = window.id().protocol_id();
+            match event {
+                c_toplevel::Event::Configure { width, height, states } => {
+                    let states = states.chunks_exact(4).map(|v| u32::from_ne_bytes(v.try_into().unwrap())).collect();
+                    state.window_configures.insert(id, (width, height, states));
+                }
+                c_toplevel::Event::Close => state.window_closes.push(id),
+                _ => {}
+            }
+        }
     }
     impl Dispatch<c_surface::XdgSurface, ()> for TestClient {
         fn event(state: &mut Self, surf: &c_surface::XdgSurface, event: c_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
@@ -716,6 +719,8 @@ mod tests {
                     state.popup1_last_serial = Some(serial);
                 } else if Some(id) == state.popup2_xdg_id {
                     state.popup2_last_serial = Some(serial);
+                } else {
+                    surf.ack_configure(serial);
                 }
             }
         }
@@ -777,6 +782,187 @@ mod tests {
         (pool, buf)
     }
 
+    #[derive(Default)]
+    struct WindowLog {
+        shown: Vec<(String, String, Option<String>)>,
+        hidden: Vec<String>,
+        destroyed: Vec<String>,
+    }
+
+    struct TestSink(Arc<Mutex<WindowLog>>);
+
+    impl DisplaySink for TestSink {
+        fn show(&mut self, w: crate::sink::WindowInfo<'_>) {
+            self.0.lock().unwrap().shown.push((w.stage_id.into(), w.window_id.into(), w.parent_window_id.map(str::to_owned)));
+        }
+        fn hide(&mut self, id: &str) -> Option<SavedRect> {
+            self.0.lock().unwrap().hidden.push(id.into());
+            None
+        }
+        fn destroy(&mut self, id: &str) { self.0.lock().unwrap().destroyed.push(id.into()); }
+        fn set_title(&mut self, _: &str, _: &str) {}
+        fn present(&mut self, _: &str, _: u32, _: u32, _: &[u8]) {}
+        fn poll_events(&mut self) -> Vec<crate::sink::SinkInputEvent> { Vec::new() }
+    }
+
+    #[test]
+    fn same_stage_windows_map_resize_scale_and_close_independently() {
+        let event_loop: EventLoop<'static, FocusStageState> = EventLoop::try_new().unwrap();
+        let mut display = Display::new().unwrap();
+        let mut dh = display.handle();
+        let log = Arc::new(Mutex::new(WindowLog::default()));
+        let mut state = FocusStageState::new(
+            &dh, event_loop.handle(), "focusstage-multitest".into(), std::env::temp_dir(),
+            1.25, 60, SavedRect { x: 0, y: 0, width: 1920, height: 1080 },
+            Some(Box::new(TestSink(log.clone()))),
+        );
+        let (server_sock, client_sock) = UnixStream::pair().unwrap();
+        let _client = dh.insert_client(server_sock, Arc::new(ClientState::default())).unwrap();
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue = conn.new_event_queue();
+        let qh = queue.handle();
+        let mut client = TestClient::default();
+        let _registry = conn.display().get_registry(&qh, ());
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let compositor = client.compositor.as_ref().unwrap().clone();
+        let wm = client.wm_base.as_ref().unwrap().clone();
+        let scale = client.fractional_scale.as_ref().unwrap().clone();
+        let shm = client.shm.as_ref().unwrap().clone();
+
+        let mut make_window = |title: &str, parent: Option<&c_toplevel::XdgToplevel>, w: i32, h: i32| {
+            let surface = compositor.create_surface(&qh, ());
+            let xdg = wm.get_xdg_surface(&surface, &qh, ());
+            let window = xdg.get_toplevel(&qh, ());
+            window.set_title(title.to_string());
+            window.set_parent(parent);
+            let fraction = scale.get_fractional_scale(&surface, &qh, window.id().protocol_id());
+            surface.commit();
+            pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+            let buffer_scale = if parent.is_some() { 2 } else { 1 };
+            let (pool, buffer) = create_shm_buffer(&shm, &qh, w * buffer_scale, h * buffer_scale);
+            surface.set_buffer_scale(buffer_scale);
+            if parent.is_none() {
+                xdg.set_window_geometry(0, 0, w, h);
+            }
+            surface.attach(Some(&buffer), 0, 0);
+            surface.commit();
+            pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+            (window, surface, xdg, fraction, pool, buffer)
+        };
+        let (first, first_surface, _, _, _, _) = make_window("First", None, 640, 480);
+        let (second, second_surface, second_xdg, second_fraction, _, _) = make_window("Second", Some(&first), 320, 240);
+        let (sid, first_id, second_id) = {
+            let log = log.lock().unwrap();
+            assert_eq!(log.shown.len(), 2);
+            let (sid, first_id, parent) = &log.shown[0];
+            assert!(parent.is_none());
+            assert_eq!(log.shown[1].0, *sid);
+            assert_eq!(log.shown[1].2.as_deref(), Some(first_id.as_str()));
+            (sid.clone(), first_id.clone(), log.shown[1].1.clone())
+        };
+        assert_eq!(state.stages.len(), 1);
+        assert_eq!(state.stages[&sid].window(&first_id).unwrap().title, "First");
+        assert_eq!(state.stages[&sid].window(&second_id).unwrap().title, "Second");
+        assert_eq!(client.preferred_scales[&first.id().protocol_id()], 150);
+        assert_eq!(client.preferred_scales[&second.id().protocol_id()], 150);
+
+        assert_eq!(state.stages[&sid].window(&second_id).unwrap().logical_size, (320, 240).into());
+        let host_state = crate::sink::WindowState {
+            rect: SavedRect { x: -1800, y: 0, width: 511, height: 480 },
+            scale: 1.5,
+            monitor: Some(SavedRect { x: -1920, y: 0, width: 1920, height: 1080 }),
+            pixel_size: Some([767, 720]),
+            activated: true, maximized: false, resizing: true, tiled: [true, false, true, true],
+        };
+        state.update_window_from_sink(&second_id, host_state.clone());
+        state.send_window_pointer_motion_at(&sid, Some(&first_id), 20.0, 30.0, 0);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(state.stages[&sid].active_window().unwrap().id, second_id);
+        assert_eq!(client.pointer_enters.last().unwrap().0, first_surface.id().protocol_id());
+        assert_eq!(client.preferred_scales[&first.id().protocol_id()], 150);
+        assert_eq!(client.preferred_scales[&second.id().protocol_id()], 180);
+        let (width, height, flags) = &client.window_configures[&second.id().protocol_id()];
+        assert_eq!((*width, *height), (511, 480));
+        for flag in [c_toplevel::State::Activated, c_toplevel::State::Resizing, c_toplevel::State::TiledLeft] {
+            assert!(flags.contains(&(flag as u32)));
+        }
+        assert_eq!(state.stages[&sid].window(&first_id).unwrap().logical_size, (640, 480).into());
+        let second_window = state.stages[&sid].window(&second_id).unwrap();
+        assert_eq!(state.offscreen.render_window_bgra_into(Some(second_window), second_window.logical_size,
+            second_window.scale, &[], &mut Vec::new()).unwrap(), (767, 720));
+
+        let shift = 42;
+        state.send_sink_key(&sid, &first_id, shift, true, 0);
+        state.update_window_from_sink(&second_id, host_state.clone());
+        state.send_sink_key(&sid, &second_id, shift, true, 0);
+        state.send_sink_key(&sid, &first_id, shift, false, 0);
+        assert_eq!(state.stages[&sid].active_window().unwrap().id, second_id);
+        assert!(state.stages[&sid].input.pressed_keys.contains(&shift));
+        state.send_sink_key(&sid, &second_id, shift, false, 0);
+        assert!(state.stages[&sid].input.pressed_keys.is_empty());
+
+        let inactive = crate::sink::WindowState { activated: false, ..host_state };
+        state.update_window_from_sink(&second_id, inactive.clone());
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let activated = c_toplevel::State::Activated as u32;
+        assert!(!client.window_configures[&second.id().protocol_id()].2.contains(&activated));
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        state.handle_control_message(crate::control::ControlServerMessage {
+            request: crate::protocol::ControlRequest::Acquire {
+                stage_id: sid.clone(), ttl_s: 30, hide: false, agent_name: None,
+            },
+            reply_tx,
+        });
+        assert!(matches!(reply_rx.try_recv().unwrap(), crate::protocol::ControlResponse::Acquired { .. }));
+        state.update_window_from_sink(&second_id, inactive.clone());
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert!(client.window_configures[&second.id().protocol_id()].2.contains(&activated));
+        state.human_takeover(Some(&sid));
+
+        second_surface.attach(None, 0, 0);
+        second_surface.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert!(!state.stages[&sid].window(&second_id).unwrap().mapped);
+        let (_pool, new_buffer) = create_shm_buffer(&shm, &qh, 768, 576);
+        second_surface.attach(Some(&new_buffer), 0, 0);
+        second_surface.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let remapped = state.stages[&sid].window(&second_id).unwrap();
+        assert!(remapped.mapped);
+        assert_eq!(remapped.logical_size, (384, 288).into());
+        assert_eq!(remapped.pixel_size, None);
+        assert_eq!((remapped.saved_rect.width, remapped.saved_rect.height), (384, 288));
+        assert_eq!(state.offscreen.render_window_bgra_into(Some(remapped), remapped.logical_size,
+            remapped.scale, &[], &mut Vec::new()).unwrap(), (576, 432));
+
+        state.send_sink_key(&sid, &second_id, shift, true, 0);
+        state.send_window_button_at(&sid, Some(&second_id), 20.0, 30.0, 0x110, true, 0);
+        state.close_window_from_sink(&second_id);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(client.window_closes, [second.id().protocol_id()]);
+        assert_eq!(state.stages[&sid].windows.len(), 2, "wait for the client to close the window");
+        second_fraction.destroy();
+        second.destroy();
+        second_xdg.destroy();
+        second_surface.destroy();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(log.lock().unwrap().destroyed.as_slice(), std::slice::from_ref(&second_id));
+        let stage = &state.stages[&sid];
+        assert_eq!(stage.active_window().unwrap().id, first_id);
+        assert!(stage.input.pressed_keys.is_empty());
+        assert!(stage.input.pressed_buttons.is_empty());
+        assert!(stage.input.pointer_window_id.is_none());
+        state.send_window_pointer_motion_at(&sid, Some(&first_id), 20.0, 30.0, 0);
+        state.leave_window_pointer(&sid, &first_id);
+        assert!(state.stages[&sid].input.current_pointer_target.is_none());
+
+        state.set_stage_display(&sid, DisplayState::Hidden);
+        state.update_window_from_sink(&first_id, inactive);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(log.lock().unwrap().hidden, [second_id, first_id]);
+        assert!(client.window_configures[&first.id().protocol_id()].2.contains(&activated));
+    }
+
     #[test]
     fn wayland_popup_new_reposition_and_nested_submenu_constrain_to_stage() {
         use wayland_client::Proxy;
@@ -792,7 +978,8 @@ mod tests {
             std::env::temp_dir(),
             1.0,
             60,
-            false,
+            SavedRect { x: 0, y: 0, width: 1920, height: 1080 },
+            None,
         );
 
         let (server_sock, client_sock) = UnixStream::pair().expect("unix socket pair");
@@ -822,7 +1009,7 @@ mod tests {
         assert!(client.toplevel_configured);
 
         let stage_id = state.stages.keys().next().unwrap().clone();
-        state.stages.get_mut(&stage_id).unwrap().logical_size = (800, 600).into();
+        state.stages.get_mut(&stage_id).unwrap().windows[0].logical_size = (800, 600).into();
 
         let (_pool_tl, buf_tl) = create_shm_buffer(&shm, &qh, 800, 600);
         tl_xdg.set_window_geometry(0, 0, 800, 600);

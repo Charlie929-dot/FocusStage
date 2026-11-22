@@ -92,7 +92,7 @@ internal sealed class LauncherForm : Form
         }
 
         // 1. Minimal Top Bar (drag handle + subtle brand/status + centered search pill + window controls)
-        _topBar = new Panel
+        _topBar = new TransparentPanel
         {
             Dock = DockStyle.Top,
             Height = 58,
@@ -130,7 +130,7 @@ internal sealed class LauncherForm : Form
             if (e.Button == MouseButtons.Left) Win11WindowHelper.BeginDragWindow(this);
         };
 
-        _statusDot = new Panel
+        _statusDot = new TransparentPanel
         {
             Size = new Size(9, 9),
             Location = new Point(150, 26),
@@ -213,7 +213,7 @@ internal sealed class LauncherForm : Form
             Padding = new Padding(14, 7, 14, 7)
         };
 
-        var dockFlow = new FlowLayoutPanel
+        var dockFlow = new TransparentFlowPanel
         {
             AutoSize = true,
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
@@ -272,7 +272,7 @@ internal sealed class LauncherForm : Form
             Padding = new Padding(22, 18, 22, 18)
         };
 
-        var folderHeader = new Panel
+        var folderHeader = new TransparentPanel
         {
             Dock = DockStyle.Top,
             Height = 42,
@@ -289,7 +289,7 @@ internal sealed class LauncherForm : Form
         };
         _folderTitleLabel.Click += (_, _) => PromptRenameCurrentFolder();
 
-        var folderHeaderBtns = new FlowLayoutPanel
+        var folderHeaderBtns = new TransparentFlowPanel
         {
             Dock = DockStyle.Right,
             AutoSize = true,
@@ -349,7 +349,7 @@ internal sealed class LauncherForm : Form
             Padding = new Padding(22, 18, 22, 18)
         };
 
-        var settingsHeader = new Panel
+        var settingsHeader = new TransparentPanel
         {
             Dock = DockStyle.Top,
             Height = 42,
@@ -384,7 +384,7 @@ internal sealed class LauncherForm : Form
         };
         settingsHeader.Controls.AddRange(new Control[] { settingsTitle, distroBadge, btnCloseSettings });
 
-        _settingsScrollBody = new Panel
+        _settingsScrollBody = new TransparentPanel
         {
             Dock = DockStyle.Fill,
             AutoScroll = true,
@@ -392,7 +392,7 @@ internal sealed class LauncherForm : Form
             Padding = new Padding(0, 6, 4, 4)
         };
 
-        var settingsStack = new FlowLayoutPanel
+        var settingsStack = new TransparentFlowPanel
         {
             FlowDirection = FlowDirection.TopDown,
             WrapContents = false,
@@ -404,7 +404,7 @@ internal sealed class LauncherForm : Form
 
         // --- Section 1: General & Desktop ---
         var generalCard = CreateSettingsGroupCard("桌面与启动");
-        var startupRow = new Panel { Height = 42, Dock = DockStyle.Top, BackColor = Color.Transparent };
+        var startupRow = new TransparentPanel { Height = 42, Dock = DockStyle.Top, BackColor = Color.Transparent };
         var startupTitle = new Label
         {
             Text = "开机自启",
@@ -437,7 +437,7 @@ internal sealed class LauncherForm : Form
         startupRow.Resize += (_, _) => _toggleStartup.Location = new Point(startupRow.Width - _toggleStartup.Width - 2, 9);
         startupRow.Controls.AddRange(new Control[] { startupTitle, startupSub, _toggleStartup });
 
-        var desktopActions = new FlowLayoutPanel
+        var desktopActions = new TransparentFlowPanel
         {
             Dock = DockStyle.Top,
             Height = 42,
@@ -479,8 +479,8 @@ internal sealed class LauncherForm : Form
 
         // --- Section 2: Daemon & Takeover ---
         var daemonCard = CreateSettingsGroupCard("守护进程与接管");
-        var daemonRow = new Panel { Height = 36, Dock = DockStyle.Top, BackColor = Color.Transparent };
-        _settingsDaemonDot = new Panel { Size = new Size(9, 9), Location = new Point(2, 13), BackColor = Color.Transparent };
+        var daemonRow = new TransparentPanel { Height = 36, Dock = DockStyle.Top, BackColor = Color.Transparent };
+        _settingsDaemonDot = new TransparentPanel { Size = new Size(9, 9), Location = new Point(2, 13), BackColor = Color.Transparent };
         _settingsDaemonDot.Paint += (_, e) =>
         {
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
@@ -512,7 +512,7 @@ internal sealed class LauncherForm : Form
         daemonRow.Resize += (_, _) => _btnStartStopDaemon.Location = new Point(daemonRow.Width - _btnStartStopDaemon.Width - 2, 3);
         daemonRow.Controls.AddRange(new Control[] { _settingsDaemonDot, _settingsDaemonLabel, _btnStartStopDaemon });
 
-        var daemonActions = new FlowLayoutPanel
+        var daemonActions = new TransparentFlowPanel
         {
             Dock = DockStyle.Top,
             Height = 40,
@@ -548,7 +548,7 @@ internal sealed class LauncherForm : Form
             AutoSizeMode = AutoSizeMode.GrowAndShrink
         };
 
-        var stagesHeaderRow = new Panel
+        var stagesHeaderRow = new TransparentPanel
         {
             Height = 30,
             Dock = DockStyle.Top,
@@ -679,16 +679,6 @@ internal sealed class LauncherForm : Form
                 await RefreshAppsAsync(forceRender: false);
             }
         };
-    }
-
-    protected override CreateParams CreateParams
-    {
-        get
-        {
-            var cp = base.CreateParams;
-            cp.ExStyle |= 0x02000000; // WS_EX_COMPOSITED: composite transparent child hierarchy without flicker
-            return cp;
-        }
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -1444,7 +1434,7 @@ internal sealed class LauncherForm : Form
                 BackColor = Color.Transparent
             };
 
-            var actions = new FlowLayoutPanel
+            var actions = new TransparentFlowPanel
             {
                 Location = new Point(10, 45),
                 Size = new Size(cardWidth - 20, 26),
@@ -1797,7 +1787,7 @@ internal sealed class LauncherForm : Form
             }
 
             ShowToast($"正在启动应用中心 ({cmd})...");
-            var (ok, msg) = await _ctx.RunControlWithFeedbackAsync("launch", "--ensure-daemon", "--wm-class", $"focusstage-{cmd}", cmd);
+            var (ok, msg) = await _ctx.RunControlWithFeedbackAsync("launch", "--ensure-daemon", cmd);
             ShowToast(ok ? $"已打开应用中心 ({cmd})" : $"启动应用中心失败");
             if (!ok)
             {
@@ -1882,7 +1872,7 @@ internal sealed class LauncherForm : Form
             var tb = new TextBox { Text = defaultValue, Dock = DockStyle.Fill };
             tb.SelectAll();
 
-            var buttons = new FlowLayoutPanel
+            var buttons = new TransparentFlowPanel
             {
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,

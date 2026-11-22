@@ -11,7 +11,6 @@ use smithay::xwayland::{XWayland, XWaylandEvent};
 use tracing::{debug, info, warn};
 
 use crate::clipboard::pick_text_mime;
-use crate::protocol::DisplayState;
 use crate::stage::StageToplevel;
 use crate::state::FocusStageState;
 
@@ -21,22 +20,14 @@ impl XWaylandShellHandler for FocusStageState {
     }
 
     fn surface_associated(&mut self, xwm_id: XwmId, surface: WlSurface, window: X11Surface) {
-        self.offscreen.ensure_surface_entered(&surface);
-        if let Some(stage_id) = self.xwm_to_stage.get(&xwm_id).cloned() {
-            if !window.is_override_redirect() {
-                if let Some(stage) = self.stages.get_mut(&stage_id) {
-                    let already = stage.toplevels.iter().any(|t| match t {
-                        StageToplevel::X11(x) => x == &window,
-                        _ => false,
-                    });
-                    if !already {
-                        stage.toplevels.push(StageToplevel::X11(window));
-                    }
-                    stage.bump_frame();
-                }
-                self.ensure_virtual_focus(&stage_id);
+        if let Some(id) = self.window_id_for_toplevel(&StageToplevel::X11(window)) {
+            self.set_window_mapped(&id, true);
+        } else if let Some(stage_id) = self.xwm_to_stage.get(&xwm_id) {
+            if let Some(stage) = self.stages.get_mut(stage_id) {
+                stage.bump_frame();
             }
         }
+        self.sync_surface_output(&surface);
     }
 }
 
@@ -51,10 +42,6 @@ impl XwmHandler for FocusStageState {
 
     fn new_override_redirect_window(&mut self, xwm: XwmId, window: X11Surface) {
         debug!("X11 override_redirect window {:?} on {:?}", window.window_id(), xwm);
-        self.x11_override_windows
-            .entry(xwm)
-            .or_default()
-            .push(window);
     }
 
     fn map_window_request(&mut self, xwm: XwmId, window: X11Surface) {
@@ -62,106 +49,93 @@ impl XwmHandler for FocusStageState {
             let _ = window.set_mapped(true);
             return;
         };
-
-        let size = self
-            .stages
-            .get(&stage_id)
-            .map(|s| s.logical_size)
-            .unwrap_or_else(|| (1024, 768).into());
-
-        let _ = window.configure(Rectangle::new((0, 0).into(), size));
+        let toplevel = StageToplevel::X11(window.clone());
+        let stage = self.stages.get_mut(&stage_id).unwrap();
+        let id = if let Some(known) = stage.windows.iter_mut().find(|w| w.toplevel == toplevel) {
+            // Configure requests while unmapped update the X11 surface's geometry.
+            known.set_mapped_size(window.geometry().size);
+            known.id.clone()
+        } else {
+            let size = if stage.windows.is_empty() {
+                stage.logical_size()
+            } else {
+                let geo = window.geometry();
+                (geo.size.w.max(1), geo.size.h.max(1)).into()
+            };
+            stage.add_window(toplevel, size)
+        };
+        let size = stage.window(&id).unwrap().logical_size;
+        let _ = window.configure(Rectangle::new(window.geometry().loc, size));
         let _ = window.set_mapped(true);
         let _ = window.set_activated(true);
-
+        self.update_x11_parent(&id, &window);
         let title = window.title();
-        let mut need_show = false;
-        let mut rect = None;
-        if let Some(stage) = self.stages.get_mut(&stage_id) {
-            if !title.is_empty() {
-                stage.title = title.clone();
-            }
-            if !window.is_override_redirect() {
-                let already = stage.toplevels.iter().any(|t| match t {
-                    StageToplevel::X11(x) => x == &window,
-                    _ => false,
-                });
-                if !already {
-                    stage.toplevels.push(StageToplevel::X11(window));
-                }
-            }
-            stage.bump_frame();
-            if stage.display == DisplayState::Desktop {
-                need_show = true;
-                rect = stage.saved_rect;
-            }
+        if !title.is_empty() {
+            self.update_window_title(&id, title);
         }
-        if need_show {
-            if let (Some(ref mut sink), Some(r)) = (&mut self.wslg_sink, rect) {
-                let (t, cls) = self
-                    .stages
-                    .get(&stage_id)
-                    .map(|s| (s.title.clone(), s.wm_class.clone()))
-                    .unwrap_or_default();
-                sink.show(&stage_id, &t, &cls, r);
-            }
+        if window.wl_surface().is_some() {
+            self.set_window_mapped(&id, true);
         }
-        self.ensure_virtual_focus(&stage_id);
     }
 
     fn mapped_override_redirect_window(&mut self, xwm: XwmId, window: X11Surface) {
-        let list = self.x11_override_windows.entry(xwm).or_default();
-        if !list.contains(&window) {
-            list.push(window);
-        }
-        if let Some(stage_id) = self.xwm_to_stage.get(&xwm).cloned() {
-            if let Some(stage) = self.stages.get_mut(&stage_id) {
-                stage.bump_frame();
+        let Some(stage) = self.xwm_to_stage.get(&xwm).and_then(|id| self.stages.get_mut(id)) else {
+            return;
+        };
+        let owner = window.is_transient_for().or_else(|| {
+            match stage.active_toplevel()? {
+                StageToplevel::X11(x) => Some(x.window_id()),
+                _ => None,
             }
-        }
+        });
+        let list = self.x11_override_windows.entry(xwm).or_default();
+        list.retain(|(w, _)| w != &window);
+        list.push((window, owner));
+        stage.bump_frame();
     }
 
     fn unmapped_window(&mut self, xwm: XwmId, window: X11Surface) {
         if let Some(list) = self.x11_override_windows.get_mut(&xwm) {
-            list.retain(|w| w != &window);
+            list.retain(|(w, _)| w != &window);
         }
-        if let Some(stage_id) = self.xwm_to_stage.get(&xwm).cloned() {
-            if let Some(stage) = self.stages.get_mut(&stage_id) {
-                stage.toplevels.retain(|t| match t {
-                    StageToplevel::X11(x) => x != &window,
-                    _ => true,
-                });
-                stage.bump_frame();
-            }
+        if let Some(id) = self.window_id_for_toplevel(&StageToplevel::X11(window)) {
+            self.set_window_mapped(&id, false);
+        }
+        if let Some(stage) = self.xwm_to_stage.get(&xwm).and_then(|id| self.stages.get_mut(id)) {
+            stage.bump_frame();
         }
     }
 
     fn destroyed_window(&mut self, xwm: XwmId, window: X11Surface) {
-        self.unmapped_window(xwm, window);
+        self.unmapped_window(xwm, window.clone());
+        if let Some(id) = self.window_id_for_toplevel(&StageToplevel::X11(window)) {
+            self.remove_window(&id);
+        }
     }
 
     fn configure_request(
         &mut self,
-        xwm: XwmId,
+        _xwm: XwmId,
         window: X11Surface,
-        _x: Option<i32>,
-        _y: Option<i32>,
-        w: Option<u32>,
-        h: Option<u32>,
+        x: Option<i32>,
+        y: Option<i32>,
+        width: Option<u32>,
+        height: Option<u32>,
         _reorder: Option<Reorder>,
     ) {
-        let stage_size = self
-            .xwm_to_stage
-            .get(&xwm)
-            .and_then(|sid| self.stages.get(sid))
-            .map(|s| s.logical_size);
-        let cur = window.geometry();
-        let target_w = w.map(|v| v as i32).unwrap_or_else(|| {
-            stage_size.map(|s| s.w).unwrap_or(cur.size.w.max(1))
-        });
-        let target_h = h.map(|v| v as i32).unwrap_or_else(|| {
-            stage_size.map(|s| s.h).unwrap_or(cur.size.h.max(1))
-        });
-        let _ = window.configure(Rectangle::new((0, 0).into(), (target_w, target_h).into()));
+        let current = window.geometry();
+        let id = self.window_id_for_toplevel(&StageToplevel::X11(window.clone()));
+        // Once mapped, the host owns the size. Before mapping, honor the application's hints.
+        let mapped = id.as_deref().and_then(|id| self.stage_for_window(id)?.window(id))
+            .is_some_and(|w| w.mapped);
+        let size = if mapped {
+            current.size
+        } else {
+            (width.map_or(current.size.w, |w| w as i32).max(1),
+             height.map_or(current.size.h, |h| h as i32).max(1)).into()
+        };
+        let loc = (x.unwrap_or(current.loc.x), y.unwrap_or(current.loc.y)).into();
+        let _ = window.configure(Rectangle::new(loc, size));
     }
 
     fn configure_notify(
@@ -171,31 +145,62 @@ impl XwmHandler for FocusStageState {
         _geometry: Rectangle<i32, Logical>,
         _above: Option<u32>,
     ) {
-        if let Some(stage_id) = self.xwm_to_stage.get(&xwm).cloned() {
-            if let Some(stage) = self.stages.get_mut(&stage_id) {
-                stage.bump_frame();
+        if let Some(stage) = self.xwm_to_stage.get(&xwm).and_then(|id| self.stages.get_mut(id)) {
+            stage.bump_frame();
+        }
+    }
+
+    fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
+        if let Some(id) = self.window_id_for_toplevel(&StageToplevel::X11(window.clone())) {
+            match property {
+                WmWindowProperty::Title => self.update_window_title(&id, window.title()),
+                WmWindowProperty::TransientFor => self.update_x11_parent(&id, &window),
+                _ => {}
             }
         }
     }
 
-    fn property_notify(&mut self, xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
-        if property == WmWindowProperty::Title {
-            if let Some(stage_id) = self.xwm_to_stage.get(&xwm).cloned() {
-                let title = window.title();
-                if !title.is_empty() {
-                    if let Some(stage) = self.stages.get_mut(&stage_id) {
-                        stage.title = title.clone();
-                    }
-                    if let Some(ref mut sink) = self.wslg_sink {
-                        sink.set_title(&stage_id, &title);
-                    }
-                }
+    fn resize_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32, edge: ResizeEdge) {
+        let direction = match edge {
+            ResizeEdge::TopLeft => 0,
+            ResizeEdge::Top => 1,
+            ResizeEdge::TopRight => 2,
+            ResizeEdge::Right => 3,
+            ResizeEdge::BottomRight => 4,
+            ResizeEdge::Bottom => 5,
+            ResizeEdge::BottomLeft => 6,
+            ResizeEdge::Left => 7,
+        };
+        if let Some(id) = self.window_id_for_toplevel(&StageToplevel::X11(window)) {
+            if let Some(sink) = self.display_sink.as_mut() {
+                sink.begin_resize(&id, direction);
             }
         }
     }
 
-    fn resize_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32, _resize_edge: ResizeEdge) {}
-    fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {}
+    fn move_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32) {
+        if let Some(id) = self.window_id_for_toplevel(&StageToplevel::X11(window)) {
+            if let Some(sink) = self.display_sink.as_mut() {
+                sink.begin_move(&id);
+            }
+        }
+    }
+
+    fn maximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.maximize_x11(window, true);
+    }
+
+    fn unmaximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.maximize_x11(window, false);
+    }
+
+    fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(id) = self.window_id_for_toplevel(&StageToplevel::X11(window)) {
+            if let Some(sink) = self.display_sink.as_mut() {
+                sink.minimize(&id);
+            }
+        }
+    }
 
     fn allow_selection_access(&mut self, _xwm: XwmId, _selection: SelectionTarget) -> bool {
         true
@@ -333,10 +338,38 @@ impl FocusStageState {
         Ok(())
     }
 
-    pub fn x11_override_windows_for(&self, xwm_id: XwmId) -> Vec<X11Surface> {
-        self.x11_override_windows
-            .get(&xwm_id)
-            .map(|v| v.iter().filter(|w| w.alive()).cloned().collect())
+    fn update_x11_parent(&mut self, id: &str, window: &X11Surface) {
+        let parent = window.is_transient_for().and_then(|parent| {
+            self.stage_for_window(id)?.windows.iter().find(|w| {
+                matches!(&w.toplevel, StageToplevel::X11(x) if x.window_id() == parent)
+            }).map(|w| w.id.clone())
+        });
+        self.update_window_parent(id, parent);
+    }
+
+    fn maximize_x11(&mut self, window: X11Surface, maximized: bool) {
+        let _ = window.set_maximized(maximized);
+        if let Some(id) = self.window_id_for_toplevel(&StageToplevel::X11(window)) {
+            self.request_window_maximized(&id, maximized);
+        }
+    }
+
+    pub fn x11_override_windows_for(&self, toplevel: &StageToplevel) -> Vec<X11Surface> {
+        let StageToplevel::X11(toplevel) = toplevel else {
+            return Vec::new();
+        };
+        toplevel.xwm_id().and_then(|id| self.x11_override_windows.get(&id))
+            .map(|list| list.iter().filter(|(w, owner)| {
+                let mut owner = w.is_transient_for().or(*owner);
+                // Nested X11 menus can be transient for another override-redirect window.
+                for _ in 0..list.len() {
+                    let Some((_, next)) = list.iter().find(|(parent, _)| Some(parent.window_id()) == owner) else {
+                        break;
+                    };
+                    owner = *next;
+                }
+                w.alive() && owner == Some(toplevel.window_id())
+            }).map(|(w, _)| w.clone()).collect())
             .unwrap_or_default()
     }
 }

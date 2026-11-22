@@ -201,11 +201,13 @@ internal static class ShortcutManager
         return $@"\\wsl.localhost\{distro}\{trimmed.Replace('/', '\\')}";
     }
 
+    internal static string AppIconPath(string appId) =>
+        Path.Combine(IconsDir, $"{SanitizeFileName(appId)}.ico");
+
     public static string EnsureAppIco(string distro, LinuxAppDto app)
     {
         Directory.CreateDirectory(IconsDir);
-        var safeId = SanitizeFileName(string.IsNullOrWhiteSpace(app.Id) ? app.Stem : app.Id);
-        var icoPath = Path.Combine(IconsDir, $"{safeId}.ico");
+        var icoPath = AppIconPath(string.IsNullOrWhiteSpace(app.Id) ? app.Stem : app.Id);
         using var bmp = TryLoadLinuxAppBitmap(distro, app, 48) ?? RenderAppFallbackBitmap(app.DisplayName, 48);
         SaveBitmapAsIco(bmp, icoPath);
         return icoPath;

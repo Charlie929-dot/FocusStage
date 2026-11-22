@@ -11,16 +11,14 @@ use smithay::backend::renderer::{
     Bind, Color32F, Frame, Offscreen, Renderer,
 };
 use smithay::desktop::PopupManager;
-use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::compositor::{
     with_surface_tree_downward, with_states, SurfaceAttributes, TraversalAction,
 };
 use smithay::wayland::shell::xdg::SurfaceCachedState;
 
-use crate::stage::{Stage, StageToplevel};
+use crate::stage::{Stage, StageToplevel, StageWindow};
 
 /// Return the Wayland toplevel's `xdg_surface.set_window_geometry` top-left offset
 /// (non-zero for CSD clients with drop shadows around the main buffer).
@@ -38,77 +36,39 @@ pub fn wayland_window_geometry_loc(surface: &WlSurface) -> Point<i32, smithay::u
 
 pub struct OffscreenCore {
     pub renderer: PixmanRenderer,
-    pub virtual_output: Output,
-    pub output_size: Size<i32, Physical>,
-    pub frame_hz: u32,
     cached_image: Option<(i32, i32, pixman::Image<'static, 'static>)>,
 }
 
 impl OffscreenCore {
-    pub fn new(dh: &DisplayHandle, width: i32, height: i32, scale: f64, frame_hz: u32) -> Self {
-        let renderer = PixmanRenderer::new().expect("create PixmanRenderer");
-        let output = Output::new(
-            "focusstage-0".to_string(),
-            PhysicalProperties {
-                size: Size::from((508, 286)),
-                subpixel: Subpixel::Unknown,
-                make: "FocusStage".to_string(),
-                model: "VirtualStage".to_string(),
-            },
-        );
-        let mode = Mode {
-            size: Size::from((width, height)),
-            refresh: (frame_hz * 1000) as i32,
-        };
-        output.change_current_state(
-            Some(mode),
-            Some(Transform::Normal),
-            Some(smithay::output::Scale::Fractional(scale)),
-            Some(Point::from((0, 0))),
-        );
-        output.set_preferred(mode);
-        let _global = output.create_global::<crate::state::FocusStageState>(dh);
-
+    pub fn new() -> Self {
         Self {
-            renderer,
-            virtual_output: output,
-            output_size: Size::from((width, height)),
-            frame_hz,
+            renderer: PixmanRenderer::new().expect("create PixmanRenderer"),
             cached_image: None,
         }
     }
 
-    pub fn ensure_surface_entered(&self, surface: &WlSurface) {
-        self.virtual_output.enter(surface);
-    }
-
-    /// Render a Stage's main toplevel + all popups + subsurfaces + X11 override-redirect menus
+    /// Render one toplevel with its popups, subsurfaces and X11 override-redirect menus
     /// into BGRA8888 (little-endian ARGB8888 premultiplied) bytes inside `out`,
     /// returning `(width, height)`.
-    pub fn render_stage_bgra_into(
+    pub fn render_window_bgra_into(
         &mut self,
-        stage: &Stage,
+        window: Option<&StageWindow>,
+        size: smithay::utils::Size<i32, smithay::utils::Logical>,
+        scale: f64,
         x11_override_windows: &[smithay::xwayland::X11Surface],
         out: &mut Vec<u8>,
     ) -> Result<(u32, u32), String> {
-        let scale = stage.scale.max(1.0);
-        let logical_w = stage.logical_size.w.max(1);
-        let logical_h = stage.logical_size.h.max(1);
-        let phys_w = ((logical_w as f64) * scale).round().max(1.0) as i32;
-        let phys_h = ((logical_h as f64) * scale).round().max(1.0) as i32;
+        let logical_w = size.w.max(1);
+        let logical_h = size.h.max(1);
+        let [phys_w, phys_h] = window.and_then(|w| w.pixel_size).map(|size| size.map(|v| v as i32))
+            .unwrap_or_else(|| [logical_w, logical_h].map(|v| (v as f64 * scale).round().max(1.0) as i32));
         let phys_size: Size<i32, Physical> = Size::from((phys_w, phys_h));
         let buf_size: Size<i32, BufferCoords> = Size::from((phys_w, phys_h));
         let damage = Rectangle::from_size(phys_size);
 
         let mut elements: Vec<WaylandSurfaceRenderElement<PixmanRenderer>> = Vec::new();
 
-        // Collect all alive toplevels + popups; front-to-back order for draw_render_elements
-        // Note: Smithay's draw_render_elements draws front-to-back? Actually in Smithay `draw_render_elements`
-        // renders elements in REVERSE order (last = bottom, first = top), so push popups FIRST, then main window!
-        // Wait: let's verify! In Smithay `WaylandSurfaceRenderElement`, elements[0] is topmost.
-        let main_toplevel = stage.active_toplevel().cloned();
-
-        if let Some(ref tl) = main_toplevel {
+        if let Some(tl) = window.map(|w| &w.toplevel) {
             match tl {
                 StageToplevel::Wayland(wl_tl) => {
                     let root = wl_tl.wl_surface();
@@ -253,7 +213,11 @@ impl OffscreenCore {
         x11_override_windows: &[smithay::xwayland::X11Surface],
     ) -> Result<(u32, u32, Vec<u8>), String> {
         let mut bytes = Vec::new();
-        let (w, h) = self.render_stage_bgra_into(stage, x11_override_windows, &mut bytes)?;
+        let window = stage.active_window();
+        let (w, h) = self.render_window_bgra_into(
+            window, stage.logical_size(), window.map_or(stage.default_scale, |w| w.scale),
+            x11_override_windows, &mut bytes,
+        )?;
         Ok((w, h, bytes))
     }
 

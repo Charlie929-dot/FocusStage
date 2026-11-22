@@ -382,7 +382,7 @@ fn ensure_focusstaged_running(sock: &std::path::Path) -> anyhow::Result<()> {
                 "-p",
                 &format!("StandardError=append:{}", effective_log_path.display()),
             ]);
-        for key in ["DISPLAY", "WAYLAND_DISPLAY", "PULSE_SERVER", "WSL_INTEROP"] {
+        for key in ["DISPLAY", "WAYLAND_DISPLAY", "PULSE_SERVER", "WSL_INTEROP", "XDG_CONFIG_HOME"] {
             if let Ok(val) = std::env::var(key) {
                 if !val.is_empty() {
                     sd.args(["-E", &format!("{key}={val}")]);
@@ -598,7 +598,13 @@ fn discover_desktop_apps() -> Vec<DiscoveredDesktopApp> {
             let Some(parsed) = parse_desktop_entry(&text) else {
                 continue;
             };
-            let icon_path = parsed.icon.as_deref().and_then(resolve_icon_path);
+            // Windows opens these paths via the WSL share, which cannot follow Snap's `current` link.
+            let icon_path = parsed
+                .icon
+                .as_deref()
+                .and_then(resolve_icon_path)
+                .and_then(|path| std::fs::canonicalize(path).ok())
+                .map(|path| path.display().to_string());
             let wrapper_id = format!("focusstage-{stem}");
             apps.push(DiscoveredDesktopApp {
                 stem: stem.to_string(),

@@ -8,15 +8,14 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use smithay::reexports::calloop::channel::{self, Channel, Sender as CalloopSender};
-use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::utils::{Logical, Point};
 use tracing::{info, warn};
 
 use crate::protocol::{
-    ActStatus, ControlRequest, ControlResponse, DisplayState, InputOwner, SavedRect,
+    ActStatus, ControlRequest, ControlResponse, DisplayState, InputOwner,
 };
 use crate::router::{InputSource, PendingActJob, SettleState};
-use crate::stage::{Lease, StageToplevel};
+use crate::stage::Lease;
 use crate::state::FocusStageState;
 
 pub struct ControlServerMessage {
@@ -172,7 +171,7 @@ impl FocusStageState {
                 let _ = reply_tx.send(ControlResponse::Pong {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     wayland_display: self.wayland_socket_name.clone(),
-                    wslg_active: self.wslg_sink.is_some(),
+                    wslg_active: self.display_sink.is_some(),
                 });
             }
             ControlRequest::List => {
@@ -371,6 +370,8 @@ impl FocusStageState {
 
         if hide {
             let _ = self.set_stage_display(stage_id, DisplayState::Hidden);
+        } else {
+            self.ensure_virtual_focus(stage_id);
         }
 
         ControlResponse::Acquired {
@@ -437,11 +438,8 @@ impl FocusStageState {
             };
         };
         let frame_seq = stage.frame_seq;
-        let scale = stage.scale.max(1.0);
-        let xwm_id = stage.xwm_id;
-        let x11_ovrs = xwm_id
-            .map(|id| self.x11_override_windows_for(id))
-            .unwrap_or_default();
+        let scale = stage.active_window().map_or(stage.default_scale, |w| w.scale);
+        let x11_ovrs = stage.active_toplevel().map(|t| self.x11_override_windows_for(t)).unwrap_or_default();
 
         let (width, height, png_base64) = if image {
             let stage_ref = self.stages.get(&target_id).unwrap();
@@ -461,8 +459,8 @@ impl FocusStageState {
         } else {
             let s = self.stages.get(&target_id).unwrap();
             (
-                s.logical_size.w.max(1) as u32,
-                s.logical_size.h.max(1) as u32,
+                s.logical_size().w.max(1) as u32,
+                s.logical_size().h.max(1) as u32,
                 None,
             )
         };
@@ -600,7 +598,7 @@ impl FocusStageState {
                 message: "Lease not found or already preempted".to_string(),
             };
         };
-        self.release_all_stage_inputs_pub(&stage_id);
+        self.release_all_stage_inputs(&stage_id);
         if let Some(stage) = self.stages.get_mut(&stage_id) {
             stage.lease = None;
             stage.input_owner = InputOwner::Human;
@@ -609,23 +607,6 @@ impl FocusStageState {
             let _ = self.set_stage_display(&stage_id, DisplayState::Desktop);
         }
         ControlResponse::Ok
-    }
-
-    fn release_all_stage_inputs_pub(&mut self, stage_id: &str) {
-        let (keys, btns, pos) = match self.stages.get(stage_id) {
-            Some(s) => (
-                s.input.pressed_keys.iter().copied().collect::<Vec<_>>(),
-                s.input.pressed_buttons.iter().copied().collect::<Vec<_>>(),
-                s.input.pointer_pos,
-            ),
-            None => return,
-        };
-        for kc in keys {
-            self.send_stage_evdev_key(stage_id, kc, false);
-        }
-        for b in btns {
-            self.send_stage_button(stage_id, pos.x, pos.y, b, false);
-        }
     }
 
     pub fn set_stage_display(&mut self, stage_id: &str, display: DisplayState) -> ControlResponse {
@@ -641,34 +622,9 @@ impl FocusStageState {
         }
         stage.display = display;
 
-        match display {
-            DisplayState::Hidden => {
-                if let Some(ref mut sink) = self.wslg_sink {
-                    if let Some(rect) = sink.hide(stage_id) {
-                        if let Some(stage) = self.stages.get_mut(stage_id) {
-                            stage.saved_rect = Some(rect);
-                        }
-                    }
-                }
-            }
-            DisplayState::Desktop => {
-                let (title, wm_class, rect) = {
-                    let stage = self.stages.get(stage_id).unwrap();
-                    let rect = stage.saved_rect.unwrap_or(SavedRect {
-                        x: 100,
-                        y: 100,
-                        width: stage.logical_size.w.max(1) as u32,
-                        height: stage.logical_size.h.max(1) as u32,
-                    });
-                    (stage.title.clone(), stage.wm_class.clone(), rect)
-                };
-                if let Some(ref mut sink) = self.wslg_sink {
-                    sink.show(stage_id, &title, &wm_class, rect);
-                }
-                if let Some(stage) = self.stages.get_mut(stage_id) {
-                    stage.dirty_for_sink = true;
-                }
-            }
+        self.update_stage_window_visibility(stage_id);
+        if display == DisplayState::Hidden {
+            self.ensure_virtual_focus(stage_id);
         }
         ControlResponse::Ok
     }
@@ -686,36 +642,10 @@ impl FocusStageState {
         } else if stage.input_owner == InputOwner::Frozen {
             stage.input_owner = InputOwner::Human;
         }
-        ControlResponse::Ok
-    }
-
-    pub fn resize_stage_from_sink(&mut self, stage_id: &str, rect: SavedRect) {
-        let toplevel = if let Some(stage) = self.stages.get_mut(stage_id) {
-            stage.saved_rect = Some(rect);
-            stage.logical_size = (rect.width as i32, rect.height as i32).into();
-            stage.dirty_for_sink = true;
-            stage.active_toplevel().cloned()
-        } else {
-            None
-        };
-
-        if let Some(tl) = toplevel {
-            match tl {
-                StageToplevel::Wayland(w) => {
-                    w.with_pending_state(|s| {
-                        s.size = Some((rect.width as i32, rect.height as i32).into());
-                        s.states.set(xdg_toplevel::State::Activated);
-                    });
-                    w.send_configure();
-                }
-                StageToplevel::X11(x) => {
-                    let _ = x.configure(smithay::utils::Rectangle::new(
-                        (0, 0).into(),
-                        (rect.width as i32, rect.height as i32).into(),
-                    ));
-                }
-            }
+        if frozen {
+            self.ensure_virtual_focus(stage_id);
         }
+        ControlResponse::Ok
     }
 
     fn handle_clipboard_get(

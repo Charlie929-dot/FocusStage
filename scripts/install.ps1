@@ -35,7 +35,7 @@ $installCmd = @(
     "install -m 755 '$WslRepo/target/release/focusstage' /usr/local/bin/focusstage",
     "sed 's/\r`$//' '$WslRepo/scripts/focusstage-launch' > /usr/local/bin/focusstage-launch",
     "chmod 755 /usr/local/bin/focusstage-launch",
-    "if command -v apt-get >/dev/null 2>&1 && ! dpkg -s policykit-1-gnome xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq policykit-1-gnome xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk && fc-cache -f >/dev/null 2>&1 || true; fi",
+    "if command -v apt-get >/dev/null 2>&1 && ! dpkg -s policykit-1-gnome xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq policykit-1-gnome xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland && fc-cache -f >/dev/null 2>&1 || true; fi",
     "/usr/local/bin/focusstage --json sync-apps >/dev/null"
 ) -join " && "
 wsl.exe -d $Distro -u root -e bash -lc $installCmd
@@ -55,6 +55,52 @@ if ($LASTEXITCODE -ne 0) {
 $exePath = Join-Path $InstallDir "FocusStage.exe"
 if (-not (Test-Path $exePath)) {
     throw "Expected launcher binary missing at $exePath"
+}
+
+# Verify the executable that Windows will actually run before registering its path.
+$hostStart = [System.Diagnostics.ProcessStartInfo]::new($exePath, "--window-host")
+$hostStart.UseShellExecute = $false
+$hostStart.RedirectStandardInput = $true
+$hostStart.RedirectStandardOutput = $true
+$previousInputEncoding = [Console]::InputEncoding
+try {
+    # Windows PowerShell uses the console encoding for the child stdin pipe.
+    [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+    $hostProcess = [System.Diagnostics.Process]::Start($hostStart)
+} finally {
+    [Console]::InputEncoding = $previousInputEncoding
+}
+try {
+    $readyLine = $hostProcess.StandardOutput.ReadLineAsync()
+    if (-not $readyLine.Wait(5000) -or [string]::IsNullOrWhiteSpace($readyLine.Result)) {
+        throw "The installed FocusStage.exe did not complete the window host handshake: $exePath"
+    }
+    $ready = $readyLine.Result | ConvertFrom-Json
+    if ($ready.type -ne "ready" -or $ready.scale -le 0 -or $ready.width -le 0 -or $ready.height -le 0 -or $hostProcess.HasExited) {
+        throw "The installed FocusStage.exe returned an invalid window host handshake: $exePath"
+    }
+} finally {
+    if (-not $hostProcess.HasExited) {
+        $hostProcess.StandardInput.BaseStream.Close()
+        if (-not $hostProcess.WaitForExit(2000)) {
+            $hostProcess.Kill()
+            $hostProcess.WaitForExit()
+        }
+    }
+    $hostProcess.Dispose()
+}
+
+$wslHostPath = wsl.exe -d $Distro -e wslpath -a ($exePath -replace '\\', '/')
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($wslHostPath)) {
+    throw "Failed to resolve the Windows host path for WSL '$Distro'."
+}
+$hostPathBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($wslHostPath.TrimEnd("`r", "`n")))
+$registerHost = 'dir="${XDG_CONFIG_HOME:-$HOME/.config}/focusstage"; umask 077; mkdir -p "$dir" && printf %s ' + $hostPathBase64 + ' | base64 -d > "$dir/native-host-path"'
+# Windows PowerShell can strip embedded quotes from arguments to wsl.exe.
+$registerHostBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($registerHost))
+wsl.exe -d $Distro -e bash -lc "printf %s $registerHostBase64 | base64 -d | bash"
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to register the native Windows host in WSL '$Distro'."
 }
 
 Write-Host "[5/5] Creating Start Menu, Desktop & Startup shortcuts..." -ForegroundColor Cyan

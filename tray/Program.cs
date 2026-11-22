@@ -16,6 +16,10 @@ internal static class Program
     private static int Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
+        if (args.Length == 1 && args[0] == "--window-host")
+        {
+            return NativeHost.Run();
+        }
 
         string distro = "Ubuntu";
         bool trayOnly = false;
@@ -581,7 +585,7 @@ internal sealed class FocusStageTrayContext : ApplicationContext
             psi.ArgumentList.Add("-e");
             psi.ArgumentList.Add("bash");
             psi.ArgumentList.Add("-lc");
-            psi.ArgumentList.Add("if ! focusstage --json ping >/dev/null 2>&1; then LOG=/run/user/$(id -u)/focusstaged.log; if command -v systemd-run >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then systemd-run --user --collect -E DISPLAY -E WAYLAND_DISPLAY -E PULSE_SERVER -E WSL_INTEROP -E PATH -p \"StandardOutput=append:$LOG\" -p \"StandardError=append:$LOG\" focusstaged >/dev/null 2>&1; else setsid -f focusstaged >\"$LOG\" 2>&1 </dev/null; fi; fi; sleep 0.6; focusstage --json ping");
+            psi.ArgumentList.Add("if ! focusstage --json ping >/dev/null 2>&1; then LOG=/run/user/$(id -u)/focusstaged.log; if command -v systemd-run >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then systemd-run --user --collect -E DISPLAY -E WAYLAND_DISPLAY -E PULSE_SERVER -E WSL_INTEROP -E XDG_CONFIG_HOME -E PATH -p \"StandardOutput=append:$LOG\" -p \"StandardError=append:$LOG\" focusstaged >/dev/null 2>&1; else setsid -f focusstaged >\"$LOG\" 2>&1 </dev/null; fi; fi; sleep 0.6; focusstage --json ping");
             using var proc = Process.Start(psi);
             if (proc is not null)
             {

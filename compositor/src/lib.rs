@@ -1,6 +1,7 @@
 pub mod a11y;
 pub mod clipboard;
 pub mod control;
+mod dpi;
 pub mod manager;
 pub mod offscreen;
 pub mod protocol;
@@ -8,4 +9,5 @@ pub mod router;
 pub mod sink;
 pub mod stage;
 pub mod state;
+mod windows;
 pub mod xwayland;

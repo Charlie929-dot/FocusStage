@@ -15,9 +15,12 @@ use tracing::{info, warn};
 
 use focusstage_compositor::control::spawn_control_server;
 use focusstage_compositor::offscreen::send_frames_surface_tree;
-use focusstage_compositor::protocol::{default_socket_path, DisplayState};
+use focusstage_compositor::protocol::{default_socket_path, DisplayState, SavedRect};
 use focusstage_compositor::router::InputSource;
-use focusstage_compositor::sink::SinkInputEvent;
+use focusstage_compositor::sink::native::NativeSink;
+use focusstage_compositor::sink::wslg::WslgSink;
+use focusstage_compositor::sink::wslg_wayland::WslgWaylandSink;
+use focusstage_compositor::sink::{DisplaySink, SinkInputEvent};
 use focusstage_compositor::state::{ClientState, FocusStageState};
 
 #[derive(Debug, Parser)]
@@ -35,13 +38,21 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     frame_hz: u32,
 
-    /// Default HiDPI scale factor
+    /// Default HiDPI scale factor for WSLg and headless mode
     #[arg(long, default_value_t = 1.0)]
     scale: f64,
 
-    /// Run headless without connecting to WSLg X11 display
-    #[arg(long, default_value_t = false)]
+    /// Run offscreen without a desktop host.
+    #[arg(long, conflicts_with_all = ["wslg", "native_host"])]
     headless: bool,
+
+    /// Use the legacy WSLg backend even if the Windows host is installed.
+    #[arg(long, conflicts_with = "native_host")]
+    wslg: bool,
+
+    /// Start the native Windows host at this WSL path instead of the installed executable.
+    #[arg(long, value_name = "FOCUSSTAGE_EXE")]
+    native_host: Option<PathBuf>,
 }
 
 fn get_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
@@ -187,6 +198,59 @@ fn ensure_desktop_session_helpers() {
     }
 }
 
+fn installed_native_host() -> Option<PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME").filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))?;
+    let path = std::fs::read_to_string(config.join("focusstage/native-host-path")).ok()?;
+    let path = path.trim_end_matches(['\r', '\n']);
+    if path.is_empty() { None } else { Some(PathBuf::from(path)) }
+}
+
+fn connect_desktop(args: &Args) -> anyhow::Result<(Option<Box<dyn DisplaySink>>, SavedRect, f64)> {
+    let default_monitor = SavedRect { x: 0, y: 0, width: 1920, height: 1080 };
+    let default_scale = if args.scale.is_finite() { args.scale.max(1.0) } else { 1.0 };
+    if args.headless {
+        return Ok((None, default_monitor, default_scale));
+    }
+    if !args.wslg {
+        if let Some(path) = args.native_host.clone().or_else(installed_native_host) {
+            match NativeSink::connect(&path) {
+                Ok((host, monitor, scale)) => {
+                    info!(scale, "Connected to native Win32 display host");
+                    return Ok((Some(Box::new(host)), monitor, scale));
+                }
+                Err(err) if args.native_host.is_some() => {
+                    return Err(err.context(format!("start native Windows host at {}", path.display())));
+                }
+                Err(err) => {
+                    warn!("Native Windows host unavailable at {} ({err}); using WSLg", path.display());
+                }
+            }
+        }
+    }
+    let sink: Option<Box<dyn DisplaySink>> = match WslgWaylandSink::connect() {
+        Ok(sink) => Some(Box::new(sink)),
+        Err(wl_err) => {
+            let display = std::env::var("WSLG_DISPLAY").ok().or_else(|| std::env::var("DISPLAY").ok());
+            match display.as_deref().filter(|d| !d.is_empty()) {
+                Some(d) => match WslgSink::connect(Some(d)) {
+                    Ok(sink) => Some(Box::new(sink)),
+                    Err(err) => {
+                        warn!("WSLg unavailable (Wayland: {wl_err}; X11: {err}); running offscreen");
+                        None
+                    }
+                },
+                None => {
+                    warn!("WSLg unavailable ({wl_err}); running offscreen");
+                    None
+                }
+            }
+        }
+    };
+    Ok((sink, default_monitor, default_scale))
+}
+
 fn main() -> anyhow::Result<()> {
     normalize_process_path();
     if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
@@ -201,6 +265,7 @@ fn main() -> anyhow::Result<()> {
     if !args.headless {
         ensure_desktop_session_helpers();
     }
+    let (display_sink, monitor, scale) = connect_desktop(&args)?;
     let control_socket = args.socket.unwrap_or_else(default_socket_path);
     let runtime_base = control_socket
         .parent()
@@ -230,16 +295,17 @@ fn main() -> anyhow::Result<()> {
         event_loop.handle(),
         wayland_name.clone(),
         runtime_base,
-        args.scale,
+        scale,
         frame_hz,
-        !args.headless,
+        monitor,
+        display_sink,
     );
 
     info!(
-        "focusstaged started: WAYLAND_DISPLAY={}, control_socket={}, wslg={}",
+        "focusstaged started: WAYLAND_DISPLAY={}, control_socket={}, desktop={}",
         wayland_name,
         control_socket.display(),
-        state.wslg_sink.is_some()
+        state.display_sink.is_some()
     );
 
     event_loop
@@ -295,7 +361,7 @@ fn main() -> anyhow::Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("insert control channel source: {e}"))?;
 
-    if let Some(sink_fd) = state.wslg_sink.as_ref().and_then(|s| s.event_fd()) {
+    if let Some(sink_fd) = state.display_sink.as_ref().and_then(|s| s.event_fd()) {
         event_loop
             .handle()
             .insert_source(
@@ -307,10 +373,10 @@ fn main() -> anyhow::Result<()> {
                     if dispatch_sink_events(state) {
                         let _ = state.display_handle.backend_handle().flush(None);
                     }
-                    Ok(PostAction::Continue)
+                    Ok(if state.display_sink.is_some() { PostAction::Continue } else { PostAction::Remove })
                 },
             )
-            .map_err(|e| anyhow::anyhow!("insert wslg sink source: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("insert display sink source: {e}"))?;
     }
 
     let tick_due = Rc::new(Cell::new(false));
@@ -337,82 +403,52 @@ fn main() -> anyhow::Result<()> {
         state.expire_leases();
         state.reap_exited_stages();
         state.popups.cleanup();
+        state.virtual_outputs.cleanup();
 
-        // 3. Collect stages whose WSLg wl_surface.frame callback just completed
-        let frame_done_stages = if let Some(ref mut sink) = state.wslg_sink {
-            sink.take_frame_done_stages()
-        } else {
-            Vec::new()
-        };
+        let frame_done = state.display_sink.as_mut()
+            .map(|sink| sink.take_frame_done_windows()).unwrap_or_default();
 
-        // 4. Present dirty Desktop stages to WslgSink (paced by WSLg frame callback)
-        if state.wslg_sink.is_some() {
-            let desktop_dirty: Vec<String> = state
-                .stages
-                .iter()
-                .filter(|(sid, s)| {
-                    s.display == DisplayState::Desktop
-                        && s.dirty_for_sink
-                        && s.has_live_surface()
-                        && !state
-                            .wslg_sink
-                            .as_ref()
-                            .is_some_and(|sink| sink.is_frame_pending(sid))
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
-
-            for sid in desktop_dirty {
-                let xwm_id = state.stages.get(&sid).and_then(|s| s.xwm_id);
-                let ovrs = xwm_id
-                    .map(|id| state.x11_override_windows_for(id))
-                    .unwrap_or_default();
-                let mut buf = state
-                    .wslg_sink
-                    .as_mut()
-                    .map(|sink| sink.take_frame_buffer(0))
-                    .unwrap_or_default();
-                let rendered = {
-                    let stage_ref = state.stages.get(&sid).unwrap();
-                    state
-                        .offscreen
-                        .render_stage_bgra_into(stage_ref, &ovrs, &mut buf)
-                };
-                if let Ok((w, h)) = rendered {
-                    if let Some(ref mut sink) = state.wslg_sink {
-                        sink.present_owned(&sid, w, h, buf);
+        let mut desktop_dirty = Vec::new();
+        if let Some(sink) = state.display_sink.as_ref() {
+            for stage in state.stages.values().filter(|s| s.display == DisplayState::Desktop) {
+                for window in &stage.windows {
+                    if !window.mapped || !window.dirty || sink.is_frame_pending(&window.id) {
+                        continue;
                     }
-                    if let Some(s) = state.stages.get_mut(&sid) {
-                        s.dirty_for_sink = false;
-                    }
+                    // Render after collecting IDs so we can also update each window's dirty flag.
+                    desktop_dirty.push(window.id.clone());
                 }
             }
         }
+        for id in desktop_dirty {
+            let (stage_id, _) = id.rsplit_once('/').unwrap();
+            let window = state.stages[stage_id].window(&id).unwrap();
+            let overrides = state.x11_override_windows_for(&window.toplevel);
+            let sink = state.display_sink.as_mut().unwrap();
+            let mut pixels = sink.take_frame_buffer(0);
+            if let Ok((width, height)) = state.offscreen.render_window_bgra_into(
+                Some(window), window.logical_size, window.scale, &overrides, &mut pixels,
+            ) {
+                sink.present_owned(&id, width, height, pixels);
+                state.stages.get_mut(stage_id).unwrap().window_mut(&id).unwrap().dirty = false;
+            }
+        }
 
-        // 5. Send frame callbacks to surfaces:
-        //    - Desktop stages: immediately when WSLg frame callback completes, or on frame_hz tick if idle
-        //    - Hidden stages: on frame_hz tick (keeps offscreen stages rendering)
+        // Hidden and idle windows still receive frame callbacks on the compositor timer.
         let is_tick = tick_due.replace(false);
-        if is_tick || !frame_done_stages.is_empty() {
+        if is_tick || !frame_done.is_empty() {
             let now_ms = state.now_ms();
-            let surfaces: Vec<_> = state
-                .stages
-                .iter()
-                .filter(|(sid, s)| {
-                    if s.display == DisplayState::Hidden {
+            let surfaces: Vec<_> = state.stages.values().flat_map(|stage| {
+                let sink = state.display_sink.as_ref();
+                let frame_done = &frame_done;
+                stage.windows.iter().filter(move |w| {
+                    if stage.display == DisplayState::Hidden || !w.mapped {
                         return is_tick;
                     }
-                    let pending = state
-                        .wslg_sink
-                        .as_ref()
-                        .is_some_and(|sink| sink.is_frame_pending(sid));
-                    if pending {
-                        return false;
-                    }
-                    is_tick || frame_done_stages.iter().any(|d| d == *sid)
-                })
-                .flat_map(|(_, s)| s.toplevels.iter().filter_map(|t| t.wl_surface()))
-                .collect();
+                    !sink.is_some_and(|sink| sink.is_frame_pending(&w.id))
+                        && (is_tick || frame_done.contains(&w.id))
+                }).filter_map(|w| w.toplevel.wl_surface())
+            }).collect();
             for surf in surfaces {
                 send_frames_surface_tree(&surf, now_ms);
                 for (popup, _) in PopupManager::popups_for_surface(&surf) {
@@ -423,7 +459,7 @@ fn main() -> anyhow::Result<()> {
 
         // 6. Flush outgoing Wayland & WSLg buffers before sleeping
         let _ = state.display_handle.backend_handle().flush(None);
-        if let Some(ref mut sink) = state.wslg_sink {
+        if let Some(ref mut sink) = state.display_sink {
             sink.flush();
         }
 
@@ -437,7 +473,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn dispatch_sink_events(state: &mut FocusStageState) -> bool {
-    let sink_events = if let Some(ref mut sink) = state.wslg_sink {
+    let sink_events = if let Some(ref mut sink) = state.display_sink {
         sink.poll_events()
     } else {
         Vec::new()
@@ -445,85 +481,68 @@ fn dispatch_sink_events(state: &mut FocusStageState) -> bool {
     let had_events = !sink_events.is_empty();
     for ev in sink_events {
         match ev {
-            SinkInputEvent::PointerMotion {
-                stage_id,
-                x,
-                y,
-                time,
-            } => {
-                if state.is_input_allowed(&stage_id, InputSource::Human, None) {
-                    let t = state.resolve_input_time(time);
-                    state.send_stage_pointer_motion_at(&stage_id, x, y, t);
+            SinkInputEvent::Disconnected => {
+                warn!("Native Windows host disconnected; existing stages remain available offscreen");
+                state.display_sink = None;
+            }
+            SinkInputEvent::PointerLeave { window_id } => {
+                if let Some(stage_id) = human_input_stage(state, &window_id) {
+                    state.leave_window_pointer(&stage_id, &window_id);
                 }
             }
-            SinkInputEvent::PointerButton {
-                stage_id,
-                button,
-                pressed,
-                x,
-                y,
-                time,
-            } => {
-                if state.is_input_allowed(&stage_id, InputSource::Human, None) {
-                    let t = state.resolve_input_time(time);
-                    state.send_stage_button_at(&stage_id, x, y, button, pressed, t);
+            SinkInputEvent::PointerMotion { window_id, x, y, time } => {
+                if let Some(stage_id) = human_input_stage(state, &window_id) {
+                    let time = state.resolve_input_time(time);
+                    state.send_window_pointer_motion_at(&stage_id, Some(&window_id), x, y, time);
                 }
             }
-            SinkInputEvent::PointerScroll {
-                stage_id,
-                dx,
-                dy,
-                source,
-                v120,
-                stop,
-                time,
-            } => {
-                if state.is_input_allowed(&stage_id, InputSource::Human, None) {
-                    if let Some(pos) = state.stages.get(&stage_id).map(|s| s.input.pointer_pos) {
-                        let t = state.resolve_input_time(time);
-                        state.send_stage_scroll_frame(
-                            &stage_id,
-                            pos.x,
-                            pos.y,
-                            dx,
-                            dy,
-                            source,
-                            v120,
-                            stop,
-                            Some(t),
-                        );
+            SinkInputEvent::PointerButton { window_id, button, pressed, x, y, time } => {
+                if let Some(stage_id) = human_input_stage(state, &window_id) {
+                    if pressed {
+                        state.activate_sink_window(&stage_id, &window_id);
                     }
+                    let time = state.resolve_input_time(time);
+                    state.send_window_button_at(&stage_id, Some(&window_id), x, y, button, pressed, time);
                 }
             }
-            SinkInputEvent::Key {
-                stage_id,
-                evdev_keycode,
-                pressed,
-                time,
-            } => {
-                if state.is_input_allowed(&stage_id, InputSource::Human, None) {
-                    let t = state.resolve_input_time(time);
-                    state.send_stage_evdev_key_at(&stage_id, evdev_keycode, pressed, t);
+            SinkInputEvent::PointerScroll { window_id, dx, dy, position, source, v120, stop, time } => {
+                if let Some(stage_id) = human_input_stage(state, &window_id) {
+                    let pos = state.stages[&stage_id].input.pointer_pos;
+                    let (x, y) = position.unwrap_or((pos.x, pos.y));
+                    let time = state.resolve_input_time(time);
+                    state.send_window_scroll_frame(
+                        &stage_id, Some(&window_id), x, y, dx, dy, source, v120, stop, Some(time),
+                    );
                 }
             }
-            SinkInputEvent::Resized { stage_id, rect } => {
-                state.resize_stage_from_sink(&stage_id, rect);
+            SinkInputEvent::Key { window_id, evdev_keycode, pressed, time } => {
+                if let Some(stage_id) = human_input_stage(state, &window_id) {
+                    state.send_sink_key(&stage_id, &window_id, evdev_keycode, pressed, time);
+                }
             }
-            SinkInputEvent::CloseRequested { stage_id } => {
-                let _ = state.close_stage(&stage_id);
+            SinkInputEvent::Resized { window_id, rect } => {
+                state.resize_window_from_sink(&window_id, rect);
+            }
+            SinkInputEvent::WindowChanged { window_id, state: host_state } => {
+                state.update_window_from_sink(&window_id, host_state);
+            }
+            SinkInputEvent::CloseRequested { window_id } => {
+                state.close_window_from_sink(&window_id);
             }
             SinkInputEvent::HostClipboardChanged { text } => {
                 state.sync_from_host_clipboard(text);
             }
-            SinkInputEvent::FilesDropped {
-                stage_id,
-                paths,
-                x,
-                y,
-            } => {
-                let _ = state.drop_files_to_stage(&stage_id, &paths, Some((x, y).into()));
+            SinkInputEvent::FilesDropped { window_id, paths, x, y } => {
+                if let Some(stage_id) = human_input_stage(state, &window_id) {
+                    let _ = state.drop_files_to_window(&stage_id, Some(&window_id), &paths, Some((x, y).into()));
+                }
             }
         }
     }
     had_events
+}
+
+fn human_input_stage(state: &FocusStageState, window_id: &str) -> Option<String> {
+    state.desktop_stage_for_window(window_id)
+        .filter(|id| state.is_input_allowed(id, InputSource::Human, None))
 }

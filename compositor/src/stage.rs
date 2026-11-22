@@ -28,7 +28,7 @@ impl Lease {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StageToplevel {
     Wayland(ToplevelSurface),
     X11(X11Surface),
@@ -89,6 +89,7 @@ pub struct StageInputState {
     pub pressed_keys: HashSet<u32>,
     /// Pointer coordinates in Stage-logical pixels (origin = main window top-left)
     pub pointer_pos: Point<f64, Logical>,
+    pub pointer_window_id: Option<String>,
     /// Evdev mouse button codes currently pressed on this Stage
     pub pressed_buttons: HashSet<u32>,
     /// Current surface holding `wl_keyboard` focus on this Stage
@@ -123,6 +124,7 @@ impl StageInputState {
             mods_state,
             pressed_keys: HashSet::new(),
             pointer_pos: Point::from((10.0, 10.0)),
+            pointer_window_id: None,
             pressed_buttons: HashSet::new(),
             current_keyboard_target: None,
             current_pointer_target: None,
@@ -161,10 +163,33 @@ pub struct StageClipboard {
 }
 
 pub struct PendingX11Launch {
-    pub app: String,
-    pub args: Vec<String>,
     pub env: std::collections::HashMap<String, String>,
     pub cwd: Option<String>,
+}
+
+pub struct StageWindow {
+    pub id: String,
+    pub toplevel: StageToplevel,
+    pub title: String,
+    pub logical_size: Size<i32, Logical>,
+    pub saved_rect: SavedRect,
+    pub scale: f64,
+    pub parent_window_id: Option<String>,
+    pub monitor: Option<SavedRect>,
+    pub pixel_size: Option<[u32; 2]>,
+    pub maximized: bool,
+    pub host_close_requested: bool,
+    pub mapped: bool,
+    pub dirty: bool,
+}
+
+impl StageWindow {
+    pub(crate) fn set_mapped_size(&mut self, size: Size<i32, Logical>) {
+        self.logical_size = size;
+        self.saved_rect.width = size.w.max(1) as u32;
+        self.saved_rect.height = size.h.max(1) as u32;
+        self.pixel_size = None;
+    }
 }
 
 pub struct Stage {
@@ -173,24 +198,25 @@ pub struct Stage {
     pub wm_class: String,
     pub args: Vec<String>,
     pub kind: StageKind,
-    pub title: String,
     pub pid: Option<u32>,
     pub child: Option<Child>,
+    pub(crate) launch_token: Option<String>,
+    pub(crate) next_process_check: Option<Instant>,
     pub user_data_dir: Option<std::path::PathBuf>,
 
     pub display: DisplayState,
     pub input_owner: InputOwner,
     pub lease: Option<Lease>,
 
-    pub logical_size: Size<i32, Logical>,
-    pub saved_rect: Option<SavedRect>,
-    pub scale: f64,
-
+    pub initial_rect: SavedRect,
+    pub default_scale: f64,
     pub frame_seq: u64,
-    pub dirty_for_sink: bool,
 
     pub wayland_clients: HashMap<ClientId, Client>,
-    pub toplevels: Vec<StageToplevel>,
+    pub windows: Vec<StageWindow>,
+    pub active_window_id: Option<String>,
+    pub window_seq: u64,
+    pub retire_when_empty: bool,
 
     pub input: StageInputState,
     pub clipboard: StageClipboard,
@@ -271,29 +297,26 @@ impl Stage {
         let wm_class = Self::derive_wm_class(&app);
         Self {
             id,
-            app: app.clone(),
+            app,
             wm_class,
             args,
             kind,
-            title: app,
             pid: None,
             child: None,
+            launch_token: None,
+            next_process_check: None,
             user_data_dir: None,
             display,
             input_owner: InputOwner::Human,
             lease: None,
-            logical_size: Size::from((width as i32, height as i32)),
-            saved_rect: Some(SavedRect {
-                x: 100,
-                y: 100,
-                width,
-                height,
-            }),
-            scale,
+            initial_rect: SavedRect { x: 100, y: 100, width, height },
+            default_scale: scale,
             frame_seq: 0,
-            dirty_for_sink: true,
             wayland_clients: HashMap::new(),
-            toplevels: Vec::new(),
+            windows: Vec::new(),
+            active_window_id: None,
+            window_seq: 0,
+            retire_when_empty: false,
             input: StageInputState::new(),
             clipboard: StageClipboard::default(),
             xwayland: None,
@@ -305,38 +328,103 @@ impl Stage {
         }
     }
 
+    pub fn add_window(&mut self, toplevel: StageToplevel, size: Size<i32, Logical>) -> String {
+        self.window_seq += 1;
+        let id = format!("{}/{}", self.id, self.window_seq);
+        let cascade = ((self.window_seq - 1) % 8) as i32 * 24;
+        self.windows.push(StageWindow {
+            id: id.clone(),
+            toplevel,
+            title: self.app.clone(),
+            logical_size: size,
+            saved_rect: SavedRect {
+                x: self.initial_rect.x + cascade,
+                y: self.initial_rect.y + cascade,
+                width: size.w.max(1) as u32,
+                height: size.h.max(1) as u32,
+            },
+            scale: self.default_scale,
+            parent_window_id: None,
+            monitor: None,
+            pixel_size: None,
+            maximized: false,
+            host_close_requested: false,
+            mapped: false,
+            dirty: true,
+        });
+        id
+    }
+
+    pub fn window(&self, id: &str) -> Option<&StageWindow> {
+        self.windows.iter().find(|w| w.id == id)
+    }
+
+    pub fn window_mut(&mut self, id: &str) -> Option<&mut StageWindow> {
+        self.windows.iter_mut().find(|w| w.id == id)
+    }
+
+    pub fn active_window(&self) -> Option<&StageWindow> {
+        let live = || self.windows.iter().rev().filter(|w| w.toplevel.alive());
+        self.active_window_id.as_deref().and_then(|id| self.window(id))
+            .filter(|w| w.mapped && w.toplevel.alive())
+            .or_else(|| live().find(|w| w.mapped))
+            .or_else(|| live().next())
+    }
+
     pub fn active_toplevel(&self) -> Option<&StageToplevel> {
-        self.toplevels.iter().rev().find(|t| t.alive())
+        self.active_window().map(|w| &w.toplevel)
+    }
+
+    pub(crate) fn uses_virtual_focus(&self) -> bool {
+        self.display == DisplayState::Hidden || self.input_owner != InputOwner::Human
+    }
+
+    pub fn input_toplevel(&self, window_id: Option<&str>) -> Option<&StageToplevel> {
+        match window_id {
+            Some(id) => self.window(id).map(|w| &w.toplevel),
+            None => self.active_toplevel(),
+        }
+    }
+
+    pub fn logical_size(&self) -> Size<i32, Logical> {
+        self.active_window().map(|w| w.logical_size)
+            .unwrap_or_else(|| (self.initial_rect.width as i32, self.initial_rect.height as i32).into())
     }
 
     pub fn has_live_surface(&self) -> bool {
-        self.toplevels
-            .iter()
-            .any(|t| t.alive() && t.wl_surface().is_some())
+        self.windows.iter().any(|w| w.toplevel.alive() && w.toplevel.wl_surface().is_some())
     }
 
     pub fn bump_frame(&mut self) {
         self.frame_seq = self.frame_seq.saturating_add(1);
-        self.dirty_for_sink = true;
+        for window in &mut self.windows {
+            window.dirty = true;
+        }
+    }
+
+    pub fn bump_window_frame(&mut self, id: &str) {
+        if let Some(window) = self.window_mut(id) {
+            window.dirty = true;
+            self.frame_seq = self.frame_seq.saturating_add(1);
+        }
     }
 
     pub fn info(&self) -> StageInfo {
+        let window = self.active_window();
+        let size = self.logical_size();
         StageInfo {
             stage_id: self.id.clone(),
             app: self.app.clone(),
-            title: self.title.clone(),
+            title: window.map(|w| &w.title).unwrap_or(&self.app).clone(),
             kind: self.kind,
             pid: self.pid,
             display: self.display,
             input_owner: self.input_owner.clone(),
-            size: [
-                self.logical_size.w.max(1) as u32,
-                self.logical_size.h.max(1) as u32,
-            ],
-            rect: self.saved_rect,
+            size: [size.w.max(1) as u32, size.h.max(1) as u32],
+            rect: Some(window.map(|w| w.saved_rect).unwrap_or(self.initial_rect)),
             frame_seq: self.frame_seq,
             has_surface: self.has_live_surface(),
-            scale: self.scale,
+            scale: window.map(|w| w.scale).unwrap_or(self.default_scale),
             wm_class: Some(self.wm_class.clone()),
         }
     }

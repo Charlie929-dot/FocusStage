@@ -21,20 +21,8 @@ internal static class Win11WindowHelper
     public const int HTBOTTOMLEFT = 16;
     public const int HTBOTTOMRIGHT = 17;
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MARGINS
-    {
-        public int Left;
-        public int Right;
-        public int Top;
-        public int Bottom;
-    }
-
     [DllImport("dwmapi.dll", PreserveSig = true)]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
-
-    [DllImport("dwmapi.dll", PreserveSig = true)]
-    private static extern int DwmExtendFrameIntoClientArea(IntPtr hwnd, ref MARGINS pMarInset);
 
     [DllImport("user32.dll")]
     public static extern bool ReleaseCapture();
@@ -48,9 +36,6 @@ internal static class Win11WindowHelper
         {
             int pref = DWMWCP_ROUND;
             DwmSetWindowAttribute(handle, DWMWA_WINDOW_CORNER_PREFERENCE, ref pref, sizeof(int));
-
-            var margins = new MARGINS { Left = 0, Right = 0, Top = 0, Bottom = 1 };
-            DwmExtendFrameIntoClientArea(handle, ref margins);
         }
         catch
         {
@@ -177,15 +162,29 @@ internal static class UiGraphics
     }
 }
 
-internal sealed class BufferedFlowPanel : FlowLayoutPanel
+internal class TransparentPanel : Panel
+{
+    public TransparentPanel()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint
+            | ControlStyles.SupportsTransparentBackColor | ControlStyles.ResizeRedraw, true);
+        BackColor = Color.Transparent;
+    }
+}
+
+internal class TransparentFlowPanel : FlowLayoutPanel
+{
+    public TransparentFlowPanel()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint
+            | ControlStyles.SupportsTransparentBackColor | ControlStyles.ResizeRedraw, true);
+        BackColor = Color.Transparent;
+    }
+}
+
+internal sealed class BufferedFlowPanel : TransparentFlowPanel
 {
     public Func<Bitmap?>? WallpaperProvider { get; set; }
-
-    public BufferedFlowPanel()
-    {
-        DoubleBuffered = true;
-        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.ResizeRedraw, true);
-    }
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
@@ -236,8 +235,12 @@ internal sealed class RoundedPanel : Panel
         var rect = new Rectangle(inset, inset, Width - 1 - inset * 2, Height - 1 - inset * 2);
         if (rect.Width <= 0 || rect.Height <= 0) return;
 
+        using var path = UiGraphics.BuildRoundPath(rect, CornerRadius);
         if (DrawShadow)
         {
+            var state = g.Save();
+            using var interior = new Region(path);
+            g.ExcludeClip(interior);
             for (int i = 3; i >= 1; i--)
             {
                 var sr = new Rectangle(rect.X - i + 1, rect.Y + i, rect.Width + (i - 1) * 2, rect.Height);
@@ -245,9 +248,8 @@ internal sealed class RoundedPanel : Panel
                 using var sb = new SolidBrush(Color.FromArgb(10 * (4 - i), 15, 23, 42));
                 g.FillPath(sb, sp);
             }
+            g.Restore(state);
         }
-
-        using var path = UiGraphics.BuildRoundPath(rect, CornerRadius);
         using var fill = new SolidBrush(FillColor);
         using var pen = new Pen(BorderColor, 1f);
         g.FillPath(fill, path);

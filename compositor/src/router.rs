@@ -9,6 +9,7 @@ use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::{
     zwp_text_input_manager_v3::{self, ZwpTextInputManagerV3},
     zwp_text_input_v3::{self, ZwpTextInputV3},
 };
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as ToplevelState;
 use smithay::reexports::wayland_server::{
     backend::{ClientId, GlobalId},
     protocol::{wl_keyboard::KeyState as WlKeyState, wl_surface::WlSurface},
@@ -334,6 +335,45 @@ impl FocusStageState {
         true
     }
 
+    pub fn leave_window_pointer(&mut self, stage_id: &str, window_id: &str) {
+        let Some(stage) = self.stages.get_mut(stage_id) else { return; };
+        if stage.input.pointer_window_id.as_deref() != Some(window_id) || !stage.input.pressed_buttons.is_empty() {
+            return;
+        }
+        stage.input.pointer_window_id = None;
+        let Some(target) = stage.input.current_pointer_target.take().filter(|t| t.alive()) else { return; };
+        let seat = self.seat.clone();
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = self.now_ms();
+        match target {
+            StageInputTarget::Wayland(surface) => {
+                PointerTarget::leave(&surface, &seat, self, serial, time);
+                PointerTarget::frame(&surface, &seat, self);
+            }
+            StageInputTarget::X11(surface) => {
+                PointerTarget::leave(&surface, &seat, self, serial, time);
+                PointerTarget::frame(&surface, &seat, self);
+            }
+        }
+    }
+
+    pub(crate) fn clear_window_inputs(&mut self, stage_id: &str, window_id: &str) {
+        let stage = self.stages.get_mut(stage_id).unwrap();
+        let focused = stage.active_window().is_some_and(|w| w.id == window_id)
+            || (stage.active_window_id.as_deref() == Some(window_id)
+                && stage.window(window_id).is_some_and(|w| w.mapped));
+        if focused {
+            let keys: Vec<_> = stage.input.pressed_keys.iter().copied().collect();
+            for key in keys {
+                stage.input.update_key(key, false);
+            }
+        }
+        if stage.input.pointer_window_id.as_deref() == Some(window_id) {
+            stage.input.pressed_buttons.clear();
+            self.leave_window_pointer(stage_id, window_id);
+        }
+    }
+
     /// Ensure virtual focus is permanently active for a Stage without sending `leave` to any other Stage.
     pub fn ensure_virtual_focus(&mut self, stage_id: &str) {
         let Some(stage) = self.stages.get(stage_id) else {
@@ -343,6 +383,8 @@ impl FocusStageState {
             Some(t) => t.clone(),
             None => return,
         };
+        let virtual_focus = stage.uses_virtual_focus();
+        let x11_virtual_activation = virtual_focus || self.display_sink.is_none();
         let mods_state = stage.input.mods_state;
         let pointer_pos = stage.input.pointer_pos;
         let cur_kbd = stage.input.current_keyboard_target.clone();
@@ -351,6 +393,12 @@ impl FocusStageState {
 
         match toplevel {
             StageToplevel::Wayland(ref wl_tl) => {
+                if virtual_focus {
+                    wl_tl.with_pending_state(|pending| {
+                        pending.states.set(ToplevelState::Activated);
+                    });
+                    wl_tl.send_pending_configure();
+                }
                 let wl_surf = wl_tl.wl_surface().clone();
                 let kbd_valid = cur_kbd.as_ref().is_some_and(|t| {
                     t.alive()
@@ -370,7 +418,7 @@ impl FocusStageState {
                     t.alive()
                         && matches!(t, StageInputTarget::Wayland(s) if s == &wl_surf || PopupManager::popups_for_surface(&wl_surf).any(|(p, _)| p.wl_surface() == s))
                 });
-                if !ptr_valid {
+                if virtual_focus && !ptr_valid {
                     let (target, local) =
                         self.hit_test_wayland_surface(&wl_surf, pointer_pos.x, pointer_pos.y);
                     let serial = SERIAL_COUNTER.next_serial();
@@ -384,11 +432,13 @@ impl FocusStageState {
                 }
             }
             StageToplevel::X11(ref x11_tl) => {
-                let _ = x11_tl.set_activated(true);
+                let kbd_valid = cur_kbd.as_ref().is_some_and(|t| {
+                    t.alive() && t.same_target(&StageInputTarget::X11(x11_tl.clone()))
+                });
+                if x11_virtual_activation || !kbd_valid {
+                    let _ = x11_tl.set_activated(true);
+                }
                 if x11_tl.wl_surface().is_some() {
-                    let kbd_valid = cur_kbd.as_ref().is_some_and(|t| {
-                        t.alive() && t.same_target(&StageInputTarget::X11(x11_tl.clone()))
-                    });
                     if !kbd_valid {
                         let serial = SERIAL_COUNTER.next_serial();
                         self.set_keyboard_target(
@@ -399,7 +449,7 @@ impl FocusStageState {
                         );
                     }
                     let ptr_valid = cur_ptr.as_ref().is_some_and(|t| t.alive());
-                    if !ptr_valid {
+                    if virtual_focus && !ptr_valid {
                         let serial = SERIAL_COUNTER.next_serial();
                         self.set_pointer_target(
                             stage_id,
@@ -448,29 +498,10 @@ impl FocusStageState {
             // Release any held keys/buttons from AI before switching to Human.
             self.release_all_stage_inputs(id);
 
-            let (should_show, title, wm_class, rect) = if let Some(stage) = self.stages.get_mut(id) {
+            if let Some(stage) = self.stages.get_mut(id) {
                 stage.lease = None;
                 stage.input_owner = InputOwner::Human;
-                let was_hidden = stage.display == DisplayState::Hidden;
-                stage.display = DisplayState::Desktop;
-                let rect = stage.saved_rect.unwrap_or(crate::protocol::SavedRect {
-                    x: 100,
-                    y: 100,
-                    width: stage.logical_size.w.max(1) as u32,
-                    height: stage.logical_size.h.max(1) as u32,
-                });
-                (was_hidden, stage.title.clone(), stage.wm_class.clone(), rect)
-            } else {
-                (false, String::new(), String::from("FocusStage"), crate::protocol::SavedRect { x: 100, y: 100, width: 800, height: 600 })
-            };
-
-            if should_show {
-                if let Some(ref mut sink) = self.wslg_sink {
-                    sink.show(id, &title, &wm_class, rect);
-                }
-                if let Some(stage) = self.stages.get_mut(id) {
-                    stage.dirty_for_sink = true;
-                }
+                self.set_stage_display(id, DisplayState::Desktop);
             }
         }
 
@@ -497,21 +528,24 @@ impl FocusStageState {
         ids
     }
 
-    fn release_all_stage_inputs(&mut self, stage_id: &str) {
-        let (pressed_keys, pressed_buttons, pos) = match self.stages.get(stage_id) {
+    pub(crate) fn release_all_stage_inputs(&mut self, stage_id: &str) {
+        let (pressed_keys, pressed_buttons, pos, pointer_window_id) = match self.stages.get(stage_id) {
             Some(s) => (
                 s.input.pressed_keys.iter().copied().collect::<Vec<_>>(),
                 s.input.pressed_buttons.iter().copied().collect::<Vec<_>>(),
                 s.input.pointer_pos,
+                s.input.pointer_window_id.clone(),
             ),
             None => return,
         };
         for kc in pressed_keys {
             self.send_stage_evdev_key(stage_id, kc, false);
         }
+        let time = self.now_ms();
         for btn in pressed_buttons {
-            self.send_stage_button(stage_id, pos.x, pos.y, btn, false);
+            self.send_window_button_at(stage_id, pointer_window_id.as_deref(), pos.x, pos.y, btn, false, time);
         }
+        self.stages.get_mut(stage_id).unwrap().input.pressed_buttons.clear();
     }
 
     /// Resolve Stage-relative `(x, y)` to `(WlSurface | X11Surface target, local_point)` checking popups first.
@@ -541,12 +575,19 @@ impl FocusStageState {
     }
 
     pub fn send_stage_pointer_motion_at(&mut self, stage_id: &str, x: f64, y: f64, time: u32) {
-        self.ensure_virtual_focus(stage_id);
-        let Some(toplevel) = self.stages.get(stage_id).and_then(|s| s.active_toplevel().cloned()) else {
+        self.send_window_pointer_motion_at(stage_id, None, x, y, time);
+    }
+
+    pub fn send_window_pointer_motion_at(&mut self, stage_id: &str, window_id: Option<&str>, x: f64, y: f64, time: u32) {
+        if window_id.is_none() {
+            self.ensure_virtual_focus(stage_id);
+        }
+        let Some(toplevel) = self.stages.get(stage_id).and_then(|s| s.input_toplevel(window_id)).cloned() else {
             return;
         };
         if let Some(stage) = self.stages.get_mut(stage_id) {
             stage.input.pointer_pos = Point::from((x, y));
+            stage.input.pointer_window_id = window_id.map(str::to_owned);
         }
         let seat = self.seat.clone();
         let serial = SERIAL_COUNTER.next_serial();
@@ -576,8 +617,8 @@ impl FocusStageState {
                 // Check override-redirect X11 popup windows (menus/dropdowns) first
                 let mut hit_x11 = x11.clone();
                 let mut local = Point::from((x, y));
-                if let Some(xwm_id) = self.stages.get(stage_id).and_then(|s| s.xwm_id) {
-                    for ovr in self.x11_override_windows_for(xwm_id).into_iter().rev() {
+                if x11.xwm_id().is_some() {
+                    for ovr in self.x11_override_windows_for(&StageToplevel::X11(x11.clone())).into_iter().rev() {
                         let ogeo = ovr.geometry();
                         let rx = (ogeo.loc.x - geo.loc.x) as f64;
                         let ry = (ogeo.loc.y - geo.loc.y) as f64;
@@ -626,8 +667,14 @@ impl FocusStageState {
         pressed: bool,
         time: u32,
     ) {
-        self.send_stage_pointer_motion_at(stage_id, x, y, time);
-        let Some(toplevel) = self.stages.get(stage_id).and_then(|s| s.active_toplevel().cloned()) else {
+        self.send_window_button_at(stage_id, None, x, y, button, pressed, time);
+    }
+
+    pub fn send_window_button_at(
+        &mut self, stage_id: &str, window_id: Option<&str>, x: f64, y: f64, button: u32, pressed: bool, time: u32,
+    ) {
+        self.send_window_pointer_motion_at(stage_id, window_id, x, y, time);
+        let Some(toplevel) = self.stages.get(stage_id).and_then(|s| s.input_toplevel(window_id)).cloned() else {
             return;
         };
         if let Some(stage) = self.stages.get_mut(stage_id) {
@@ -660,8 +707,8 @@ impl FocusStageState {
             StageToplevel::X11(x11) => {
                 let geo = x11.geometry();
                 let mut hit_x11 = x11;
-                if let Some(xwm_id) = self.stages.get(stage_id).and_then(|s| s.xwm_id) {
-                    for ovr in self.x11_override_windows_for(xwm_id).into_iter().rev() {
+                if hit_x11.xwm_id().is_some() {
+                    for ovr in self.x11_override_windows_for(&StageToplevel::X11(hit_x11.clone())).into_iter().rev() {
                         let ogeo = ovr.geometry();
                         let rx = (ogeo.loc.x - geo.loc.x) as f64;
                         let ry = (ogeo.loc.y - geo.loc.y) as f64;
@@ -732,18 +779,26 @@ impl FocusStageState {
         stop: (bool, bool),
         time: Option<u32>,
     ) {
+        self.send_window_scroll_frame(stage_id, None, x, y, dx, dy, source, v120, stop, time);
+    }
+
+    pub fn send_window_scroll_frame(
+        &mut self, stage_id: &str, window_id: Option<&str>, x: f64, y: f64, dx: f64, dy: f64,
+        source: Option<AxisSource>, v120: Option<(i32, i32)>, stop: (bool, bool), time: Option<u32>,
+    ) {
         let time = time.unwrap_or_else(|| self.now_ms());
         let need_motion = self.stages.get(stage_id).is_none_or(|s| {
             s.input.current_pointer_target.as_ref().is_none_or(|t| !t.alive())
                 || (s.input.pointer_pos.x - x).abs() > 0.01
                 || (s.input.pointer_pos.y - y).abs() > 0.01
+                || s.input.pointer_window_id.as_deref() != window_id
         });
         if need_motion {
-            self.send_stage_pointer_motion_at(stage_id, x, y, time);
-        } else {
+            self.send_window_pointer_motion_at(stage_id, window_id, x, y, time);
+        } else if window_id.is_none() {
             self.ensure_virtual_focus(stage_id);
         }
-        let Some(toplevel) = self.stages.get(stage_id).and_then(|s| s.active_toplevel().cloned()) else {
+        let Some(toplevel) = self.stages.get(stage_id).and_then(|s| s.input_toplevel(window_id)).cloned() else {
             return;
         };
         let seat = self.seat.clone();
@@ -812,8 +867,8 @@ impl FocusStageState {
             StageToplevel::X11(x11) => {
                 let geo = x11.geometry();
                 let mut hit_x11 = x11;
-                if let Some(xwm_id) = self.stages.get(stage_id).and_then(|s| s.xwm_id) {
-                    for ovr in self.x11_override_windows_for(xwm_id).into_iter().rev() {
+                if hit_x11.xwm_id().is_some() {
+                    for ovr in self.x11_override_windows_for(&StageToplevel::X11(hit_x11.clone())).into_iter().rev() {
                         let ogeo = ovr.geometry();
                         let rx = (ogeo.loc.x - geo.loc.x) as f64;
                         let ry = (ogeo.loc.y - geo.loc.y) as f64;
@@ -846,9 +901,10 @@ impl FocusStageState {
         time: u32,
     ) {
         self.ensure_virtual_focus(stage_id);
-        let Some(toplevel) = self.stages.get(stage_id).and_then(|s| s.active_toplevel().cloned()) else {
+        let toplevel = self.stages.get(stage_id).and_then(|s| s.active_toplevel().cloned());
+        if pressed && toplevel.is_none() {
             return;
-        };
+        }
 
         let (_xkb_code, mods_state, prev_mods) = {
             let Some(stage) = self.stages.get_mut(stage_id) else {
@@ -857,6 +913,9 @@ impl FocusStageState {
             let prev = stage.input.mods_state;
             let (code, mods) = stage.input.update_key(evdev_code, pressed);
             (code, mods, prev)
+        };
+        let Some(toplevel) = toplevel else {
+            return;
         };
 
         let seat = self.seat.clone();
@@ -949,10 +1008,11 @@ impl FocusStageState {
                 .stages
                 .get(stage_id)
                 .ok_or_else(|| format!("Stage '{}' not found", stage_id))?;
+            let is_x11 = matches!(stage.active_toplevel(), Some(StageToplevel::X11(_)));
             (
                 stage.wayland_clients.keys().cloned().collect::<Vec<_>>(),
-                stage.kind == crate::protocol::StageKind::X11,
-                stage.xwm_id,
+                is_x11,
+                stage.xwm_id.filter(|_| is_x11),
             )
         };
 

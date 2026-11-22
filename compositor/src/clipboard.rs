@@ -410,8 +410,8 @@ impl FocusStageState {
             if self.clipboard_state.latest_host_clipboard.as_deref() != Some(&text) {
                 self.clipboard_state.latest_host_clipboard = Some(text.clone());
                 self.clipboard_state.host_clipboard_seq += 1;
-                // Also sync to WSLg X11 clipboard if sink is active
-                if let Some(ref mut sink) = self.wslg_sink {
+                // Push the selection to the desktop backend when one is connected.
+                if let Some(ref mut sink) = self.display_sink {
                     sink.set_host_clipboard(&text);
                 }
             }
@@ -444,13 +444,20 @@ impl FocusStageState {
         paths: &[String],
         pos: Option<Point<f64, Logical>>,
     ) -> Result<(), String> {
+        self.drop_files_to_window(stage_id, None, paths, pos)
+    }
+
+    pub fn drop_files_to_window(
+        &mut self, stage_id: &str, window_id: Option<&str>, paths: &[String],
+        pos: Option<Point<f64, Logical>>,
+    ) -> Result<(), String> {
         let stage = self
             .stages
             .get(stage_id)
             .ok_or_else(|| format!("Stage '{}' not found", stage_id))?;
 
         let surface = stage
-            .active_toplevel()
+            .input_toplevel(window_id)
             .and_then(|t| t.wl_surface())
             .ok_or_else(|| format!("Stage '{}' has no live surface", stage_id))?;
 
@@ -473,7 +480,7 @@ impl FocusStageState {
         for (dev_sid, weak_dev) in &self.clipboard_state.devices {
             if dev_sid == stage_id {
                 if let Ok(dev) = weak_dev.upgrade() {
-                    if let Some(client) = dev.client() {
+                    if let Some(client) = dev.client().filter(|c| surface.client().is_some_and(|owner| owner.id() == c.id())) {
                         let mimes = vec!["text/uri-list".to_string()];
                         if let Ok(offer) = client.create_resource::<WlDataOffer, _, FocusStageState>(
                             &self.display_handle,
