@@ -304,7 +304,9 @@ fn main() -> anyhow::Result<()> {
                     if readiness.error && !readiness.readable {
                         return Ok(PostAction::Remove);
                     }
-                    dispatch_sink_events(state);
+                    if dispatch_sink_events(state) {
+                        let _ = state.display_handle.backend_handle().flush(None);
+                    }
                     Ok(PostAction::Continue)
                 },
             )
@@ -365,13 +367,20 @@ fn main() -> anyhow::Result<()> {
                 let ovrs = xwm_id
                     .map(|id| state.x11_override_windows_for(id))
                     .unwrap_or_default();
+                let mut buf = state
+                    .wslg_sink
+                    .as_mut()
+                    .map(|sink| sink.take_frame_buffer(0))
+                    .unwrap_or_default();
                 let rendered = {
                     let stage_ref = state.stages.get(&sid).unwrap();
-                    state.offscreen.render_stage_bgra(stage_ref, &ovrs)
+                    state
+                        .offscreen
+                        .render_stage_bgra_into(stage_ref, &ovrs, &mut buf)
                 };
-                if let Ok((w, h, bgra)) = rendered {
+                if let Ok((w, h)) = rendered {
                     if let Some(ref mut sink) = state.wslg_sink {
-                        sink.present(&sid, w, h, &bgra);
+                        sink.present_owned(&sid, w, h, buf);
                     }
                     if let Some(s) = state.stages.get_mut(&sid) {
                         s.dirty_for_sink = false;
@@ -427,12 +436,13 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn dispatch_sink_events(state: &mut FocusStageState) {
+fn dispatch_sink_events(state: &mut FocusStageState) -> bool {
     let sink_events = if let Some(ref mut sink) = state.wslg_sink {
         sink.poll_events()
     } else {
         Vec::new()
     };
+    let had_events = !sink_events.is_empty();
     for ev in sink_events {
         match ev {
             SinkInputEvent::PointerMotion {
@@ -515,4 +525,5 @@ fn dispatch_sink_events(state: &mut FocusStageState) {
             }
         }
     }
+    had_events
 }

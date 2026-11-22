@@ -5,10 +5,12 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use smithay::backend::input::AxisSource;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
     wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
@@ -99,6 +101,67 @@ impl ShmSlot {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingConfigure {
+    serial: u32,
+    width: u32,
+    height: u32,
+    strict: bool,
+}
+
+#[derive(Default, Debug)]
+struct XdgConfigureTracker {
+    pending_toplevel_size: (u32, u32),
+    pending_toplevel_strict: bool,
+    unacked_configure: Option<PendingConfigure>,
+    acked_strict_size: Option<(u32, u32)>,
+}
+
+impl XdgConfigureTracker {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn on_toplevel_configure(&mut self, width: i32, height: i32, strict: bool) {
+        self.pending_toplevel_size = (width.max(0) as u32, height.max(0) as u32);
+        self.pending_toplevel_strict = strict;
+    }
+
+    fn on_surface_configure(&mut self, serial: u32) {
+        self.unacked_configure = Some(PendingConfigure {
+            serial,
+            width: self.pending_toplevel_size.0,
+            height: self.pending_toplevel_size.1,
+            strict: self.pending_toplevel_strict,
+        });
+    }
+
+    fn prepare_commit(&mut self, width: u32, height: u32) -> Result<Option<u32>, ()> {
+        if let Some(cfg) = self.unacked_configure {
+            if cfg.strict
+                && cfg.width > 0
+                && cfg.height > 0
+                && (width != cfg.width || height != cfg.height)
+            {
+                return Err(());
+            }
+            self.unacked_configure = None;
+            self.acked_strict_size = if cfg.strict && cfg.width > 0 && cfg.height > 0 {
+                Some((cfg.width, cfg.height))
+            } else {
+                None
+            };
+            return Ok(Some(cfg.serial));
+        }
+        if let Some((cw, ch)) = self.acked_strict_size {
+            if width != cw || height != ch {
+                return Err(());
+            }
+        }
+        Ok(None)
+    }
+}
+
 struct WaylandStageWindow {
     surface: Option<wl_surface::WlSurface>,
     xdg_surface: Option<xdg_surface::XdgSurface>,
@@ -106,6 +169,7 @@ struct WaylandStageWindow {
     decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     configured: bool,
     mapped: bool,
+    cfg_tracker: XdgConfigureTracker,
     rect: SavedRect,
     title: String,
     wm_class: String,
@@ -140,12 +204,14 @@ struct WaylandClientState {
     host_clipboard_text: String,
     clipboard_source: Option<wl_data_source::WlDataSource>,
     clipboard_tx: mpsc::Sender<String>,
+    wake_worker_fd: Arc<OwnedFd>,
     pending_offers: HashMap<u32, Vec<String>>,
     dnd_offer: Option<wl_data_offer::WlDataOffer>,
     dnd_stage: Option<String>,
     dnd_pos: (f64, f64),
     just_configured: Vec<String>,
     frame_done_stages: Vec<String>,
+    updated_rects: Vec<(String, SavedRect)>,
 
     events: Vec<SinkInputEvent>,
 }
@@ -157,32 +223,102 @@ struct PendingScrollFrame {
     dy: f64,
     source: Option<AxisSource>,
     v120: Option<(i32, i32)>,
+    saw_discrete: (bool, bool),
+    saw_v120: (bool, bool),
     stop: (bool, bool),
     time: u32,
 }
 
 impl PendingScrollFrame {
+    fn record_axis_discrete(&mut self, axis: wl_pointer::Axis, discrete: i32) {
+        self.has_event = true;
+        if self.source.is_none() {
+            self.source = Some(AxisSource::Wheel);
+        }
+        match axis {
+            wl_pointer::Axis::HorizontalScroll => {
+                self.saw_discrete.0 = true;
+                if discrete != 0 {
+                    let v120 = self.v120.get_or_insert((0, 0));
+                    v120.0 += discrete * 120;
+                }
+            }
+            wl_pointer::Axis::VerticalScroll => {
+                self.saw_discrete.1 = true;
+                if discrete != 0 {
+                    let v120 = self.v120.get_or_insert((0, 0));
+                    v120.1 += discrete * 120;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_axis_value120(&mut self, axis: wl_pointer::Axis, value120: i32) {
+        self.has_event = true;
+        match axis {
+            wl_pointer::Axis::HorizontalScroll => {
+                self.saw_v120.0 = true;
+                if value120 != 0 {
+                    let v120 = self.v120.get_or_insert((0, 0));
+                    v120.0 += value120;
+                }
+            }
+            wl_pointer::Axis::VerticalScroll => {
+                self.saw_v120.1 = true;
+                if value120 != 0 {
+                    let v120 = self.v120.get_or_insert((0, 0));
+                    v120.1 += value120;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn flush(&mut self, stage_id: &str, out: &mut Vec<SinkInputEvent>) {
         if !self.has_event {
             return;
         }
         let mut dx = self.dx;
         let mut dy = self.dy;
-        if let Some((vx, vy)) = self.v120 {
+        let (mut vx, mut vy) = self.v120.unwrap_or((0, 0));
+
+        // On wl_pointer v5-v7 (e.g. WSLg Weston), direction reversals and residual
+        // accumulator wheel ticks often arrive as axis_discrete(0) + axis(±9.0/±10.0)
+        // without axis_value120. Dropping discrete to 0 causes v7 clients (GTK3/Firefox,
+        // XWayland) to skip the first reversed notch until a second notch accumulates.
+        let is_wheel_source = matches!(self.source, Some(AxisSource::Wheel | AxisSource::WheelTilt));
+        if !self.saw_v120.0 && vx == 0 && (self.saw_discrete.0 || is_wheel_source) && dx.abs() >= 5.0 {
+            vx = if dx > 0.0 { 120 } else { -120 };
+        }
+        if !self.saw_v120.1 && vy == 0 && (self.saw_discrete.1 || is_wheel_source) && dy.abs() >= 5.0 {
+            vy = if dy > 0.0 { 120 } else { -120 };
+        }
+
+        let v120 = if vx != 0 || vy != 0 {
             if dx == 0.0 && vx != 0 {
                 dx = (vx as f64 / 120.0) * 15.0;
             }
             if dy == 0.0 && vy != 0 {
                 dy = (vy as f64 / 120.0) * 15.0;
             }
-        }
-        if dx != 0.0 || dy != 0.0 || self.v120.is_some() || self.stop.0 || self.stop.1 {
+            Some((vx, vy))
+        } else {
+            None
+        };
+
+        let emitted = dx != 0.0 || dy != 0.0 || v120.is_some() || self.stop.0 || self.stop.1;
+        debug!(
+            "[scroll-wslg] flush stage={} raw_d=({:.3},{:.3}) out_d=({:.3},{:.3}) v120={:?} source={:?} stop={:?} time={} emitted={}",
+            stage_id, self.dx, self.dy, dx, dy, v120, self.source, self.stop, self.time, emitted
+        );
+        if emitted {
             out.push(SinkInputEvent::PointerScroll {
                 stage_id: stage_id.to_string(),
                 dx,
                 dy,
                 source: self.source,
-                v120: self.v120,
+                v120,
                 stop: self.stop,
                 time: self.time,
             });
@@ -192,7 +328,7 @@ impl PendingScrollFrame {
 }
 
 impl WaylandClientState {
-    fn new(clipboard_tx: mpsc::Sender<String>) -> Self {
+    fn new(clipboard_tx: mpsc::Sender<String>, wake_worker_fd: Arc<OwnedFd>) -> Self {
         Self {
             compositor: None,
             shm: None,
@@ -216,23 +352,121 @@ impl WaylandClientState {
             host_clipboard_text: String::new(),
             clipboard_source: None,
             clipboard_tx,
+            wake_worker_fd,
             pending_offers: HashMap::new(),
             dnd_offer: None,
             dnd_stage: None,
             dnd_pos: (0.0, 0.0),
             just_configured: Vec::new(),
             frame_done_stages: Vec::new(),
+            updated_rects: Vec::new(),
             events: Vec::new(),
         }
     }
 }
 
+enum SinkCommand {
+    Show {
+        stage_id: String,
+        title: String,
+        wm_class: String,
+        rect: SavedRect,
+    },
+    Hide {
+        stage_id: String,
+    },
+    Destroy {
+        stage_id: String,
+    },
+    SetTitle {
+        stage_id: String,
+        title: String,
+    },
+    BeginMove {
+        stage_id: String,
+    },
+    BeginResize {
+        stage_id: String,
+        direction: u32,
+    },
+    Minimize {
+        stage_id: String,
+    },
+    SetMaximized {
+        stage_id: String,
+        maximized: bool,
+    },
+    SetHostClipboard {
+        text: String,
+    },
+    Shutdown,
+}
+
+struct PendingPresentFrame {
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
+}
+
+#[derive(Default)]
+struct SharedSinkState {
+    pending_frames: HashMap<String, PendingPresentFrame>,
+    free_buffers: Vec<Vec<u8>>,
+    frame_pending_since: HashMap<String, Instant>,
+    frame_done_stages: Vec<String>,
+    events: Vec<SinkInputEvent>,
+    window_rects: HashMap<String, SavedRect>,
+}
+
 pub struct WslgWaylandSink {
+    cmd_tx: mpsc::Sender<SinkCommand>,
+    shared: Arc<Mutex<SharedSinkState>>,
+    wake_worker_fd: Arc<OwnedFd>,
+    notify_main_fd: Arc<OwnedFd>,
+    worker: Option<JoinHandle<()>>,
+}
+
+struct WorkerCtx {
     conn: Connection,
     queue: EventQueue<WaylandClientState>,
     qh: QueueHandle<WaylandClientState>,
     state: WaylandClientState,
     clipboard_rx: mpsc::Receiver<String>,
+}
+
+fn create_eventfd() -> Result<OwnedFd, String> {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(format!("eventfd failed: {}", std::io::Error::last_os_error()));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn signal_eventfd(fd: &OwnedFd) {
+    let val: u64 = 1;
+    unsafe {
+        libc::write(
+            fd.as_raw_fd(),
+            &val as *const u64 as *const libc::c_void,
+            std::mem::size_of::<u64>(),
+        );
+    }
+}
+
+fn drain_eventfd(fd: &OwnedFd) {
+    let mut val: u64 = 0;
+    loop {
+        let rc = unsafe {
+            libc::read(
+                fd.as_raw_fd(),
+                &mut val as *mut u64 as *mut libc::c_void,
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if rc <= 0 {
+            break;
+        }
+    }
 }
 
 fn find_wslg_wayland_socket() -> Option<PathBuf> {
@@ -281,7 +515,73 @@ impl WslgWaylandSink {
     pub fn connect() -> Result<Self, String> {
         let sock_path = find_wslg_wayland_socket()
             .ok_or_else(|| "WSLg wayland-0 socket not found".to_string())?;
-        let stream = UnixStream::connect(&sock_path)
+        let wake_worker_fd = Arc::new(create_eventfd()?);
+        let notify_main_fd = Arc::new(create_eventfd()?);
+        let shared = Arc::new(Mutex::new(SharedSinkState::default()));
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SinkCommand>();
+        let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
+
+        let worker_wake = Arc::clone(&wake_worker_fd);
+        let worker_notify = Arc::clone(&notify_main_fd);
+        let worker_shared = Arc::clone(&shared);
+        let handle = std::thread::Builder::new()
+            .name("wslg-wayland-io".to_string())
+            .spawn(move || {
+                let mut worker = match WorkerCtx::connect(&sock_path, Arc::clone(&worker_wake)) {
+                    Ok(w) => {
+                        let _ = init_tx.send(Ok(()));
+                        w
+                    }
+                    Err(e) => {
+                        let _ = init_tx.send(Err(e));
+                        return;
+                    }
+                };
+                run_worker_loop(&mut worker, cmd_rx, worker_shared, worker_wake, worker_notify);
+            })
+            .map_err(|e| format!("spawn wslg-wayland-io thread: {e}"))?;
+
+        match init_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = handle.join();
+                return Err(e);
+            }
+            Err(e) => {
+                let _ = handle.join();
+                return Err(format!("wslg-wayland-io init channel error: {e}"));
+            }
+        }
+
+        Ok(Self {
+            cmd_tx,
+            shared,
+            wake_worker_fd,
+            notify_main_fd,
+            worker: Some(handle),
+        })
+    }
+
+    fn send_cmd(&self, cmd: SinkCommand) {
+        if self.cmd_tx.send(cmd).is_ok() {
+            signal_eventfd(&self.wake_worker_fd);
+        }
+    }
+}
+
+impl Drop for WslgWaylandSink {
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.send(SinkCommand::Shutdown);
+        signal_eventfd(&self.wake_worker_fd);
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl WorkerCtx {
+    fn connect(sock_path: &PathBuf, wake_worker_fd: Arc<OwnedFd>) -> Result<Self, String> {
+        let stream = UnixStream::connect(sock_path)
             .map_err(|e| format!("connect WSLg Wayland {}: {e}", sock_path.display()))?;
         let conn = Connection::from_socket(stream)
             .map_err(|e| format!("wayland Connection::from_socket: {e}"))?;
@@ -289,7 +589,7 @@ impl WslgWaylandSink {
         let mut queue: EventQueue<WaylandClientState> = conn.new_event_queue();
         let qh = queue.handle();
         let (clipboard_tx, clipboard_rx) = mpsc::channel();
-        let mut state = WaylandClientState::new(clipboard_tx);
+        let mut state = WaylandClientState::new(clipboard_tx, wake_worker_fd);
 
         let _registry = conn.display().get_registry(&qh, ());
         queue
@@ -304,7 +604,7 @@ impl WslgWaylandSink {
         }
 
         info!(
-            "Connected WslgWaylandSink to {} (csd_decoration_mgr={})",
+            "Connected WslgWaylandSink (async worker) to {} (csd_decoration_mgr={})",
             sock_path.display(),
             state.decoration_mgr.is_some()
         );
@@ -384,6 +684,7 @@ impl WslgWaylandSink {
             decoration: None,
             configured: false,
             mapped: false,
+            cfg_tracker: XdgConfigureTracker::default(),
             rect,
             title: clean_title.to_string(),
             wm_class: cls.to_string(),
@@ -398,6 +699,8 @@ impl WslgWaylandSink {
         win.decoration = decoration;
         win.configured = false;
         win.mapped = true;
+        win.cfg_tracker.reset();
+        win.last_frame = None;
         win.pending_frame_cb = None;
         win.rect = rect;
         win.title = clean_title.to_string();
@@ -405,22 +708,15 @@ impl WslgWaylandSink {
         self.state.windows.insert(stage_id.to_string(), win);
 
         surface.commit();
-        let _ = self.queue.roundtrip(&mut self.state);
-
-        let last = self
-            .state
-            .windows
-            .get(stage_id)
-            .and_then(|w| w.last_frame.clone());
-        if let Some((w, h, buf)) = last {
-            self.present(stage_id, w, h, &buf);
-        }
+        let _ = self.conn.flush();
     }
 
     fn unmap_window(&mut self, stage_id: &str) {
         if let Some(win) = self.state.windows.get_mut(stage_id) {
             win.mapped = false;
             win.configured = false;
+            win.cfg_tracker.reset();
+            win.last_frame = None;
             win.pending_frame_cb = None;
             if let Some(dec) = win.decoration.take() {
                 dec.destroy();
@@ -441,41 +737,43 @@ impl WslgWaylandSink {
             let _ = self.conn.flush();
         }
     }
-}
 
-impl DisplaySink for WslgWaylandSink {
-    fn show(&mut self, stage_id: &str, title: &str, wm_class: &str, rect: SavedRect) {
-        self.map_window(stage_id, title, wm_class, rect);
-    }
-
-    fn hide(&mut self, stage_id: &str) -> Option<SavedRect> {
-        let rect = self.state.windows.get(stage_id).map(|w| w.rect)?;
-        self.unmap_window(stage_id);
-        Some(rect)
-    }
-
-    fn destroy(&mut self, stage_id: &str) {
-        self.unmap_window(stage_id);
-        self.state.windows.remove(stage_id);
-    }
-
-    fn present(&mut self, stage_id: &str, width: u32, height: u32, bgra: &[u8]) {
+    fn present_frame(&mut self, stage_id: &str, width: u32, height: u32, bgra: &[u8]) -> bool {
         if width == 0 || height == 0 || bgra.len() < (width * height * 4) as usize {
-            return;
+            return false;
         }
         let Some(shm) = self.state.shm.clone() else {
-            return;
+            return false;
         };
         let Some(win) = self.state.windows.get_mut(stage_id) else {
-            return;
+            return false;
         };
         if !win.mapped || !win.configured {
             win.last_frame = Some((width, height, bgra.to_vec()));
-            return;
+            return false;
         }
         win.last_frame = None;
+        let ack_serial = match win.cfg_tracker.prepare_commit(width, height) {
+            Ok(serial) => serial,
+            Err(()) => {
+                info!(
+                    "[wslg-wayland] skipping mismatched frame {}x{} for {} (pending={:?}, acked_strict={:?})",
+                    width,
+                    height,
+                    stage_id,
+                    win.cfg_tracker.unacked_configure,
+                    win.cfg_tracker.acked_strict_size
+                );
+                return false;
+            }
+        };
+        if let Some(serial) = ack_serial {
+            if let Some(ref xdg_surf) = win.xdg_surface {
+                xdg_surf.ack_configure(serial);
+            }
+        }
         let Some(ref surface) = win.surface else {
-            return;
+            return false;
         };
 
         // Drop slots whose dimensions no longer match and are free
@@ -495,7 +793,7 @@ impl DisplaySink for WslgWaylandSink {
                 }
                 Err(e) => {
                     warn!("ShmSlot::new failed for {}: {}", stage_id, e);
-                    return;
+                    return false;
                 }
             },
         };
@@ -503,11 +801,38 @@ impl DisplaySink for WslgWaylandSink {
         win.slots[idx].write_bgra(bgra);
         win.slots[idx].busy = true;
         let cb = surface.frame(&self.qh, stage_id.to_string());
-        win.pending_frame_cb = Some((cb, std::time::Instant::now()));
+        win.pending_frame_cb = Some((cb, Instant::now()));
         surface.attach(Some(&win.slots[idx].buffer), 0, 0);
         surface.damage_buffer(0, 0, width as i32, height as i32);
         surface.commit();
         let _ = self.conn.flush();
+        true
+    }
+
+    fn present_just_configured(&mut self, shared: &Arc<Mutex<SharedSinkState>>) {
+        let ready_sids = std::mem::take(&mut self.state.just_configured);
+        for sid in ready_sids {
+            let last = self
+                .state
+                .windows
+                .get_mut(&sid)
+                .and_then(|w| w.last_frame.take());
+            if let Some((w, h, buf)) = last {
+                if self.present_frame(&sid, w, h, &buf) {
+                    let mut guard = shared.lock().unwrap();
+                    guard.frame_pending_since.insert(sid, Instant::now());
+                }
+            }
+        }
+    }
+
+    fn drain_clipboard(&mut self) {
+        while let Ok(text) = self.clipboard_rx.try_recv() {
+            if !text.is_empty() && text != self.state.host_clipboard_text {
+                self.state.host_clipboard_text = text.clone();
+                self.state.events.push(SinkInputEvent::HostClipboardChanged { text });
+            }
+        }
     }
 
     fn set_title(&mut self, stage_id: &str, title: &str) {
@@ -593,73 +918,358 @@ impl DisplaySink for WslgWaylandSink {
             let _ = self.conn.flush();
         }
     }
+}
 
-    fn event_fd(&self) -> Option<OwnedFd> {
-        self.conn.as_fd().try_clone_to_owned().ok()
+fn publish_worker_outputs(
+    state: &mut WaylandClientState,
+    shared: &Arc<Mutex<SharedSinkState>>,
+    notify_main_fd: &OwnedFd,
+) {
+    let has_events = !state.events.is_empty();
+    let has_frame_done = !state.frame_done_stages.is_empty();
+    let has_resizes = !state.updated_rects.is_empty();
+    if !has_events && !has_frame_done && !has_resizes {
+        return;
     }
-
-    fn flush(&mut self) {
-        let _ = self.conn.flush();
+    {
+        let mut guard = shared.lock().unwrap();
+        for (sid, rect) in state.updated_rects.drain(..) {
+            guard.window_rects.insert(sid, rect);
+        }
+        for sid in &state.frame_done_stages {
+            if !guard.pending_frames.contains_key(sid) {
+                guard.frame_pending_since.remove(sid);
+            }
+        }
+        if has_frame_done {
+            guard.frame_done_stages.append(&mut state.frame_done_stages);
+        }
+        if has_events {
+            guard.events.append(&mut state.events);
+        }
     }
-
-    fn is_frame_pending(&self, stage_id: &str) -> bool {
-        const FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
-        self.state
-            .windows
-            .get(stage_id)
-            .and_then(|w| w.pending_frame_cb.as_ref())
-            .is_some_and(|(_, since)| since.elapsed() < FRAME_TIMEOUT)
+    if has_events || has_frame_done {
+        signal_eventfd(notify_main_fd);
     }
+}
 
-    fn take_frame_done_stages(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.state.frame_done_stages)
-    }
+fn run_worker_loop(
+    worker: &mut WorkerCtx,
+    cmd_rx: mpsc::Receiver<SinkCommand>,
+    shared: Arc<Mutex<SharedSinkState>>,
+    wake_worker_fd: Arc<OwnedFd>,
+    notify_main_fd: Arc<OwnedFd>,
+) {
+    let mut running = true;
+    while running {
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                SinkCommand::Show {
+                    stage_id,
+                    title,
+                    wm_class,
+                    rect,
+                } => {
+                    worker.map_window(&stage_id, &title, &wm_class, rect);
+                }
+                SinkCommand::Hide { stage_id } => {
+                    worker.unmap_window(&stage_id);
+                }
+                SinkCommand::Destroy { stage_id } => {
+                    worker.unmap_window(&stage_id);
+                    worker.state.windows.remove(&stage_id);
+                }
+                SinkCommand::SetTitle { stage_id, title } => {
+                    worker.set_title(&stage_id, &title);
+                }
+                SinkCommand::BeginMove { stage_id } => {
+                    worker.begin_move(&stage_id);
+                }
+                SinkCommand::BeginResize {
+                    stage_id,
+                    direction,
+                } => {
+                    worker.begin_resize(&stage_id, direction);
+                }
+                SinkCommand::Minimize { stage_id } => {
+                    worker.minimize(&stage_id);
+                }
+                SinkCommand::SetMaximized {
+                    stage_id,
+                    maximized,
+                } => {
+                    worker.set_maximized(&stage_id, maximized);
+                }
+                SinkCommand::SetHostClipboard { text } => {
+                    worker.set_host_clipboard(&text);
+                }
+                SinkCommand::Shutdown => {
+                    running = false;
+                    break;
+                }
+            }
+        }
+        if !running {
+            break;
+        }
 
-    fn poll_events(&mut self) -> Vec<SinkInputEvent> {
-        let _ = self.queue.dispatch_pending(&mut self.state);
-        let _ = self.conn.flush();
+        let pending_frames = {
+            let mut guard = shared.lock().unwrap();
+            std::mem::take(&mut guard.pending_frames)
+        };
+        for (sid, frame) in pending_frames {
+            let committed = worker.present_frame(&sid, frame.width, frame.height, &frame.bgra);
+            let mut guard = shared.lock().unwrap();
+            if !committed && !guard.pending_frames.contains_key(&sid) {
+                guard.frame_pending_since.remove(&sid);
+            }
+            if guard.free_buffers.len() < 4 {
+                guard.free_buffers.push(frame.bgra);
+            }
+        }
+
+        let _ = worker.queue.dispatch_pending(&mut worker.state);
+        worker.present_just_configured(&shared);
+        worker.drain_clipboard();
+        publish_worker_outputs(&mut worker.state, &shared, &notify_main_fd);
+
+        let _ = worker.conn.flush();
+
         for _ in 0..16 {
-            let Some(guard) = self.conn.prepare_read() else {
-                let _ = self.queue.dispatch_pending(&mut self.state);
+            let Some(guard) = worker.conn.prepare_read() else {
+                let _ = worker.queue.dispatch_pending(&mut worker.state);
+                worker.present_just_configured(&shared);
+                worker.drain_clipboard();
+                publish_worker_outputs(&mut worker.state, &shared, &notify_main_fd);
                 continue;
             };
-            let fd = guard.connection_fd().as_raw_fd();
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ready = unsafe { libc::poll(&mut pfd, 1, 0) };
-            if ready > 0 && (pfd.revents & libc::POLLIN) != 0 {
+            let wl_fd = guard.connection_fd().as_raw_fd();
+            let mut pfds = [
+                libc::pollfd {
+                    fd: wl_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: wake_worker_fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                drop(guard);
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                warn!("wslg-wayland-io poll error: {}", err);
+                running = false;
+                break;
+            }
+            if (pfds[1].revents & libc::POLLIN) != 0 {
+                drain_eventfd(&wake_worker_fd);
+            }
+            if (pfds[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP)) != 0 {
                 match guard.read() {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(_) => break,
+                    Ok(0) => {
+                        if (pfds[0].revents & (libc::POLLERR | libc::POLLHUP)) != 0 {
+                            warn!("WSLg Wayland socket closed (EOF)");
+                            running = false;
+                        }
+                        break;
+                    }
+                    Ok(_) => {
+                        let _ = worker.queue.dispatch_pending(&mut worker.state);
+                        worker.present_just_configured(&shared);
+                        worker.drain_clipboard();
+                        publish_worker_outputs(&mut worker.state, &shared, &notify_main_fd);
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        if !msg.contains("WouldBlock") {
+                            warn!("wslg-wayland-io read error: {}", e);
+                            running = false;
+                        }
+                        break;
+                    }
                 }
             } else {
                 drop(guard);
                 break;
             }
         }
-        let _ = self.queue.dispatch_pending(&mut self.state);
-        let ready_sids = std::mem::take(&mut self.state.just_configured);
-        for sid in ready_sids {
-            let last = self
-                .state
-                .windows
-                .get(&sid)
-                .and_then(|w| w.last_frame.clone());
-            if let Some((w, h, buf)) = last {
-                self.present(&sid, w, h, &buf);
-            }
+    }
+}
+
+impl DisplaySink for WslgWaylandSink {
+    fn show(&mut self, stage_id: &str, title: &str, wm_class: &str, rect: SavedRect) {
+        {
+            let mut guard = self.shared.lock().unwrap();
+            guard.window_rects.insert(stage_id.to_string(), rect);
         }
-        while let Ok(text) = self.clipboard_rx.try_recv() {
-            if !text.is_empty() && text != self.state.host_clipboard_text {
-                self.state.host_clipboard_text = text.clone();
-                self.state.events.push(SinkInputEvent::HostClipboardChanged { text });
+        self.send_cmd(SinkCommand::Show {
+            stage_id: stage_id.to_string(),
+            title: title.to_string(),
+            wm_class: wm_class.to_string(),
+            rect,
+        });
+    }
+
+    fn hide(&mut self, stage_id: &str) -> Option<SavedRect> {
+        let rect = {
+            let mut guard = self.shared.lock().unwrap();
+            let rect = guard.window_rects.get(stage_id).copied();
+            if let Some(old) = guard.pending_frames.remove(stage_id) {
+                if guard.free_buffers.len() < 4 {
+                    guard.free_buffers.push(old.bgra);
+                }
             }
+            guard.frame_pending_since.remove(stage_id);
+            rect
+        };
+        if rect.is_some() {
+            self.send_cmd(SinkCommand::Hide {
+                stage_id: stage_id.to_string(),
+            });
         }
-        std::mem::take(&mut self.state.events)
+        rect
+    }
+
+    fn destroy(&mut self, stage_id: &str) {
+        {
+            let mut guard = self.shared.lock().unwrap();
+            guard.window_rects.remove(stage_id);
+            if let Some(old) = guard.pending_frames.remove(stage_id) {
+                if guard.free_buffers.len() < 4 {
+                    guard.free_buffers.push(old.bgra);
+                }
+            }
+            guard.frame_pending_since.remove(stage_id);
+        }
+        self.send_cmd(SinkCommand::Destroy {
+            stage_id: stage_id.to_string(),
+        });
+    }
+
+    fn take_frame_buffer(&mut self, min_capacity: usize) -> Vec<u8> {
+        let mut guard = self.shared.lock().unwrap();
+        if let Some(idx) = guard.free_buffers.iter().position(|b| b.capacity() >= min_capacity) {
+            let mut buf = guard.free_buffers.swap_remove(idx);
+            buf.clear();
+            return buf;
+        }
+        if let Some(mut buf) = guard.free_buffers.pop() {
+            buf.clear();
+            if buf.capacity() < min_capacity {
+                buf.reserve(min_capacity - buf.capacity());
+            }
+            return buf;
+        }
+        Vec::with_capacity(min_capacity)
+    }
+
+    fn present(&mut self, stage_id: &str, width: u32, height: u32, bgra: &[u8]) {
+        let mut buf = self.take_frame_buffer(bgra.len());
+        buf.extend_from_slice(bgra);
+        self.present_owned(stage_id, width, height, buf);
+    }
+
+    fn present_owned(&mut self, stage_id: &str, width: u32, height: u32, bgra: Vec<u8>) {
+        if width == 0 || height == 0 || bgra.len() < (width * height * 4) as usize {
+            let mut guard = self.shared.lock().unwrap();
+            if guard.free_buffers.len() < 4 {
+                guard.free_buffers.push(bgra);
+            }
+            return;
+        }
+        {
+            let mut guard = self.shared.lock().unwrap();
+            if let Some(old) = guard.pending_frames.insert(
+                stage_id.to_string(),
+                PendingPresentFrame {
+                    width,
+                    height,
+                    bgra,
+                },
+            ) {
+                if guard.free_buffers.len() < 4 {
+                    guard.free_buffers.push(old.bgra);
+                }
+            }
+            guard
+                .frame_pending_since
+                .insert(stage_id.to_string(), Instant::now());
+        }
+        signal_eventfd(&self.wake_worker_fd);
+    }
+
+    fn set_title(&mut self, stage_id: &str, title: &str) {
+        self.send_cmd(SinkCommand::SetTitle {
+            stage_id: stage_id.to_string(),
+            title: title.to_string(),
+        });
+    }
+
+    fn begin_move(&mut self, stage_id: &str) {
+        self.send_cmd(SinkCommand::BeginMove {
+            stage_id: stage_id.to_string(),
+        });
+    }
+
+    fn begin_resize(&mut self, stage_id: &str, direction: u32) {
+        self.send_cmd(SinkCommand::BeginResize {
+            stage_id: stage_id.to_string(),
+            direction,
+        });
+    }
+
+    fn minimize(&mut self, stage_id: &str) {
+        self.send_cmd(SinkCommand::Minimize {
+            stage_id: stage_id.to_string(),
+        });
+    }
+
+    fn set_maximized(&mut self, stage_id: &str, maximized: bool) {
+        self.send_cmd(SinkCommand::SetMaximized {
+            stage_id: stage_id.to_string(),
+            maximized,
+        });
+    }
+
+    fn set_host_clipboard(&mut self, text: &str) {
+        self.send_cmd(SinkCommand::SetHostClipboard {
+            text: text.to_string(),
+        });
+    }
+
+    fn event_fd(&self) -> Option<OwnedFd> {
+        self.notify_main_fd.as_fd().try_clone_to_owned().ok()
+    }
+
+    fn flush(&mut self) {
+        // Worker thread flushes its own Wayland socket immediately after processing commands/frames.
+    }
+
+    fn is_frame_pending(&self, stage_id: &str) -> bool {
+        const FRAME_TIMEOUT: Duration = Duration::from_millis(50);
+        let guard = self.shared.lock().unwrap();
+        guard
+            .frame_pending_since
+            .get(stage_id)
+            .is_some_and(|since| since.elapsed() < FRAME_TIMEOUT)
+    }
+
+    fn take_frame_done_stages(&mut self) -> Vec<String> {
+        let mut guard = self.shared.lock().unwrap();
+        std::mem::take(&mut guard.frame_done_stages)
+    }
+
+    fn poll_events(&mut self) -> Vec<SinkInputEvent> {
+        drain_eventfd(&self.notify_main_fd);
+        let mut guard = self.shared.lock().unwrap();
+        std::mem::take(&mut guard.events)
     }
 }
 
@@ -857,11 +1467,11 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for WaylandClientState {
         _: &QueueHandle<Self>,
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
-            xdg_surf.ack_configure(serial);
             if let Some(sid) = state.xdg_to_stage.get(&xdg_surf.id().protocol_id()).cloned() {
                 if let Some(win) = state.windows.get_mut(&sid) {
                     let first = !win.configured;
                     win.configured = true;
+                    win.cfg_tracker.on_surface_configure(serial);
                     if first && win.last_frame.is_some() {
                         state.just_configured.push(sid);
                     }
@@ -884,14 +1494,21 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandClientState {
             return;
         };
         match event {
-            xdg_toplevel::Event::Configure { width, height, .. } => {
-                if width > 0 && height > 0 {
-                    if let Some(win) = state.windows.get_mut(&sid) {
+            xdg_toplevel::Event::Configure { width, height, states } => {
+                let strict = states.chunks_exact(4).any(|chunk| {
+                    let val = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    val == xdg_toplevel::State::Maximized as u32
+                        || val == xdg_toplevel::State::Fullscreen as u32
+                });
+                if let Some(win) = state.windows.get_mut(&sid) {
+                    win.cfg_tracker.on_toplevel_configure(width, height, strict);
+                    if width > 0 && height > 0 {
                         let w = width as u32;
                         let h = height as u32;
                         if win.rect.width != w || win.rect.height != h {
                             win.rect.width = w;
                             win.rect.height = h;
+                            state.updated_rects.push((sid.clone(), win.rect));
                             state.events.push(SinkInputEvent::Resized {
                                 stage_id: sid,
                                 rect: win.rect,
@@ -1014,6 +1631,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientState {
             wl_pointer::Event::AxisSource {
                 axis_source: WEnum::Value(src),
             } => {
+                debug!(
+                    "[scroll-wslg] axis_source={:?} stage={:?} ptr_v={}",
+                    src, state.pointer_stage, pointer.version()
+                );
                 state.pending_scroll.source = Some(match src {
                     wl_pointer::AxisSource::Wheel => AxisSource::Wheel,
                     wl_pointer::AxisSource::Finger => AxisSource::Finger,
@@ -1026,31 +1647,31 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientState {
                 axis: WEnum::Value(axis),
                 discrete,
             } => {
-                state.pending_scroll.has_event = true;
-                let v120 = state.pending_scroll.v120.get_or_insert((0, 0));
-                match axis {
-                    wl_pointer::Axis::HorizontalScroll => v120.0 += discrete * 120,
-                    wl_pointer::Axis::VerticalScroll => v120.1 += discrete * 120,
-                    _ => {}
-                }
+                debug!(
+                    "[scroll-wslg] axis_discrete axis={:?} discrete={} stage={:?} ptr_v={}",
+                    axis, discrete, state.pointer_stage, pointer.version()
+                );
+                state.pending_scroll.record_axis_discrete(axis, discrete);
             }
             wl_pointer::Event::AxisValue120 {
                 axis: WEnum::Value(axis),
                 value120,
             } => {
-                state.pending_scroll.has_event = true;
-                let v120 = state.pending_scroll.v120.get_or_insert((0, 0));
-                match axis {
-                    wl_pointer::Axis::HorizontalScroll => v120.0 += value120,
-                    wl_pointer::Axis::VerticalScroll => v120.1 += value120,
-                    _ => {}
-                }
+                debug!(
+                    "[scroll-wslg] axis_value120 axis={:?} value120={} stage={:?} ptr_v={}",
+                    axis, value120, state.pointer_stage, pointer.version()
+                );
+                state.pending_scroll.record_axis_value120(axis, value120);
             }
             wl_pointer::Event::Axis {
                 time,
                 axis: WEnum::Value(axis),
                 value,
             } => {
+                debug!(
+                    "[scroll-wslg] axis axis={:?} value={:.4} time={} stage={:?} ptr_v={}",
+                    axis, value, time, state.pointer_stage, pointer.version()
+                );
                 state.pending_scroll.has_event = true;
                 state.pending_scroll.time = time;
                 match axis {
@@ -1070,6 +1691,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientState {
                 time,
                 axis: WEnum::Value(axis),
             } => {
+                debug!(
+                    "[scroll-wslg] axis_stop axis={:?} time={} stage={:?}",
+                    axis, time, state.pointer_stage
+                );
                 state.pending_scroll.has_event = true;
                 state.pending_scroll.time = time;
                 match axis {
@@ -1079,6 +1704,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientState {
                 }
             }
             wl_pointer::Event::Frame => {
+                if state.pending_scroll.has_event {
+                    debug!(
+                        "[scroll-wslg] pointer_frame stage={:?}",
+                        state.pointer_stage
+                    );
+                }
                 if let Some(sid) = state.pointer_stage.as_deref() {
                     state.pending_scroll.flush(sid, &mut state.events);
                 } else {
@@ -1213,9 +1844,11 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientState {
                             offer.destroy();
                             let _ = conn.flush();
                             let tx = state.clipboard_tx.clone();
+                            let wake = Arc::clone(&state.wake_worker_fd);
                             std::thread::spawn(move || {
                                 if let Some(text) = read_fd_utf8_with_timeout(read_fd, 1500) {
                                     let _ = tx.send(text);
+                                    signal_eventfd(&wake);
                                 }
                             });
                         } else {
@@ -1297,6 +1930,8 @@ mod tests {
             dy: 10.0,
             source: Some(AxisSource::Wheel),
             v120: Some((0, 120)),
+            saw_discrete: (false, true),
+            saw_v120: (false, false),
             stop: (false, false),
             time: 42,
         };
@@ -1335,6 +1970,8 @@ mod tests {
             dy: 0.0,
             source: Some(AxisSource::Wheel),
             v120: Some((0, -120)),
+            saw_discrete: (false, false),
+            saw_v120: (false, true),
             stop: (false, false),
             time: 77,
         };
@@ -1348,6 +1985,116 @@ mod tests {
             }
             other => panic!("unexpected event: {:?}", other),
         }
+    }
+
+    #[test]
+    fn promotes_wslg_zero_discrete_wheel_reversal_to_full_v120() {
+        let mut frame = PendingScrollFrame::default();
+        frame.record_axis_discrete(wl_pointer::Axis::VerticalScroll, 0);
+        frame.dy = -9.0;
+        frame.time = 100;
+
+        let mut out = Vec::new();
+        frame.flush("stage-1", &mut out);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            SinkInputEvent::PointerScroll {
+                dy,
+                source,
+                v120,
+                ..
+            } => {
+                assert_eq!(*dy, -9.0);
+                assert_eq!(*source, Some(AxisSource::Wheel));
+                assert_eq!(*v120, Some((0, -120)));
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn keeps_subnotch_finger_and_value120_scrolls_without_inflating() {
+        // Touchpad / Finger smooth scroll must not synthesize v120
+        let mut finger = PendingScrollFrame {
+            has_event: true,
+            dy: 9.0,
+            source: Some(AxisSource::Finger),
+            time: 10,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        finger.flush("stage-1", &mut out);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            SinkInputEvent::PointerScroll {
+                dy,
+                source,
+                v120,
+                ..
+            } => {
+                assert_eq!(*dy, 9.0);
+                assert_eq!(*source, Some(AxisSource::Finger));
+                assert_eq!(*v120, None);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        // True high-res v8 axis_value120 sub-step must preserve exact value120
+        let mut hires = PendingScrollFrame::default();
+        hires.record_axis_value120(wl_pointer::Axis::VerticalScroll, 30);
+        hires.dy = 2.5;
+        hires.source = Some(AxisSource::Wheel);
+        hires.flush("stage-1", &mut out);
+        assert_eq!(out.len(), 2);
+        match &out[1] {
+            SinkInputEvent::PointerScroll { v120, .. } => {
+                assert_eq!(*v120, Some((0, 30)));
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        // Tiny sub-notch axis_discrete(0) micro-step must not inflate to 120
+        let mut micro = PendingScrollFrame::default();
+        micro.record_axis_discrete(wl_pointer::Axis::VerticalScroll, 0);
+        micro.dy = 1.5;
+        micro.flush("stage-1", &mut out);
+        assert_eq!(out.len(), 3);
+        match &out[2] {
+            SinkInputEvent::PointerScroll { dy, v120, .. } => {
+                assert_eq!(*dy, 1.5);
+                assert_eq!(*v120, None);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn xdg_configure_tracker_blocks_mismatched_maximized_commits_until_resized() {
+        let mut tracker = XdgConfigureTracker::default();
+
+        // Weston sends maximized configure (1920x1020)
+        tracker.on_toplevel_configure(1920, 1020, true);
+        tracker.on_surface_configure(10);
+
+        // Stale 1280x800 frame must NOT ack serial 10 or commit
+        assert_eq!(tracker.prepare_commit(1280, 800), Err(()));
+        assert!(tracker.unacked_configure.is_some());
+
+        // Resized 1920x1020 frame acks serial 10 and locks strict size
+        assert_eq!(tracker.prepare_commit(1920, 1020), Ok(Some(10)));
+        assert_eq!(tracker.unacked_configure, None);
+        assert_eq!(tracker.acked_strict_size, Some((1920, 1020)));
+
+        // Subsequent matching frames commit without re-acking; mismatched frames stay blocked
+        assert_eq!(tracker.prepare_commit(1920, 1020), Ok(None));
+        assert_eq!(tracker.prepare_commit(1280, 800), Err(()));
+
+        // Unmaximizing clears strict enforcement once the new configure is acked
+        tracker.on_toplevel_configure(1280, 800, false);
+        tracker.on_surface_configure(11);
+        assert_eq!(tracker.prepare_commit(1280, 800), Ok(Some(11)));
+        assert_eq!(tracker.acked_strict_size, None);
+        assert_eq!(tracker.prepare_commit(1280, 800), Ok(None));
     }
 }
 

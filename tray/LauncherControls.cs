@@ -267,32 +267,60 @@ internal sealed class DimOverlayPanel : Panel
     public DimOverlayPanel()
     {
         DoubleBuffered = true;
-        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint, true);
+        SetStyle(
+            ControlStyles.OptimizedDoubleBuffer
+            | ControlStyles.AllPaintingInWmPaint
+            | ControlStyles.UserPaint
+            | ControlStyles.ResizeRedraw,
+            true);
         MouseDown += (_, _) => BackdropClicked?.Invoke(this, EventArgs.Empty);
     }
 
-    public void CaptureBackdropFrom(Control source)
+    public void CaptureBackdrop(Size size, Action<Bitmap> render)
     {
-        _backdrop?.Dispose();
-        _backdrop = null;
-        if (source.Width <= 0 || source.Height <= 0) return;
+        if (size.Width <= 0 || size.Height <= 0)
+        {
+            ClearBackdrop();
+            return;
+        }
         try
         {
-            var bmp = new Bitmap(source.Width, source.Height);
-            source.DrawToBitmap(bmp, new Rectangle(0, 0, source.Width, source.Height));
-            _backdrop = bmp;
+            if (_backdrop is null || _backdrop.Width != size.Width || _backdrop.Height != size.Height)
+            {
+                _backdrop?.Dispose();
+                _backdrop = new Bitmap(size.Width, size.Height);
+            }
+            render(_backdrop);
         }
         catch
         {
-            _backdrop = null;
+            ClearBackdrop();
         }
+    }
+
+    public void ClearBackdrop()
+    {
+        _backdrop?.Dispose();
+        _backdrop = null;
+    }
+
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        // Fully painted in OnPaint; skip redundant base background fill.
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         if (_backdrop is not null)
         {
-            e.Graphics.DrawImage(_backdrop, new Rectangle(0, 0, Width, Height));
+            if (_backdrop.Width == Width && _backdrop.Height == Height)
+            {
+                e.Graphics.DrawImageUnscaled(_backdrop, 0, 0);
+            }
+            else
+            {
+                e.Graphics.DrawImage(_backdrop, new Rectangle(0, 0, Width, Height));
+            }
         }
         else
         {
@@ -306,8 +334,7 @@ internal sealed class DimOverlayPanel : Panel
     {
         if (disposing)
         {
-            _backdrop?.Dispose();
-            _backdrop = null;
+            ClearBackdrop();
         }
         base.Dispose(disposing);
     }
@@ -315,7 +342,36 @@ internal sealed class DimOverlayPanel : Panel
 
 internal sealed class PillSearchBox : Panel
 {
-    private readonly TextBox _input;
+    private sealed class SearchTextBox : TextBox
+    {
+        private const int WM_PRINT = 0x0317;
+        private const int WM_PRINTCLIENT = 0x0318;
+        private const long PRF_CLIENT = 0x00000004L;
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            bool isClientPrint = m.Msg == WM_PRINTCLIENT
+                || (m.Msg == WM_PRINT && (m.LParam.ToInt64() & PRF_CLIENT) != 0);
+            if (isClientPrint
+                && m.WParam != IntPtr.Zero
+                && string.IsNullOrEmpty(Text)
+                && !Focused
+                && !string.IsNullOrEmpty(PlaceholderText))
+            {
+                using var g = Graphics.FromHdc(m.WParam);
+                TextRenderer.DrawText(
+                    g,
+                    PlaceholderText,
+                    Font,
+                    ClientRectangle,
+                    SystemColors.GrayText,
+                    TextFormatFlags.Left | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+            }
+        }
+    }
+
+    private readonly SearchTextBox _input;
     private readonly Label _clearBtn;
     private bool _focused;
 
@@ -340,7 +396,7 @@ internal sealed class PillSearchBox : Panel
         Height = 36;
         Width = 280;
 
-        _input = new TextBox
+        _input = new SearchTextBox
         {
             BorderStyle = BorderStyle.None,
             BackColor = Color.FromArgb(250, 252, 255),
@@ -584,6 +640,13 @@ internal sealed class ToggleSwitch : Control
             Invalidate();
             CheckedChanged?.Invoke(this, EventArgs.Empty);
         }
+    }
+
+    public void SetCheckedSilent(bool value)
+    {
+        if (_checked == value) return;
+        _checked = value;
+        Invalidate();
     }
 
     public event EventHandler? CheckedChanged;

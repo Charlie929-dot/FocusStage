@@ -254,10 +254,9 @@ internal sealed class LauncherForm : Form
             _toastPill.Visible = false;
         };
 
-        // 5. Phone-Style Folder Overlay Modal
+        // 5. Phone-Style Folder Overlay Modal (positioned over full ClientRectangle, not DockStyle.Fill)
         _folderOverlay = new DimOverlayPanel
         {
-            Dock = DockStyle.Fill,
             Visible = false
         };
         _folderOverlay.BackdropClicked += (_, _) => CloseFolderOverlay();
@@ -335,7 +334,6 @@ internal sealed class LauncherForm : Form
         // 6. Settings Overlay Modal (All settings + Running Stages consolidated here)
         _settingsOverlay = new DimOverlayPanel
         {
-            Dock = DockStyle.Fill,
             Visible = false
         };
         _settingsOverlay.BackdropClicked += (_, _) => CloseSettingsOverlay();
@@ -590,30 +588,29 @@ internal sealed class LauncherForm : Form
         settingsStack.Controls.AddRange(new Control[] { generalCard, daemonCard, stagesCard });
         _settingsScrollBody.Controls.Add(settingsStack);
 
+        int lastSettingsContentWidth = -1;
         void SyncSettingsCardWidths()
         {
             int contentW = Math.Max(320, _settingsScrollBody.ClientSize.Width - 18);
+            if (contentW == lastSettingsContentWidth) return;
+            lastSettingsContentWidth = contentW;
+
+            _settingsScrollBody.SuspendLayout();
             settingsStack.Width = contentW;
             generalCard.Width = contentW;
             daemonCard.Width = contentW;
             stagesCard.MinimumSize = new Size(contentW, 90);
             stagesCard.MaximumSize = new Size(contentW, 0);
             stagesCard.Width = contentW;
-            if (_settingsVisible)
-            {
-                RenderStages(force: true);
-            }
+            UpdateStageCardWidths();
+            _settingsScrollBody.ResumeLayout(performLayout: true);
         }
         _settingsScrollBody.Resize += (_, _) => SyncSettingsCardWidths();
 
         _settingsCard.Controls.Add(_settingsScrollBody);
         _settingsCard.Controls.Add(settingsHeader);
         _settingsOverlay.Controls.Add(_settingsCard);
-        _settingsOverlay.Resize += (_, _) =>
-        {
-            CenterSettingsCard();
-            SyncSettingsCardWidths();
-        };
+        _settingsOverlay.Resize += (_, _) => CenterSettingsCard();
 
         // Assemble root hierarchy
         Controls.Add(_homeGrid);
@@ -632,6 +629,7 @@ internal sealed class LauncherForm : Form
         {
             RebuildWallpaper();
             LayoutChrome();
+            RefreshActiveOverlayBackdrop();
             Invalidate();
         };
 
@@ -681,6 +679,16 @@ internal sealed class LauncherForm : Form
                 await RefreshAppsAsync(forceRender: false);
             }
         };
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ExStyle |= 0x02000000; // WS_EX_COMPOSITED: composite transparent child hierarchy without flicker
+            return cp;
+        }
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -787,6 +795,9 @@ internal sealed class LauncherForm : Form
             ClientSize.Height - _dockCard.Height - 14);
 
         PositionToast();
+
+        _folderOverlay.Bounds = ClientRectangle;
+        _settingsOverlay.Bounds = ClientRectangle;
     }
 
     private void PositionToast()
@@ -942,6 +953,7 @@ internal sealed class LauncherForm : Form
                 {
                     RenderFolderModal();
                 }
+                RefreshActiveOverlayBackdrop();
                 if (listChanged && !forceRender)
                 {
                     ShowToast($"已自动检测到应用更新，当前共 {_apps.Count} 个应用");
@@ -1178,17 +1190,23 @@ internal sealed class LauncherForm : Form
     {
         CloseSettingsOverlay();
         _openFolderId = folderId;
-        RenderFolderModal();
-        _folderOverlay.CaptureBackdropFrom(this);
-        _folderOverlay.Visible = true;
-        _folderOverlay.BringToFront();
+        _folderOverlay.Bounds = ClientRectangle;
+        _folderOverlay.SuspendLayout();
         CenterFolderCard();
+        RenderFolderModal();
+        _folderOverlay.ResumeLayout(performLayout: true);
+
+        CaptureOverlayBackdrop(_folderOverlay);
+        _folderOverlay.BringToFront();
+        _folderOverlay.Visible = true;
     }
 
     private void CloseFolderOverlay()
     {
+        if (_openFolderId is null && !_folderOverlay.Visible) return;
         _openFolderId = null;
         _folderOverlay.Visible = false;
+        _folderOverlay.ClearBackdrop();
     }
 
     private void CenterFolderCard()
@@ -1196,28 +1214,36 @@ internal sealed class LauncherForm : Form
         if (_folderOverlay.Width <= 0 || _folderOverlay.Height <= 0) return;
         int w = Math.Min(580, Math.Max(360, _folderOverlay.Width - 100));
         int h = Math.Min(430, Math.Max(280, _folderOverlay.Height - 100));
-        _folderCard.Size = new Size(w, h);
-        _folderCard.Location = new Point(
+        _folderCard.SetBounds(
             (_folderOverlay.Width - w) / 2,
-            (_folderOverlay.Height - h) / 2);
+            (_folderOverlay.Height - h) / 2,
+            w,
+            h);
     }
 
     private void OpenSettingsOverlay()
     {
         CloseFolderOverlay();
         _settingsVisible = true;
-        _toggleStartup.Checked = ShortcutManager.IsStartupEnabled();
-        RenderStages(force: true);
-        _settingsOverlay.CaptureBackdropFrom(this);
-        _settingsOverlay.Visible = true;
-        _settingsOverlay.BringToFront();
+        _toggleStartup.SetCheckedSilent(ShortcutManager.IsStartupEnabled());
+
+        _settingsOverlay.Bounds = ClientRectangle;
+        _settingsOverlay.SuspendLayout();
         CenterSettingsCard();
+        RenderStages(force: true);
+        _settingsOverlay.ResumeLayout(performLayout: true);
+
+        CaptureOverlayBackdrop(_settingsOverlay);
+        _settingsOverlay.BringToFront();
+        _settingsOverlay.Visible = true;
     }
 
     private void CloseSettingsOverlay()
     {
+        if (!_settingsVisible && !_settingsOverlay.Visible) return;
         _settingsVisible = false;
         _settingsOverlay.Visible = false;
+        _settingsOverlay.ClearBackdrop();
     }
 
     private void CenterSettingsCard()
@@ -1225,10 +1251,67 @@ internal sealed class LauncherForm : Form
         if (_settingsOverlay.Width <= 0 || _settingsOverlay.Height <= 0) return;
         int w = Math.Min(540, Math.Max(380, _settingsOverlay.Width - 96));
         int h = Math.Min(540, Math.Max(340, _settingsOverlay.Height - 80));
-        _settingsCard.Size = new Size(w, h);
-        _settingsCard.Location = new Point(
+        _settingsCard.SetBounds(
             (_settingsOverlay.Width - w) / 2,
-            (_settingsOverlay.Height - h) / 2);
+            (_settingsOverlay.Height - h) / 2,
+            w,
+            h);
+    }
+
+    private void RefreshActiveOverlayBackdrop()
+    {
+        if (_folderOverlay.Visible)
+        {
+            CaptureOverlayBackdrop(_folderOverlay);
+            _folderOverlay.Invalidate();
+        }
+        if (_settingsOverlay.Visible)
+        {
+            CaptureOverlayBackdrop(_settingsOverlay);
+            _settingsOverlay.Invalidate();
+        }
+    }
+
+    private void CaptureOverlayBackdrop(DimOverlayPanel overlay)
+    {
+        if (ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
+        overlay.CaptureBackdrop(ClientSize, bmp =>
+        {
+            using (var g = Graphics.FromImage(bmp))
+            {
+                if (_wallpaper is null || _wallpaper.Width != ClientSize.Width || _wallpaper.Height != ClientSize.Height)
+                {
+                    RebuildWallpaper();
+                }
+                if (_wallpaper is not null)
+                {
+                    g.DrawImageUnscaled(_wallpaper, 0, 0);
+                }
+                else
+                {
+                    g.Clear(BackColor);
+                }
+
+                using var borderPen = new Pen(Color.FromArgb(65, 148, 163, 184), 1f);
+                g.DrawRectangle(borderPen, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
+            }
+
+            DrawSiblingToBitmap(_homeGrid, bmp);
+            DrawSiblingToBitmap(_topBar, bmp);
+            DrawSiblingToBitmap(_dockCard, bmp);
+            if (_toastPill.Visible)
+            {
+                DrawSiblingToBitmap(_toastPill, bmp);
+            }
+        });
+    }
+
+    private static void DrawSiblingToBitmap(Control control, Bitmap target)
+    {
+        if (!control.Visible || control.Width <= 0 || control.Height <= 0) return;
+        var bounds = control.Bounds;
+        if (bounds.Right <= 0 || bounds.Bottom <= 0 || bounds.Left >= target.Width || bounds.Top >= target.Height) return;
+        control.DrawToBitmap(target, bounds);
     }
 
     private void RenderFolderModal()
@@ -1262,6 +1345,31 @@ internal sealed class LauncherForm : Form
         _folderGrid.ResumeLayout();
     }
 
+    private int GetStageCardWidth() =>
+        Math.Max(260, _stagesPanel.Parent is not null ? _stagesPanel.Parent.ClientSize.Width - 36 : 420);
+
+    private void UpdateStageCardWidths()
+    {
+        int cardWidth = GetStageCardWidth();
+        bool anyUpdated = false;
+        foreach (Control c in _stagesPanel.Controls)
+        {
+            if (c is RoundedPanel card && card.Width != cardWidth)
+            {
+                if (!anyUpdated)
+                {
+                    _stagesPanel.SuspendLayout();
+                    anyUpdated = true;
+                }
+                card.Width = cardWidth;
+            }
+        }
+        if (anyUpdated)
+        {
+            _stagesPanel.ResumeLayout(performLayout: true);
+        }
+    }
+
     private void RenderStages(bool force)
     {
         var sig = BuildStagesSignature(_stages);
@@ -1275,7 +1383,7 @@ internal sealed class LauncherForm : Form
         _stagesPanel.SuspendLayout();
         _stagesPanel.Controls.Clear();
 
-        int cardWidth = Math.Max(260, _stagesPanel.Parent is not null ? _stagesPanel.Parent.ClientSize.Width - 36 : 420);
+        int cardWidth = GetStageCardWidth();
 
         if (_stages.Count == 0)
         {
@@ -1320,6 +1428,7 @@ internal sealed class LauncherForm : Form
                 ForeColor = Color.FromArgb(30, 41, 59),
                 Location = new Point(12, 8),
                 Size = new Size(cardWidth - 24, 20),
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
                 AutoEllipsis = true,
                 BackColor = Color.Transparent
             };
@@ -1330,6 +1439,7 @@ internal sealed class LauncherForm : Form
                 ForeColor = Color.FromArgb(100, 116, 139),
                 Location = new Point(12, 27),
                 Size = new Size(cardWidth - 24, 16),
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
                 AutoEllipsis = true,
                 BackColor = Color.Transparent
             };
@@ -1338,6 +1448,7 @@ internal sealed class LauncherForm : Form
             {
                 Location = new Point(10, 45),
                 Size = new Size(cardWidth - 20, 26),
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
                 WrapContents = false,
                 BackColor = Color.Transparent
             };

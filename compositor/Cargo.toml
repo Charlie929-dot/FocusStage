@@ -23,6 +23,7 @@ wayland-client = "0.31"
 x11rb = { version = "0.14", features = ["allow-unsafe-code", "xfixes"] }
 xkbcommon = { version = "0.8", features = ["wayland"] }
 drm-fourcc = "2.2"
+pixman = { version = "0.2.1", default-features = false, features = ["drm-fourcc", "sync"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 png = "0.18"

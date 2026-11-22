@@ -41,6 +41,7 @@ pub struct OffscreenCore {
     pub virtual_output: Output,
     pub output_size: Size<i32, Physical>,
     pub frame_hz: u32,
+    cached_image: Option<(i32, i32, pixman::Image<'static, 'static>)>,
 }
 
 impl OffscreenCore {
@@ -73,6 +74,7 @@ impl OffscreenCore {
             virtual_output: output,
             output_size: Size::from((width, height)),
             frame_hz,
+            cached_image: None,
         }
     }
 
@@ -81,12 +83,14 @@ impl OffscreenCore {
     }
 
     /// Render a Stage's main toplevel + all popups + subsurfaces + X11 override-redirect menus
-    /// into BGRA8888 (little-endian ARGB8888 premultiplied) buffer, returning `(width, height, bgra_bytes)`.
-    pub fn render_stage_bgra(
+    /// into BGRA8888 (little-endian ARGB8888 premultiplied) bytes inside `out`,
+    /// returning `(width, height)`.
+    pub fn render_stage_bgra_into(
         &mut self,
         stage: &Stage,
         x11_override_windows: &[smithay::xwayland::X11Surface],
-    ) -> Result<(u32, u32, Vec<u8>), String> {
+        out: &mut Vec<u8>,
+    ) -> Result<(u32, u32), String> {
         let scale = stage.scale.max(1.0);
         let logical_w = stage.logical_size.w.max(1);
         let logical_h = stage.logical_size.h.max(1);
@@ -183,53 +187,74 @@ impl OffscreenCore {
             }
         }
 
-        let mut img = self
-            .renderer
-            .create_buffer(DrmFourcc::Argb8888, buf_size)
-            .map_err(|e| format!("create pixman buffer: {e}"))?;
-
-        let mut target = self
-            .renderer
-            .bind(&mut img)
-            .map_err(|e| format!("bind pixman buffer: {e}"))?;
-
-        {
-            let mut frame = self
+        let mut img = match self.cached_image.take() {
+            Some((cw, ch, img)) if cw == phys_w && ch == phys_h => img,
+            _ => self
                 .renderer
-                .render(&mut target, phys_size, Transform::Normal)
-                .map_err(|e| format!("begin pixman frame: {e}"))?;
-
-            frame
-                .clear(Color32F::new(0.08, 0.09, 0.11, 1.0), &[damage])
-                .map_err(|e| format!("clear frame: {e}"))?;
-
-            draw_render_elements(&mut frame, scale, &elements, &[damage])
-                .map_err(|e| format!("draw elements: {e}"))?;
-
-            let _sync = frame
-                .finish()
-                .map_err(|e| format!("finish pixman frame: {e}"))?;
-        }
-        drop(target);
-
-        let stride = img.stride();
-        let row_bytes = (phys_w as usize) * 4;
-        let height = img.height();
-        let raw = unsafe {
-            std::slice::from_raw_parts(img.data() as *const u8, stride * height)
+                .create_buffer(DrmFourcc::Argb8888, buf_size)
+                .map_err(|e| format!("create pixman buffer: {e}"))?,
         };
-        let bytes = if stride == row_bytes {
-            raw.to_vec()
-        } else {
-            let mut out = Vec::with_capacity(row_bytes * (phys_h as usize));
-            for row in 0..(phys_h as usize).min(height) {
-                let start = row * stride;
-                out.extend_from_slice(&raw[start..start + row_bytes]);
+
+        let render_res = (|| -> Result<(), String> {
+            let mut target = self
+                .renderer
+                .bind(&mut img)
+                .map_err(|e| format!("bind pixman buffer: {e}"))?;
+
+            {
+                let mut frame = self
+                    .renderer
+                    .render(&mut target, phys_size, Transform::Normal)
+                    .map_err(|e| format!("begin pixman frame: {e}"))?;
+
+                frame
+                    .clear(Color32F::new(0.08, 0.09, 0.11, 1.0), &[damage])
+                    .map_err(|e| format!("clear frame: {e}"))?;
+
+                draw_render_elements(&mut frame, scale, &elements, &[damage])
+                    .map_err(|e| format!("draw elements: {e}"))?;
+
+                let _sync = frame
+                    .finish()
+                    .map_err(|e| format!("finish pixman frame: {e}"))?;
             }
-            out
-        };
+            drop(target);
 
-        Ok((phys_w as u32, phys_h as u32, bytes))
+            let stride = img.stride();
+            let row_bytes = (phys_w as usize) * 4;
+            let height = img.height();
+            let raw = unsafe {
+                std::slice::from_raw_parts(img.data() as *const u8, stride * height)
+            };
+            out.clear();
+            let needed = row_bytes * (phys_h as usize);
+            if out.capacity() < needed {
+                out.reserve(needed - out.capacity());
+            }
+            if stride == row_bytes {
+                out.extend_from_slice(&raw[..needed.min(raw.len())]);
+            } else {
+                for row in 0..(phys_h as usize).min(height) {
+                    let start = row * stride;
+                    out.extend_from_slice(&raw[start..start + row_bytes]);
+                }
+            }
+            Ok(())
+        })();
+
+        self.cached_image = Some((phys_w, phys_h, img));
+        render_res?;
+        Ok((phys_w as u32, phys_h as u32))
+    }
+
+    pub fn render_stage_bgra(
+        &mut self,
+        stage: &Stage,
+        x11_override_windows: &[smithay::xwayland::X11Surface],
+    ) -> Result<(u32, u32, Vec<u8>), String> {
+        let mut bytes = Vec::new();
+        let (w, h) = self.render_stage_bgra_into(stage, x11_override_windows, &mut bytes)?;
+        Ok((w, h, bytes))
     }
 
     pub fn render_stage_png(

@@ -58,7 +58,13 @@ pub trait DisplaySink {
     fn show(&mut self, stage_id: &str, title: &str, wm_class: &str, rect: SavedRect);
     fn hide(&mut self, stage_id: &str) -> Option<SavedRect>;
     fn destroy(&mut self, stage_id: &str);
+    fn take_frame_buffer(&mut self, min_capacity: usize) -> Vec<u8> {
+        Vec::with_capacity(min_capacity)
+    }
     fn present(&mut self, stage_id: &str, width: u32, height: u32, bgra: &[u8]);
+    fn present_owned(&mut self, stage_id: &str, width: u32, height: u32, bgra: Vec<u8>) {
+        self.present(stage_id, width, height, &bgra);
+    }
     fn set_title(&mut self, stage_id: &str, title: &str);
     fn begin_move(&mut self, _stage_id: &str) {}
     fn begin_resize(&mut self, _stage_id: &str, _direction: u32) {}

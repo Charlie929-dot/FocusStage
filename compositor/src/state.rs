@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
-use smithay::desktop::{PopupKind, PopupManager};
+use smithay::desktop::{get_popup_toplevel_coords, PopupKind, PopupManager};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::calloop::channel as calloop_channel;
@@ -13,7 +13,7 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_seat, wl_surface::WlSurface};
 use smithay::reexports::wayland_server::{Client, DisplayHandle, Resource};
-use smithay::utils::Serial;
+use smithay::utils::{Logical, Point, Rectangle, Serial, Size};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     CompositorClientState, CompositorHandler, CompositorState,
@@ -242,6 +242,37 @@ impl FocusStageState {
         info!("Auto-assigned external Wayland client (pid={:?}) to {}", pid, sid);
         sid
     }
+
+    pub(crate) fn constrain_popup_geometry(
+        &self,
+        surface: &PopupSurface,
+        positioner: PositionerState,
+    ) -> Rectangle<i32, Logical> {
+        let stage_size = surface
+            .wl_surface()
+            .client()
+            .and_then(|c| self.stage_id_for_client(&c.id()))
+            .and_then(|sid| self.stages.get(&sid))
+            .map(|s| s.logical_size);
+
+        let Some(stage_size) = stage_size else {
+            return positioner.get_geometry();
+        };
+
+        let offset = get_popup_toplevel_coords(&PopupKind::Xdg(surface.clone()));
+        let target = popup_constraint_target(stage_size, offset);
+        positioner.get_unconstrained_geometry(target)
+    }
+}
+
+pub(crate) fn popup_constraint_target(
+    stage_size: Size<i32, Logical>,
+    parent_toplevel_offset: Point<i32, Logical>,
+) -> Rectangle<i32, Logical> {
+    Rectangle::new(
+        (-parent_toplevel_offset.x, -parent_toplevel_offset.y).into(),
+        (stage_size.w.max(1), stage_size.h.max(1)).into(),
+    )
 }
 
 impl BufferHandler for FocusStageState {
@@ -324,7 +355,12 @@ impl XdgShellHandler for FocusStageState {
         }
     }
 
-    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        let geometry = self.constrain_popup_geometry(&surface, positioner);
+        surface.with_pending_state(|state| {
+            state.geometry = geometry;
+            state.positioner = positioner;
+        });
         let _ = self.popups.track_popup(PopupKind::Xdg(surface.clone()));
         let _ = surface.send_configure();
         self.offscreen.ensure_surface_entered(surface.wl_surface());
@@ -340,8 +376,8 @@ impl XdgShellHandler for FocusStageState {
         positioner: PositionerState,
         token: u32,
     ) {
+        let geometry = self.constrain_popup_geometry(&surface, positioner);
         surface.with_pending_state(|state| {
-            let geometry = positioner.get_geometry();
             state.geometry = geometry;
             state.positioner = positioner;
         });
@@ -513,3 +549,378 @@ delegate_output!(FocusStageState);
 delegate_viewporter!(FocusStageState);
 delegate_single_pixel_buffer!(FocusStageState);
 delegate_xwayland_shell!(FocusStageState);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+
+    use smithay::reexports::calloop::EventLoop;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner;
+    use smithay::reexports::wayland_server::Display;
+    use wayland_client::protocol::{
+        wl_buffer, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
+        wl_surface,
+    };
+    use wayland_client::{Connection, Dispatch, QueueHandle};
+    use wayland_protocols::xdg::shell::client::{
+        xdg_positioner as c_pos, xdg_popup as c_popup, xdg_surface as c_surface,
+        xdg_toplevel as c_toplevel, xdg_wm_base as c_wm,
+    };
+
+    #[test]
+    fn popup_constraint_target_flips_direct_and_nested_popups_within_stage() {
+        let stage_size = Size::from((1280, 800));
+
+        // Direct popup near bottom-right corner of the Stage
+        let direct_pos = PositionerState {
+            rect_size: Size::from((200, 240)),
+            anchor_rect: Rectangle::new((1200, 700).into(), (1, 1).into()),
+            anchor_edges: xdg_positioner::Anchor::BottomRight,
+            gravity: xdg_positioner::Gravity::BottomRight,
+            constraint_adjustment: xdg_positioner::ConstraintAdjustment::FlipX
+                | xdg_positioner::ConstraintAdjustment::FlipY,
+            ..Default::default()
+        };
+        let direct_target = popup_constraint_target(stage_size, (0, 0).into());
+        let direct_geo = direct_pos.get_unconstrained_geometry(direct_target);
+        assert_eq!(direct_geo, Rectangle::new((1000, 460).into(), (200, 240).into()));
+
+        // Nested submenu whose parent popup is at (1000, 460) in Stage coordinates
+        let nested_pos = PositionerState {
+            rect_size: Size::from((200, 200)),
+            anchor_rect: Rectangle::new((190, 220).into(), (10, 20).into()),
+            anchor_edges: xdg_positioner::Anchor::BottomRight,
+            gravity: xdg_positioner::Gravity::BottomRight,
+            constraint_adjustment: xdg_positioner::ConstraintAdjustment::FlipX
+                | xdg_positioner::ConstraintAdjustment::FlipY,
+            ..Default::default()
+        };
+        let nested_target = popup_constraint_target(stage_size, direct_geo.loc);
+        assert_eq!(
+            nested_target,
+            Rectangle::new((-1000, -460).into(), (1280, 800).into())
+        );
+        let nested_geo = nested_pos.get_unconstrained_geometry(nested_target);
+        // Anchor left edge = 190 -> flip X places right edge at 190 -> x = -10
+        // Anchor top edge = 220 -> flip Y places bottom edge at 220 -> y = 20
+        assert_eq!(nested_geo, Rectangle::new((-10, 20).into(), (200, 200).into()));
+        // Absolute Stage location of nested popup: (1000 - 10, 460 + 20) = (990, 480)
+        let abs_loc = direct_geo.loc + nested_geo.loc;
+        assert!(abs_loc.x >= 0 && abs_loc.x + nested_geo.size.w <= stage_size.w);
+        assert!(abs_loc.y >= 0 && abs_loc.y + nested_geo.size.h <= stage_size.h);
+    }
+
+    #[derive(Default)]
+    struct TestClient {
+        compositor: Option<wl_compositor::WlCompositor>,
+        wm_base: Option<c_wm::XdgWmBase>,
+        shm: Option<wl_shm::WlShm>,
+        seat: Option<wl_seat::WlSeat>,
+        pointer_enters: Vec<(u32, f64, f64)>,
+        toplevel_configured: bool,
+        popup1_configs: Vec<(i32, i32, i32, i32)>,
+        popup1_repositioned: Vec<u32>,
+        popup1_last_serial: Option<u32>,
+        popup2_configs: Vec<(i32, i32, i32, i32)>,
+        popup2_last_serial: Option<u32>,
+        toplevel_xdg_id: Option<u32>,
+        popup1_xdg_id: Option<u32>,
+        popup2_xdg_id: Option<u32>,
+        popup1_id: Option<u32>,
+        popup2_id: Option<u32>,
+    }
+
+    impl Dispatch<wl_registry::WlRegistry, ()> for TestClient {
+        fn event(
+            state: &mut Self,
+            reg: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global { name, interface, version } = event {
+                match interface.as_str() {
+                    "wl_compositor" => {
+                        state.compositor = Some(reg.bind(name, version.min(6), qh, ()));
+                    }
+                    "xdg_wm_base" => {
+                        state.wm_base = Some(reg.bind(name, version.min(6), qh, ()));
+                    }
+                    "wl_shm" => {
+                        state.shm = Some(reg.bind(name, version.min(1), qh, ()));
+                    }
+                    "wl_seat" => {
+                        let seat: wl_seat::WlSeat = reg.bind(name, version.min(7), qh, ());
+                        let _ = seat.get_pointer(qh, ());
+                        state.seat = Some(seat);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    impl Dispatch<wl_compositor::WlCompositor, ()> for TestClient {
+        fn event(_: &mut Self, _: &wl_compositor::WlCompositor, _: wl_compositor::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<wl_surface::WlSurface, ()> for TestClient {
+        fn event(_: &mut Self, _: &wl_surface::WlSurface, _: wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<wl_shm::WlShm, ()> for TestClient {
+        fn event(_: &mut Self, _: &wl_shm::WlShm, _: wl_shm::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<wl_shm_pool::WlShmPool, ()> for TestClient {
+        fn event(_: &mut Self, _: &wl_shm_pool::WlShmPool, _: wl_shm_pool::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<wl_buffer::WlBuffer, ()> for TestClient {
+        fn event(_: &mut Self, _: &wl_buffer::WlBuffer, _: wl_buffer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<wl_seat::WlSeat, ()> for TestClient {
+        fn event(_: &mut Self, _: &wl_seat::WlSeat, _: wl_seat::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<wl_pointer::WlPointer, ()> for TestClient {
+        fn event(state: &mut Self, _: &wl_pointer::WlPointer, event: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+            if let wl_pointer::Event::Enter { surface, surface_x, surface_y, .. } = event {
+                use wayland_client::Proxy;
+                state.pointer_enters.push((surface.id().protocol_id(), surface_x, surface_y));
+            }
+        }
+    }
+    impl Dispatch<c_wm::XdgWmBase, ()> for TestClient {
+        fn event(_: &mut Self, wm: &c_wm::XdgWmBase, event: c_wm::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+            if let c_wm::Event::Ping { serial } = event {
+                wm.pong(serial);
+            }
+        }
+    }
+    impl Dispatch<c_pos::XdgPositioner, ()> for TestClient {
+        fn event(_: &mut Self, _: &c_pos::XdgPositioner, _: c_pos::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<c_toplevel::XdgToplevel, ()> for TestClient {
+        fn event(_: &mut Self, _: &c_toplevel::XdgToplevel, _: c_toplevel::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<c_surface::XdgSurface, ()> for TestClient {
+        fn event(state: &mut Self, surf: &c_surface::XdgSurface, event: c_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+            if let c_surface::Event::Configure { serial } = event {
+                use wayland_client::Proxy;
+                let id = surf.id().protocol_id();
+                if Some(id) == state.toplevel_xdg_id {
+                    surf.ack_configure(serial);
+                    state.toplevel_configured = true;
+                } else if Some(id) == state.popup1_xdg_id {
+                    state.popup1_last_serial = Some(serial);
+                } else if Some(id) == state.popup2_xdg_id {
+                    state.popup2_last_serial = Some(serial);
+                }
+            }
+        }
+    }
+    impl Dispatch<c_popup::XdgPopup, ()> for TestClient {
+        fn event(state: &mut Self, popup: &c_popup::XdgPopup, event: c_popup::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+            use wayland_client::Proxy;
+            let id = popup.id().protocol_id();
+            match event {
+                c_popup::Event::Configure { x, y, width, height } => {
+                    if Some(id) == state.popup1_id {
+                        state.popup1_configs.push((x, y, width, height));
+                    } else if Some(id) == state.popup2_id {
+                        state.popup2_configs.push((x, y, width, height));
+                    }
+                }
+                c_popup::Event::Repositioned { token } => {
+                    if Some(id) == state.popup1_id {
+                        state.popup1_repositioned.push(token);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn pump(
+        display: &mut Display<FocusStageState>,
+        state: &mut FocusStageState,
+        conn: &Connection,
+        queue: &mut wayland_client::EventQueue<TestClient>,
+        client: &mut TestClient,
+    ) {
+        for _ in 0..4 {
+            let _ = conn.flush();
+            let _ = display.dispatch_clients(state);
+            let _ = display.flush_clients();
+            if let Some(guard) = conn.prepare_read() {
+                let _ = guard.read();
+            }
+            let _ = queue.dispatch_pending(client);
+        }
+    }
+
+    fn create_shm_buffer(
+        shm: &wl_shm::WlShm,
+        qh: &QueueHandle<TestClient>,
+        w: i32,
+        h: i32,
+    ) -> (wl_shm_pool::WlShmPool, wl_buffer::WlBuffer) {
+        let size = (w * h * 4) as usize;
+        let name = CString::new("fs-test-shm").unwrap();
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        unsafe { libc::ftruncate(fd, size as libc::off_t) };
+        let pool = shm.create_pool(std::os::fd::AsFd::as_fd(&owned), size as i32, qh, ());
+        let buf = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, qh, ());
+        (pool, buf)
+    }
+
+    #[test]
+    fn wayland_popup_new_reposition_and_nested_submenu_constrain_to_stage() {
+        use wayland_client::Proxy;
+
+        let mut event_loop: EventLoop<'static, FocusStageState> =
+            EventLoop::try_new().expect("create calloop");
+        let mut display: Display<FocusStageState> = Display::new().expect("create display");
+        let mut dh = display.handle();
+        let mut state = FocusStageState::new(
+            &dh,
+            event_loop.handle(),
+            "focusstage-test-sock".to_string(),
+            std::env::temp_dir(),
+            1.0,
+            60,
+            false,
+        );
+
+        let (server_sock, client_sock) = UnixStream::pair().expect("unix socket pair");
+        let _server_client = dh
+            .insert_client(server_sock, Arc::new(ClientState::default()))
+            .expect("insert server client");
+
+        let conn = Connection::from_socket(client_sock).expect("connect client");
+        let mut queue = conn.new_event_queue();
+        let qh = queue.handle();
+        let mut client = TestClient::default();
+
+        let _reg = conn.display().get_registry(&qh, ());
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        let compositor = client.compositor.as_ref().unwrap().clone();
+        let wm_base = client.wm_base.as_ref().unwrap().clone();
+        let shm = client.shm.as_ref().unwrap().clone();
+
+        // Create toplevel so FocusStage auto-assigns a Stage (1280x800), then resize it to 800x600.
+        let tl_wl = compositor.create_surface(&qh, ());
+        let tl_xdg = wm_base.get_xdg_surface(&tl_wl, &qh, ());
+        client.toplevel_xdg_id = Some(tl_xdg.id().protocol_id());
+        let _tl = tl_xdg.get_toplevel(&qh, ());
+        tl_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert!(client.toplevel_configured);
+
+        let stage_id = state.stages.keys().next().unwrap().clone();
+        state.stages.get_mut(&stage_id).unwrap().logical_size = (800, 600).into();
+
+        let (_pool_tl, buf_tl) = create_shm_buffer(&shm, &qh, 800, 600);
+        tl_xdg.set_window_geometry(0, 0, 800, 600);
+        tl_wl.attach(Some(&buf_tl), 0, 0);
+        tl_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        // 1. Direct popup near bottom-right corner (720, 520), size 200x200, FlipX|FlipY -> (520, 320, 200, 200)
+        let pos1 = wm_base.create_positioner(&qh, ());
+        pos1.set_size(200, 200);
+        pos1.set_anchor_rect(720, 520, 1, 1);
+        pos1.set_anchor(c_pos::Anchor::BottomRight);
+        pos1.set_gravity(c_pos::Gravity::BottomRight);
+        pos1.set_constraint_adjustment(c_pos::ConstraintAdjustment::FlipX | c_pos::ConstraintAdjustment::FlipY);
+
+        let p1_wl = compositor.create_surface(&qh, ());
+        let p1_xdg = wm_base.get_xdg_surface(&p1_wl, &qh, ());
+        client.popup1_xdg_id = Some(p1_xdg.id().protocol_id());
+        let p1 = p1_xdg.get_popup(Some(&tl_xdg), &pos1, &qh, ());
+        client.popup1_id = Some(p1.id().protocol_id());
+        p1_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        assert_eq!(client.popup1_configs.last(), Some(&(520, 320, 200, 200)));
+        let serial1 = client.popup1_last_serial.expect("popup1 configure serial");
+        let (_pool1, buf1) = create_shm_buffer(&shm, &qh, 200, 200);
+        p1_xdg.ack_configure(serial1);
+        p1_xdg.set_window_geometry(0, 0, 200, 200);
+        p1_wl.attach(Some(&buf1), 0, 0);
+        p1_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        // 2. Reposition popup1 near (750, 550), size 180x180, FlipX|FlipY -> (570, 370, 180, 180)
+        let pos_re = wm_base.create_positioner(&qh, ());
+        pos_re.set_size(180, 180);
+        pos_re.set_anchor_rect(750, 550, 1, 1);
+        pos_re.set_anchor(c_pos::Anchor::BottomRight);
+        pos_re.set_gravity(c_pos::Gravity::BottomRight);
+        pos_re.set_constraint_adjustment(c_pos::ConstraintAdjustment::FlipX | c_pos::ConstraintAdjustment::FlipY);
+        p1.reposition(&pos_re, 42);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        assert_eq!(client.popup1_repositioned, vec![42]);
+        assert_eq!(client.popup1_configs.last(), Some(&(570, 370, 180, 180)));
+        let serial1_re = client.popup1_last_serial.expect("popup1 reposition serial");
+        let (_pool1b, buf1b) = create_shm_buffer(&shm, &qh, 180, 180);
+        p1_xdg.ack_configure(serial1_re);
+        p1_xdg.set_window_geometry(0, 0, 180, 180);
+        p1_wl.attach(Some(&buf1b), 0, 0);
+        p1_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        // 3. Nested submenu popup2 parented to popup1 (now at 570, 370).
+        // Anchor (170, 160, 10, 20) inside popup1 -> unconstrained right/down (180, 180) => Stage (750, 550),
+        // which overflows 800x600. FlipX|FlipY places it at (170 - 150, 160 - 150) = (20, 10) relative to popup1,
+        // i.e. Stage (590, 380)..(740, 530).
+        let pos2 = wm_base.create_positioner(&qh, ());
+        pos2.set_size(150, 150);
+        pos2.set_anchor_rect(170, 160, 10, 20);
+        pos2.set_anchor(c_pos::Anchor::BottomRight);
+        pos2.set_gravity(c_pos::Gravity::BottomRight);
+        pos2.set_constraint_adjustment(c_pos::ConstraintAdjustment::FlipX | c_pos::ConstraintAdjustment::FlipY);
+
+        let p2_wl = compositor.create_surface(&qh, ());
+        let p2_xdg = wm_base.get_xdg_surface(&p2_wl, &qh, ());
+        client.popup2_xdg_id = Some(p2_xdg.id().protocol_id());
+        let _p2 = p2_xdg.get_popup(Some(&p1_xdg), &pos2, &qh, ());
+        client.popup2_id = Some(_p2.id().protocol_id());
+        p2_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        assert_eq!(client.popup2_configs.last(), Some(&(20, 10, 150, 150)));
+
+        // Commit popup2 and verify pointer hit-testing routes to popup2 at flipped Stage coordinates (595, 385)
+        let serial2 = client.popup2_last_serial.expect("popup2 configure serial");
+        let (_pool2, buf2) = create_shm_buffer(&shm, &qh, 150, 150);
+        p2_xdg.ack_configure(serial2);
+        p2_xdg.set_window_geometry(0, 0, 150, 150);
+        p2_wl.attach(Some(&buf2), 0, 0);
+        p2_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        state.send_stage_pointer_motion(&stage_id, 595.0, 385.0);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let ptr_target = state
+            .stages
+            .get(&stage_id)
+            .and_then(|s| s.input.current_pointer_target.as_ref())
+            .and_then(|t| t.wl_surface());
+        assert_eq!(
+            ptr_target.map(|s| Resource::id(&s).protocol_id()),
+            Some(p2_wl.id().protocol_id())
+        );
+        assert_eq!(
+            client.pointer_enters.last().copied(),
+            Some((p2_wl.id().protocol_id(), 5.0, 5.0))
+        );
+
+        let _ = event_loop.dispatch(Some(std::time::Duration::ZERO), &mut state);
+    }
+}

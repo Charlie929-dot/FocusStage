@@ -748,6 +748,22 @@ impl FocusStageState {
         };
         let seat = self.seat.clone();
         let resolved_source = source.unwrap_or(AxisSource::Wheel);
+        debug!(
+            "[scroll-router] stage={} pos=({:.1},{:.1}) d=({:.3},{:.3}) source={:?} v120={:?} stop={:?} time={} target={}",
+            stage_id,
+            x,
+            y,
+            dx,
+            dy,
+            resolved_source,
+            v120,
+            stop,
+            time,
+            match &toplevel {
+                StageToplevel::Wayland(_) => "wayland",
+                StageToplevel::X11(_) => "x11",
+            }
+        );
         let mut frame = AxisFrame::new(time).source(resolved_source);
 
         if dx.abs() > f64::EPSILON {

@@ -176,6 +176,7 @@ internal sealed class FocusStageTrayContext : ApplicationContext
     private string _lastWslClipboard = "";
     private List<StageDto> _stages = new();
     private bool _busy;
+    private bool _disposed;
 
     public bool DaemonAlive => _daemonAlive;
     public List<StageDto> CurrentStages => _stages;
@@ -726,18 +727,22 @@ internal sealed class FocusStageTrayContext : ApplicationContext
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (!_disposed)
         {
-            _signalCts.Cancel();
-            _signalCts.Dispose();
-            _syncTimer.Stop();
-            _syncTimer.Dispose();
-            _launcherForm?.Dispose();
-            _notifyIcon.Visible = false;
-            _notifyIcon.Dispose();
-            _hotkeyWindow.Dispose();
-            _trayIcon.Dispose();
-            _menu.Dispose();
+            _disposed = true;
+            if (disposing)
+            {
+                _signalCts.Cancel();
+                _signalCts.Dispose();
+                _syncTimer.Stop();
+                _syncTimer.Dispose();
+                _launcherForm?.Dispose();
+                _notifyIcon.Visible = false;
+                _notifyIcon.Dispose();
+                _hotkeyWindow.Dispose();
+                _trayIcon.Dispose();
+                _menu.Dispose();
+            }
         }
         base.Dispose(disposing);
     }
