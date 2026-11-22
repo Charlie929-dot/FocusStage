@@ -1,6 +1,8 @@
 pub mod wslg;
 pub mod wslg_wayland;
 
+use smithay::backend::input::AxisSource;
+
 use crate::protocol::SavedRect;
 
 #[derive(Debug, Clone)]
@@ -23,6 +25,9 @@ pub enum SinkInputEvent {
         stage_id: String,
         dx: f64,
         dy: f64,
+        source: Option<AxisSource>,
+        v120: Option<(i32, i32)>,
+        stop: (bool, bool),
         time: u32,
     },
     Key {

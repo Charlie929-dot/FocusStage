@@ -641,18 +641,78 @@ impl FocusStageState {
     }
 
     pub fn send_stage_scroll(&mut self, stage_id: &str, x: f64, y: f64, dx: f64, dy: f64) {
+        self.send_stage_scroll_frame(
+            stage_id,
+            x,
+            y,
+            dx,
+            dy,
+            Some(AxisSource::Wheel),
+            None,
+            (false, false),
+        );
+    }
+
+    pub fn send_stage_scroll_frame(
+        &mut self,
+        stage_id: &str,
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+        source: Option<AxisSource>,
+        v120: Option<(i32, i32)>,
+        stop: (bool, bool),
+    ) {
         self.send_stage_pointer_motion(stage_id, x, y);
         let Some(toplevel) = self.stages.get(stage_id).and_then(|s| s.active_toplevel().cloned()) else {
             return;
         };
         let seat = self.seat.clone();
         let time = self.now_ms();
-        let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
+        let resolved_source = source.unwrap_or(AxisSource::Wheel);
+        let mut frame = AxisFrame::new(time).source(resolved_source);
+
         if dx.abs() > f64::EPSILON {
             frame = frame.value(Axis::Horizontal, dx);
         }
         if dy.abs() > f64::EPSILON {
             frame = frame.value(Axis::Vertical, dy);
+        }
+
+        if let Some((vx, vy)) = v120 {
+            if vx != 0 {
+                frame = frame.v120(Axis::Horizontal, vx);
+            }
+            if vy != 0 {
+                frame = frame.v120(Axis::Vertical, vy);
+            }
+        } else if matches!(resolved_source, AxisSource::Wheel | AxisSource::WheelTilt) {
+            if dx.abs() > f64::EPSILON {
+                let steps = ((dx / 15.0) * 120.0).round() as i32;
+                let h120 = if steps == 0 {
+                    if dx > 0.0 { 1 } else { -1 }
+                } else {
+                    steps
+                };
+                frame = frame.v120(Axis::Horizontal, h120);
+            }
+            if dy.abs() > f64::EPSILON {
+                let steps = ((dy / 15.0) * 120.0).round() as i32;
+                let v120_val = if steps == 0 {
+                    if dy > 0.0 { 1 } else { -1 }
+                } else {
+                    steps
+                };
+                frame = frame.v120(Axis::Vertical, v120_val);
+            }
+        }
+
+        if stop.0 {
+            frame = frame.stop(Axis::Horizontal);
+        }
+        if stop.1 {
+            frame = frame.stop(Axis::Vertical);
         }
 
         match toplevel {
@@ -662,8 +722,25 @@ impl FocusStageState {
                 PointerTarget::frame(&target, &seat, self);
             }
             StageToplevel::X11(x11) => {
-                PointerTarget::axis(&x11, &seat, self, frame);
-                PointerTarget::frame(&x11, &seat, self);
+                let geo = x11.geometry();
+                let mut hit_x11 = x11;
+                if let Some(xwm_id) = self.stages.get(stage_id).and_then(|s| s.xwm_id) {
+                    for ovr in self.x11_override_windows_for(xwm_id).into_iter().rev() {
+                        let ogeo = ovr.geometry();
+                        let rx = (ogeo.loc.x - geo.loc.x) as f64;
+                        let ry = (ogeo.loc.y - geo.loc.y) as f64;
+                        if x >= rx
+                            && x < rx + ogeo.size.w.max(1) as f64
+                            && y >= ry
+                            && y < ry + ogeo.size.h.max(1) as f64
+                        {
+                            hit_x11 = ovr;
+                            break;
+                        }
+                    }
+                }
+                PointerTarget::axis(&hit_x11, &seat, self, frame);
+                PointerTarget::frame(&hit_x11, &seat, self);
             }
         }
     }

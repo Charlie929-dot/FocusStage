@@ -315,11 +315,23 @@ fn main() -> anyhow::Result<()> {
                     stage_id,
                     dx,
                     dy,
+                    source,
+                    v120,
+                    stop,
                     time: _,
                 } => {
                     if state.is_input_allowed(&stage_id, InputSource::Human, None) {
                         if let Some(pos) = state.stages.get(&stage_id).map(|s| s.input.pointer_pos) {
-                            state.send_stage_scroll(&stage_id, pos.x, pos.y, dx, dy);
+                            state.send_stage_scroll_frame(
+                                &stage_id,
+                                pos.x,
+                                pos.y,
+                                dx,
+                                dy,
+                                source,
+                                v120,
+                                stop,
+                            );
                         }
                     }
                 }

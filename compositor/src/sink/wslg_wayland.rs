@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::mpsc;
 
+use smithay::backend::input::AxisSource;
 use tracing::{info, warn};
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
@@ -130,6 +131,7 @@ struct WaylandClientState {
 
     pointer_stage: Option<String>,
     pointer_pos: (f64, f64),
+    pending_scroll: PendingScrollFrame,
     keyboard_stage: Option<String>,
     last_pointer_serial: u32,
     last_input_serial: u32,
@@ -144,6 +146,47 @@ struct WaylandClientState {
     just_configured: Vec<String>,
 
     events: Vec<SinkInputEvent>,
+}
+
+#[derive(Default)]
+struct PendingScrollFrame {
+    has_event: bool,
+    dx: f64,
+    dy: f64,
+    source: Option<AxisSource>,
+    v120: Option<(i32, i32)>,
+    stop: (bool, bool),
+    time: u32,
+}
+
+impl PendingScrollFrame {
+    fn flush(&mut self, stage_id: &str, out: &mut Vec<SinkInputEvent>) {
+        if !self.has_event {
+            return;
+        }
+        let mut dx = self.dx;
+        let mut dy = self.dy;
+        if let Some((vx, vy)) = self.v120 {
+            if dx == 0.0 && vx != 0 {
+                dx = (vx as f64 / 120.0) * 15.0;
+            }
+            if dy == 0.0 && vy != 0 {
+                dy = (vy as f64 / 120.0) * 15.0;
+            }
+        }
+        if dx != 0.0 || dy != 0.0 || self.v120.is_some() || self.stop.0 || self.stop.1 {
+            out.push(SinkInputEvent::PointerScroll {
+                stage_id: stage_id.to_string(),
+                dx,
+                dy,
+                source: self.source,
+                v120: self.v120,
+                stop: self.stop,
+                time: self.time,
+            });
+        }
+        *self = Self::default();
+    }
 }
 
 impl WaylandClientState {
@@ -164,6 +207,7 @@ impl WaylandClientState {
             toplevel_to_stage: HashMap::new(),
             pointer_stage: None,
             pointer_pos: (0.0, 0.0),
+            pending_scroll: PendingScrollFrame::default(),
             keyboard_stage: None,
             last_pointer_serial: 0,
             last_input_serial: 0,
@@ -665,7 +709,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandClientState {
                     state.wm_base = Some(reg.bind::<xdg_wm_base::XdgWmBase, _, _>(name, version.min(5), qh, ()));
                 }
                 "wl_seat" => {
-                    let seat = reg.bind::<wl_seat::WlSeat, _, _>(name, version.min(7), qh, ());
+                    let seat = reg.bind::<wl_seat::WlSeat, _, _>(name, version.min(8), qh, ());
                     if let Some(ref mgr) = state.data_device_mgr {
                         state.data_device = Some(mgr.get_data_device(&seat, qh, ()));
                     }
@@ -835,7 +879,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientState {
 impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientState {
     fn event(
         state: &mut Self,
-        _: &wl_pointer::WlPointer,
+        pointer: &wl_pointer::WlPointer,
         event: wl_pointer::Event,
         _: &(),
         _: &Connection,
@@ -850,6 +894,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientState {
             } => {
                 state.last_pointer_serial = serial;
                 state.last_input_serial = serial;
+                state.pending_scroll = PendingScrollFrame::default();
                 if let Some(sid) = state.surface_to_stage.get(&surface.id().protocol_id()).cloned() {
                     state.pointer_stage = Some(sid.clone());
                     state.pointer_pos = (surface_x, surface_y);
@@ -865,6 +910,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientState {
                 if let Some(sid) = state.surface_to_stage.get(&surface.id().protocol_id()) {
                     if state.pointer_stage.as_ref() == Some(sid) {
                         state.pointer_stage = None;
+                        state.pending_scroll = PendingScrollFrame::default();
                     }
                 }
             }
@@ -902,25 +948,78 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientState {
                     });
                 }
             }
+            wl_pointer::Event::AxisSource {
+                axis_source: WEnum::Value(src),
+            } => {
+                state.pending_scroll.source = Some(match src {
+                    wl_pointer::AxisSource::Wheel => AxisSource::Wheel,
+                    wl_pointer::AxisSource::Finger => AxisSource::Finger,
+                    wl_pointer::AxisSource::Continuous => AxisSource::Continuous,
+                    wl_pointer::AxisSource::WheelTilt => AxisSource::WheelTilt,
+                    _ => AxisSource::Wheel,
+                });
+            }
+            wl_pointer::Event::AxisDiscrete {
+                axis: WEnum::Value(axis),
+                discrete,
+            } => {
+                state.pending_scroll.has_event = true;
+                let v120 = state.pending_scroll.v120.get_or_insert((0, 0));
+                match axis {
+                    wl_pointer::Axis::HorizontalScroll => v120.0 += discrete * 120,
+                    wl_pointer::Axis::VerticalScroll => v120.1 += discrete * 120,
+                    _ => {}
+                }
+            }
+            wl_pointer::Event::AxisValue120 {
+                axis: WEnum::Value(axis),
+                value120,
+            } => {
+                state.pending_scroll.has_event = true;
+                let v120 = state.pending_scroll.v120.get_or_insert((0, 0));
+                match axis {
+                    wl_pointer::Axis::HorizontalScroll => v120.0 += value120,
+                    wl_pointer::Axis::VerticalScroll => v120.1 += value120,
+                    _ => {}
+                }
+            }
             wl_pointer::Event::Axis {
                 time,
                 axis: WEnum::Value(axis),
                 value,
             } => {
-                if let Some(sid) = state.pointer_stage.clone() {
-                    let (dx, dy) = match axis {
-                        wl_pointer::Axis::VerticalScroll => (0.0, value),
-                        wl_pointer::Axis::HorizontalScroll => (value, 0.0),
-                        _ => (0.0, 0.0),
-                    };
-                    if dx != 0.0 || dy != 0.0 {
-                        state.events.push(SinkInputEvent::PointerScroll {
-                            stage_id: sid,
-                            dx,
-                            dy,
-                            time,
-                        });
+                state.pending_scroll.has_event = true;
+                state.pending_scroll.time = time;
+                match axis {
+                    wl_pointer::Axis::VerticalScroll => state.pending_scroll.dy += value,
+                    wl_pointer::Axis::HorizontalScroll => state.pending_scroll.dx += value,
+                    _ => {}
+                }
+                if pointer.version() < 5 {
+                    if let Some(sid) = state.pointer_stage.as_deref() {
+                        state.pending_scroll.flush(sid, &mut state.events);
+                    } else {
+                        state.pending_scroll = PendingScrollFrame::default();
                     }
+                }
+            }
+            wl_pointer::Event::AxisStop {
+                time,
+                axis: WEnum::Value(axis),
+            } => {
+                state.pending_scroll.has_event = true;
+                state.pending_scroll.time = time;
+                match axis {
+                    wl_pointer::Axis::HorizontalScroll => state.pending_scroll.stop.0 = true,
+                    wl_pointer::Axis::VerticalScroll => state.pending_scroll.stop.1 = true,
+                    _ => {}
+                }
+            }
+            wl_pointer::Event::Frame => {
+                if let Some(sid) = state.pointer_stage.as_deref() {
+                    state.pending_scroll.flush(sid, &mut state.events);
+                } else {
+                    state.pending_scroll = PendingScrollFrame::default();
                 }
             }
             _ => {}
@@ -1122,3 +1221,70 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flushes_discrete_wheel_scroll_frame_and_resets() {
+        let mut frame = PendingScrollFrame {
+            has_event: true,
+            dx: 0.0,
+            dy: 10.0,
+            source: Some(AxisSource::Wheel),
+            v120: Some((0, 120)),
+            stop: (false, false),
+            time: 42,
+        };
+        let mut out = Vec::new();
+        frame.flush("stage-1", &mut out);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            SinkInputEvent::PointerScroll {
+                stage_id,
+                dx,
+                dy,
+                source,
+                v120,
+                stop,
+                time,
+            } => {
+                assert_eq!(stage_id, "stage-1");
+                assert_eq!((*dx, *dy), (0.0, 10.0));
+                assert_eq!(*source, Some(AxisSource::Wheel));
+                assert_eq!(*v120, Some((0, 120)));
+                assert_eq!(*stop, (false, false));
+                assert_eq!(*time, 42);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+        // Subsequent empty frame must emit nothing
+        frame.flush("stage-1", &mut out);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn derives_axis_value_when_only_v120_present() {
+        let mut frame = PendingScrollFrame {
+            has_event: true,
+            dx: 0.0,
+            dy: 0.0,
+            source: Some(AxisSource::Wheel),
+            v120: Some((0, -120)),
+            stop: (false, false),
+            time: 77,
+        };
+        let mut out = Vec::new();
+        frame.flush("stage-2", &mut out);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            SinkInputEvent::PointerScroll { dy, v120, .. } => {
+                assert_eq!(*dy, -15.0);
+                assert_eq!(*v120, Some((0, -120)));
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+}
+
