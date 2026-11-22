@@ -9,33 +9,57 @@ internal sealed class LauncherForm : Form
     private readonly FocusStageTrayContext _ctx;
     private readonly string _distro;
 
-    private readonly Label _statusLabel;
-    private readonly Button _btnAppCenter;
-    private readonly Button _btnStartStopDaemon;
-    private readonly Button _btnTakeoverAll;
-    private readonly Button _btnSyncStartMenu;
-    private readonly Button _btnStagesToggle;
-    private readonly CheckBox _chkStartup;
-    private readonly TextBox _searchBox;
-    private readonly Label _footerLabel;
+    // Top bar
+    private readonly Panel _topBar;
+    private readonly Label _titleLbl;
+    private readonly Panel _statusDot;
+    private readonly PillSearchBox _searchBox;
+    private readonly WindowControlButton _btnMinimize;
+    private readonly WindowControlButton _btnClose;
+    private readonly ToolTip _toolTip = new();
 
-    private readonly Panel _workspaceHost;
-    private readonly Panel _stagesDrawer;
-    private readonly FlowLayoutPanel _stagesPanel;
+    // Main homescreen canvas
     private readonly BufferedFlowPanel _homeGrid;
 
+    // Floating dock & transient toast
+    private readonly RoundedPanel _dockCard;
+    private readonly DockItemButton _dockAppCenter;
+    private readonly DockItemButton _dockNewFolder;
+    private readonly DockItemButton _dockRunCmd;
+    private readonly DockItemButton _dockSettings;
+    private readonly ToastPill _toastPill;
+    private readonly System.Windows.Forms.Timer _toastTimer;
+
+    // Folder overlay modal
     private readonly DimOverlayPanel _folderOverlay;
     private readonly RoundedPanel _folderCard;
     private readonly Label _folderTitleLabel;
     private readonly BufferedFlowPanel _folderGrid;
 
+    // Settings overlay modal (contains daemon controls, startup toggle, sync, and zero-flicker stages list)
+    private readonly DimOverlayPanel _settingsOverlay;
+    private readonly RoundedPanel _settingsCard;
+    private readonly Panel _settingsScrollBody;
+    private readonly ToggleSwitch _toggleStartup;
+    private readonly PillButton _btnSyncStartMenu;
+    private readonly Panel _settingsDaemonDot;
+    private readonly Label _settingsDaemonLabel;
+    private readonly PillButton _btnStartStopDaemon;
+    private readonly PillButton _btnTakeoverAll;
+    private readonly Label _stagesHeaderLabel;
+    private readonly BufferedFlowPanel _stagesPanel;
+
+    private Bitmap? _wallpaper;
     private List<LinuxAppDto> _apps = new();
     private Dictionary<string, LinuxAppDto> _appById = new(StringComparer.Ordinal);
     private LauncherLayout _layout = new();
     private List<StageDto> _stages = new();
     private bool _daemonAlive;
+    private bool _daemonStateInitialized;
+    private int _lastStageCount = -1;
+    private string _lastStagesSignature = "";
     private bool _loadingApps;
-    private bool _stagesVisible;
+    private bool _settingsVisible;
     private string? _openFolderId;
     private string? _selectedItemKey;
     private string _lastAppsSignature = "";
@@ -50,195 +74,103 @@ internal sealed class LauncherForm : Form
         _ctx = ctx;
         _distro = distro;
 
-        Text = $"FocusStage — Linux 应用桌面 ({distro})";
-        Width = 1080;
-        Height = 700;
-        MinimumSize = new Size(820, 540);
+        Text = $"FocusStage ({distro})";
+        FormBorderStyle = FormBorderStyle.None;
+        Width = 960;
+        Height = 660;
+        MinimumSize = new Size(680, 500);
         StartPosition = FormStartPosition.CenterScreen;
-        BackColor = Color.FromArgb(241, 245, 249);
-        Font = new Font("Microsoft YaHei UI", 9.2f, FontStyle.Regular);
+        BackColor = Color.FromArgb(234, 242, 252);
+        Font = new Font("Microsoft YaHei UI", 9.0f, FontStyle.Regular);
         AutoScaleMode = AutoScaleMode.Dpi;
         DoubleBuffered = true;
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.ResizeRedraw, true);
 
         using (var bmp = ShortcutManager.RenderBrandBitmap(64))
         {
             Icon = Icon.FromHandle(bmp.GetHicon());
         }
 
-        // 1. Header bar
-        var header = new Panel
+        // 1. Minimal Top Bar (drag handle + subtle brand/status + centered search pill + window controls)
+        _topBar = new Panel
         {
             Dock = DockStyle.Top,
-            Height = 64,
-            BackColor = Color.FromArgb(22, 29, 43),
-            Padding = new Padding(16, 10, 16, 10)
+            Height = 58,
+            BackColor = Color.Transparent
+        };
+        _topBar.MouseDown += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Left) Win11WindowHelper.BeginDragWindow(this);
         };
 
-        var titleLbl = new Label
+        var brandIcon = new PictureBox
         {
-            Text = "FocusStage 应用桌面",
-            ForeColor = Color.White,
-            Font = new Font("Microsoft YaHei UI", 13f, FontStyle.Bold),
+            Image = ShortcutManager.RenderBrandBitmap(24),
+            Size = new Size(22, 22),
+            SizeMode = PictureBoxSizeMode.Zoom,
+            Location = new Point(20, 18),
+            BackColor = Color.Transparent
+        };
+        brandIcon.MouseDown += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Left) Win11WindowHelper.BeginDragWindow(this);
+        };
+
+        _titleLbl = new Label
+        {
+            Text = "FocusStage",
+            ForeColor = Color.FromArgb(30, 41, 59),
+            Font = new Font("Segoe UI", 10.8f, FontStyle.Bold),
             AutoSize = true,
-            Location = new Point(16, 10)
+            Location = new Point(48, 19),
+            BackColor = Color.Transparent
+        };
+        _titleLbl.MouseDown += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Left) Win11WindowHelper.BeginDragWindow(this);
         };
 
-        _statusLabel = new Label
+        _statusDot = new Panel
         {
-            Text = "正在检测 focusstaged 状态...",
-            ForeColor = Color.FromArgb(160, 196, 235),
-            Font = new Font("Microsoft YaHei UI", 8.6f),
-            AutoSize = true,
-            Location = new Point(18, 37)
+            Size = new Size(9, 9),
+            Location = new Point(150, 26),
+            BackColor = Color.Transparent
         };
-
-        var headerRight = new FlowLayoutPanel
+        _statusDot.Paint += (_, e) =>
         {
-            Dock = DockStyle.Right,
-            FlowDirection = FlowDirection.RightToLeft,
-            WrapContents = false,
-            AutoSize = true,
-            BackColor = Color.Transparent,
-            Padding = new Padding(0, 6, 0, 0)
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            var color = _daemonAlive ? Color.FromArgb(16, 185, 129) : Color.FromArgb(148, 163, 184);
+            using var brush = new SolidBrush(color);
+            e.Graphics.FillEllipse(brush, 0, 0, 8, 8);
         };
+        _toolTip.SetToolTip(_statusDot, "focusstaged 状态检测中...");
 
-        _btnTakeoverAll = MakeHeaderButton("接管全部 (Ctrl+Alt+Space)", Color.FromArgb(37, 99, 235));
-        _btnTakeoverAll.Click += async (_, _) => await _ctx.TakeoverAllAsync();
+        _searchBox = new PillSearchBox("搜索应用...");
+        _searchBox.SearchTextChanged += (_, _) => RenderHomeGrid();
 
-        _btnStartStopDaemon = MakeHeaderButton("启动守护", Color.FromArgb(44, 62, 86));
-        _btnStartStopDaemon.Click += async (_, _) =>
+        _btnMinimize = new WindowControlButton(WindowControlKind.Minimize);
+        _btnMinimize.Click += (_, _) => WindowState = FormWindowState.Minimized;
+        _toolTip.SetToolTip(_btnMinimize, "最小化");
+
+        _btnClose = new WindowControlButton(WindowControlKind.Close);
+        _btnClose.Click += (_, _) =>
         {
-            _btnStartStopDaemon.Enabled = false;
-            try
-            {
-                if (_daemonAlive) await _ctx.RunControlAndRefreshAsync("shutdown");
-                else await _ctx.StartDaemonAsync();
-            }
-            finally
-            {
-                _btnStartStopDaemon.Enabled = true;
-            }
+            CloseAllOverlays();
+            Hide();
         };
+        _toolTip.SetToolTip(_btnClose, "隐藏到托盘");
 
-        _btnSyncStartMenu = MakeHeaderButton("同步开始菜单", Color.FromArgb(22, 134, 96));
-        _btnSyncStartMenu.Click += async (_, _) => await HandleSyncStartMenuAsync();
+        _topBar.Controls.AddRange(new Control[] { brandIcon, _titleLbl, _statusDot, _searchBox, _btnMinimize, _btnClose });
 
-        _btnAppCenter = MakeHeaderButton("应用中心", Color.FromArgb(217, 119, 6));
-        _btnAppCenter.Click += async (_, _) => await OpenOrInstallAppCenterAsync();
-
-        headerRight.Controls.Add(_btnTakeoverAll);
-        headerRight.Controls.Add(_btnStartStopDaemon);
-        headerRight.Controls.Add(_btnSyncStartMenu);
-        headerRight.Controls.Add(_btnAppCenter);
-
-        header.Controls.Add(titleLbl);
-        header.Controls.Add(_statusLabel);
-        header.Controls.Add(headerRight);
-
-        // 2. Toolbar
-        var toolbar = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Top,
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            MinimumSize = new Size(0, 46),
-            BackColor = Color.White,
-            Padding = new Padding(12, 8, 12, 8),
-            WrapContents = true
-        };
-        toolbar.Paint += (_, e) =>
-        {
-            using var pen = new Pen(Color.FromArgb(224, 230, 238));
-            e.Graphics.DrawLine(pen, 0, toolbar.Height - 1, toolbar.Width, toolbar.Height - 1);
-        };
-
-        _searchBox = new TextBox
-        {
-            PlaceholderText = "搜索应用或文件夹...",
-            Width = 190,
-            Margin = new Padding(0, 2, 8, 0)
-        };
-        _searchBox.TextChanged += (_, _) => RenderHomeGrid();
-
-        var btnNewFolder = MakeToolButton("+ 新建文件夹");
-        btnNewFolder.Click += (_, _) => PromptCreateFolder();
-
-        var btnAutoGroup = MakeToolButton("整理分类");
-        btnAutoGroup.Click += (_, _) =>
-        {
-            _layout.AutoOrganize(_apps);
-            _openFolderId = null;
-            CloseFolderOverlay();
-            RenderHomeGrid();
-            SetFooter("已按应用类型整理桌面文件夹。");
-        };
-
-        var btnRefresh = MakeToolButton("刷新");
-        btnRefresh.Click += async (_, _) => await RefreshAppsAsync(forceRender: true);
-
-        var btnCustomCmd = MakeToolButton("运行命令...");
-        btnCustomCmd.Click += (_, _) => _ctx.PromptLaunchCustom(this);
-
-        _btnStagesToggle = MakeToolButton("运行中舞台 (0)");
-        _btnStagesToggle.Click += (_, _) => ToggleStagesDrawer();
-
-        _chkStartup = new CheckBox
-        {
-            Text = "开机自启",
-            AutoSize = true,
-            Checked = ShortcutManager.IsStartupEnabled(),
-            Margin = new Padding(6, 4, 0, 0)
-        };
-        _chkStartup.CheckedChanged += (_, _) =>
-        {
-            try
-            {
-                ShortcutManager.SetStartupEnabled(_distro, _chkStartup.Checked);
-                SetFooter(_chkStartup.Checked ? "已开启开机自启 FocusStage 托盘。" : "已关闭开机自启。");
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show(this, $"设置开机自启失败: {ex.Message}", "FocusStage", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
-        };
-
-        toolbar.Controls.AddRange(new Control[]
-        {
-            _searchBox, btnNewFolder, btnAutoGroup, btnRefresh, btnCustomCmd, _btnStagesToggle, _chkStartup
-        });
-
-        // 3. Footer
-        var footer = new Panel
-        {
-            Dock = DockStyle.Bottom,
-            Height = 28,
-            BackColor = Color.FromArgb(234, 239, 246),
-            Padding = new Padding(14, 5, 14, 4)
-        };
-        _footerLabel = new Label
-        {
-            Dock = DockStyle.Fill,
-            Text = "提示：点击文件夹展开应用；双击应用直接启动；右键可添加到开始菜单/桌面或移动到文件夹；可拖拽图标合并成文件夹。",
-            ForeColor = Color.FromArgb(71, 85, 105),
-            Font = new Font("Microsoft YaHei UI", 8.4f),
-            AutoEllipsis = true
-        };
-        footer.Controls.Add(_footerLabel);
-
-        // 4. Main workspace (Home grid + collapsible Stages drawer)
-        _workspaceHost = new Panel
-        {
-            Dock = DockStyle.Fill,
-            BackColor = Color.FromArgb(241, 245, 249)
-        };
-
+        // 2. Main Phone-Style App Grid
         _homeGrid = new BufferedFlowPanel
         {
             Dock = DockStyle.Fill,
             AutoScroll = true,
-            BackColor = Color.FromArgb(241, 245, 249),
-            Padding = new Padding(22, 18, 22, 22),
-            AllowDrop = true
+            BackColor = Color.Transparent,
+            Padding = new Padding(32, 10, 32, 96),
+            AllowDrop = true,
+            WallpaperProvider = () => _wallpaper
         };
         _homeGrid.MouseUp += (_, e) =>
         {
@@ -269,41 +201,60 @@ internal sealed class LauncherForm : Form
             }
         };
 
-        _stagesDrawer = new Panel
+        // 3. Floating Bottom Dock
+        _dockCard = new RoundedPanel
         {
-            Dock = DockStyle.Right,
-            Width = 310,
-            Visible = false,
-            BackColor = Color.FromArgb(248, 250, 252),
-            Padding = new Padding(10)
-        };
-        _stagesDrawer.Paint += (_, e) =>
-        {
-            using var pen = new Pen(Color.FromArgb(220, 227, 236));
-            e.Graphics.DrawLine(pen, 0, 0, 0, _stagesDrawer.Height);
+            Height = 70,
+            Width = 420,
+            CornerRadius = 22,
+            FillColor = Color.FromArgb(236, 255, 255, 255),
+            BorderColor = Color.FromArgb(190, 226, 232, 240),
+            DrawShadow = true,
+            Padding = new Padding(14, 7, 14, 7)
         };
 
-        var stagesTitle = new Label
+        var dockFlow = new FlowLayoutPanel
         {
-            Dock = DockStyle.Top,
-            Height = 30,
-            Text = "运行中的 Stages",
-            Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Bold),
-            ForeColor = Color.FromArgb(30, 41, 59)
-        };
-
-        _stagesPanel = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            AutoScroll = true,
-            FlowDirection = FlowDirection.TopDown,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            FlowDirection = FlowDirection.LeftToRight,
             WrapContents = false,
-            BackColor = Color.Transparent
+            BackColor = Color.Transparent,
+            Padding = new Padding(0),
+            Margin = new Padding(0)
         };
-        _stagesDrawer.Controls.Add(_stagesPanel);
-        _stagesDrawer.Controls.Add(stagesTitle);
 
-        // 5. Phone-style Folder Overlay Modal (hidden unless a folder is open)
+        _dockAppCenter = new DockItemButton("应用中心", DockIconKind.AppCenter, Color.FromArgb(234, 88, 12), Color.FromArgb(255, 237, 213));
+        _dockAppCenter.Click += async (_, _) => await OpenOrInstallAppCenterAsync();
+
+        _dockNewFolder = new DockItemButton("新建文件夹", DockIconKind.NewFolder, Color.FromArgb(37, 99, 235), Color.FromArgb(219, 234, 254));
+        _dockNewFolder.Click += (_, _) => PromptCreateFolder();
+
+        _dockRunCmd = new DockItemButton("运行命令", DockIconKind.RunCommand, Color.FromArgb(79, 70, 229), Color.FromArgb(224, 231, 255));
+        _dockRunCmd.Click += (_, _) => _ctx.PromptLaunchCustom(this);
+
+        _dockSettings = new DockItemButton("设置", DockIconKind.Settings, Color.FromArgb(71, 85, 105), Color.FromArgb(226, 232, 240));
+        _dockSettings.Click += (_, _) => OpenSettingsOverlay();
+
+        dockFlow.Controls.AddRange(new Control[] { _dockAppCenter, _dockNewFolder, _dockRunCmd, _dockSettings });
+        _dockCard.Controls.Add(dockFlow);
+        _dockCard.Resize += (_, _) =>
+        {
+            dockFlow.Location = new Point(
+                Math.Max(0, (_dockCard.Width - dockFlow.Width) / 2),
+                Math.Max(0, (_dockCard.Height - dockFlow.Height) / 2 - 1));
+        };
+
+        // 4. Transient Floating Toast Pill
+        _toastPill = new ToastPill();
+        _toastTimer = new System.Windows.Forms.Timer { Interval = 3200 };
+        _toastTimer.Tick += (_, _) =>
+        {
+            _toastTimer.Stop();
+            _toastPill.Visible = false;
+        };
+
+        // 5. Phone-Style Folder Overlay Modal
         _folderOverlay = new DimOverlayPanel
         {
             Dock = DockStyle.Fill,
@@ -313,25 +264,26 @@ internal sealed class LauncherForm : Form
 
         _folderCard = new RoundedPanel
         {
-            Width = 560,
-            Height = 420,
-            CornerRadius = 22,
+            Width = 540,
+            Height = 400,
+            CornerRadius = 24,
             FillColor = Color.FromArgb(250, 252, 255),
-            BorderColor = Color.FromArgb(214, 222, 234),
-            Padding = new Padding(18, 14, 18, 16)
+            BorderColor = Color.FromArgb(216, 226, 238),
+            DrawShadow = true,
+            Padding = new Padding(22, 18, 22, 18)
         };
 
         var folderHeader = new Panel
         {
             Dock = DockStyle.Top,
-            Height = 44,
+            Height = 42,
             BackColor = Color.Transparent
         };
 
         _folderTitleLabel = new Label
         {
             Dock = DockStyle.Fill,
-            Font = new Font("Microsoft YaHei UI", 13f, FontStyle.Bold),
+            Font = new Font("Microsoft YaHei UI", 12.5f, FontStyle.Bold),
             ForeColor = Color.FromArgb(15, 23, 42),
             TextAlign = ContentAlignment.MiddleLeft,
             Cursor = Cursors.Hand
@@ -344,14 +296,14 @@ internal sealed class LauncherForm : Form
             AutoSize = true,
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = false,
-            Padding = new Padding(0, 6, 0, 0)
+            Padding = new Padding(0, 5, 0, 0),
+            BackColor = Color.Transparent
         };
 
-        var btnRenameFolder = MakeToolButton("重命名");
+        var btnRenameFolder = new PillButton("重命名") { Height = 30, Margin = new Padding(0, 0, 6, 0) };
         btnRenameFolder.Click += (_, _) => PromptRenameCurrentFolder();
 
-        var btnCloseFolder = MakeToolButton("✕");
-        btnCloseFolder.Width = 34;
+        var btnCloseFolder = new PillButton("✕") { Width = 34, Height = 30, Margin = new Padding(0) };
         btnCloseFolder.Click += (_, _) => CloseFolderOverlay();
 
         folderHeaderBtns.Controls.Add(btnRenameFolder);
@@ -364,7 +316,7 @@ internal sealed class LauncherForm : Form
             Dock = DockStyle.Fill,
             AutoScroll = true,
             BackColor = Color.Transparent,
-            Padding = new Padding(6, 10, 6, 6)
+            Padding = new Padding(4, 10, 4, 6)
         };
         _folderGrid.MouseUp += (_, e) =>
         {
@@ -380,15 +332,308 @@ internal sealed class LauncherForm : Form
         _folderOverlay.Controls.Add(_folderCard);
         _folderOverlay.Resize += (_, _) => CenterFolderCard();
 
-        _workspaceHost.Controls.Add(_homeGrid);
-        _workspaceHost.Controls.Add(_stagesDrawer);
-        _workspaceHost.Controls.Add(_folderOverlay);
-        _folderOverlay.BringToFront();
+        // 6. Settings Overlay Modal (All settings + Running Stages consolidated here)
+        _settingsOverlay = new DimOverlayPanel
+        {
+            Dock = DockStyle.Fill,
+            Visible = false
+        };
+        _settingsOverlay.BackdropClicked += (_, _) => CloseSettingsOverlay();
 
-        Controls.Add(_workspaceHost);
-        Controls.Add(toolbar);
-        Controls.Add(header);
-        Controls.Add(footer);
+        _settingsCard = new RoundedPanel
+        {
+            Width = 540,
+            Height = 520,
+            CornerRadius = 24,
+            FillColor = Color.FromArgb(246, 249, 253),
+            BorderColor = Color.FromArgb(214, 224, 236),
+            DrawShadow = true,
+            Padding = new Padding(22, 18, 22, 18)
+        };
+
+        var settingsHeader = new Panel
+        {
+            Dock = DockStyle.Top,
+            Height = 42,
+            BackColor = Color.Transparent
+        };
+
+        var settingsTitle = new Label
+        {
+            Text = "设置",
+            Font = new Font("Microsoft YaHei UI", 13f, FontStyle.Bold),
+            ForeColor = Color.FromArgb(15, 23, 42),
+            AutoSize = true,
+            Location = new Point(2, 7)
+        };
+
+        var distroBadge = new Label
+        {
+            Text = $"WSL · {_distro}",
+            Font = new Font("Segoe UI", 8.2f, FontStyle.Regular),
+            ForeColor = Color.FromArgb(100, 116, 139),
+            AutoSize = true,
+            Location = new Point(56, 13)
+        };
+
+        var btnCloseSettings = new PillButton("✕") { Width = 34, Height = 30 };
+        btnCloseSettings.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        btnCloseSettings.Click += (_, _) => CloseSettingsOverlay();
+        settingsHeader.Resize += (_, _) =>
+        {
+            distroBadge.Location = new Point(settingsTitle.Right + 10, settingsTitle.Top + (settingsTitle.Height - distroBadge.Height) / 2 + 1);
+            btnCloseSettings.Location = new Point(settingsHeader.Width - btnCloseSettings.Width, 5);
+        };
+        settingsHeader.Controls.AddRange(new Control[] { settingsTitle, distroBadge, btnCloseSettings });
+
+        _settingsScrollBody = new Panel
+        {
+            Dock = DockStyle.Fill,
+            AutoScroll = true,
+            BackColor = Color.Transparent,
+            Padding = new Padding(0, 6, 4, 4)
+        };
+
+        var settingsStack = new FlowLayoutPanel
+        {
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            BackColor = Color.Transparent,
+            Location = new Point(0, 4)
+        };
+
+        // --- Section 1: General & Desktop ---
+        var generalCard = CreateSettingsGroupCard("桌面与启动");
+        var startupRow = new Panel { Height = 42, Dock = DockStyle.Top, BackColor = Color.Transparent };
+        var startupTitle = new Label
+        {
+            Text = "开机自启",
+            Font = new Font("Microsoft YaHei UI", 9.2f, FontStyle.Bold),
+            ForeColor = Color.FromArgb(30, 41, 59),
+            AutoSize = true,
+            Location = new Point(0, 2)
+        };
+        var startupSub = new Label
+        {
+            Text = "登录 Windows 时自动在托盘运行 FocusStage",
+            Font = new Font("Microsoft YaHei UI", 8.0f),
+            ForeColor = Color.FromArgb(100, 116, 139),
+            AutoSize = true,
+            Location = new Point(0, 22)
+        };
+        _toggleStartup = new ToggleSwitch { Checked = ShortcutManager.IsStartupEnabled() };
+        _toggleStartup.CheckedChanged += (_, _) =>
+        {
+            try
+            {
+                ShortcutManager.SetStartupEnabled(_distro, _toggleStartup.Checked);
+                ShowToast(_toggleStartup.Checked ? "已开启开机自启" : "已关闭开机自启");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"设置开机自启失败: {ex.Message}", "FocusStage", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        };
+        startupRow.Resize += (_, _) => _toggleStartup.Location = new Point(startupRow.Width - _toggleStartup.Width - 2, 9);
+        startupRow.Controls.AddRange(new Control[] { startupTitle, startupSub, _toggleStartup });
+
+        var desktopActions = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            Height = 42,
+            Padding = new Padding(0, 8, 0, 0),
+            WrapContents = false,
+            BackColor = Color.Transparent
+        };
+
+        var btnRefreshApps = new PillButton("刷新应用") { Margin = new Padding(0, 0, 8, 0) };
+        btnRefreshApps.Click += async (_, _) =>
+        {
+            await RefreshAppsAsync(forceRender: true);
+            ShowToast($"已刷新，共 {_apps.Count} 个应用");
+        };
+
+        var btnAutoOrganize = new PillButton("整理分类") { Margin = new Padding(0, 0, 8, 0) };
+        btnAutoOrganize.Click += (_, _) =>
+        {
+            _layout.AutoOrganize(_apps);
+            _openFolderId = null;
+            RenderHomeGrid();
+            ShowToast("已按应用类型整理桌面文件夹");
+        };
+
+        _btnSyncStartMenu = new PillButton("同步开始菜单")
+        {
+            FillColor = Color.FromArgb(236, 253, 245),
+            HoverColor = Color.FromArgb(209, 250, 229),
+            BorderColor = Color.FromArgb(167, 243, 208),
+            ForeColor = Color.FromArgb(6, 95, 70),
+            Margin = new Padding(0)
+        };
+        _btnSyncStartMenu.Click += async (_, _) => await HandleSyncStartMenuAsync();
+
+        desktopActions.Controls.AddRange(new Control[] { btnRefreshApps, btnAutoOrganize, _btnSyncStartMenu });
+        generalCard.Controls.Add(desktopActions);
+        generalCard.Controls.Add(startupRow);
+        generalCard.Height = 132;
+
+        // --- Section 2: Daemon & Takeover ---
+        var daemonCard = CreateSettingsGroupCard("守护进程与接管");
+        var daemonRow = new Panel { Height = 36, Dock = DockStyle.Top, BackColor = Color.Transparent };
+        _settingsDaemonDot = new Panel { Size = new Size(9, 9), Location = new Point(2, 13), BackColor = Color.Transparent };
+        _settingsDaemonDot.Paint += (_, e) =>
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using var b = new SolidBrush(_daemonAlive ? Color.FromArgb(16, 185, 129) : Color.FromArgb(148, 163, 184));
+            e.Graphics.FillEllipse(b, 0, 0, 8, 8);
+        };
+        _settingsDaemonLabel = new Label
+        {
+            Text = "正在检测 focusstaged 状态...",
+            Font = new Font("Microsoft YaHei UI", 8.8f),
+            ForeColor = Color.FromArgb(51, 65, 85),
+            AutoSize = true,
+            Location = new Point(18, 9)
+        };
+        _btnStartStopDaemon = new PillButton("启动守护") { Height = 30 };
+        _btnStartStopDaemon.Click += async (_, _) =>
+        {
+            _btnStartStopDaemon.Enabled = false;
+            try
+            {
+                if (_daemonAlive) await _ctx.RunControlAndRefreshAsync("shutdown");
+                else await _ctx.StartDaemonAsync();
+            }
+            finally
+            {
+                _btnStartStopDaemon.Enabled = true;
+            }
+        };
+        daemonRow.Resize += (_, _) => _btnStartStopDaemon.Location = new Point(daemonRow.Width - _btnStartStopDaemon.Width - 2, 3);
+        daemonRow.Controls.AddRange(new Control[] { _settingsDaemonDot, _settingsDaemonLabel, _btnStartStopDaemon });
+
+        var daemonActions = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            Height = 40,
+            Padding = new Padding(0, 6, 0, 0),
+            WrapContents = false,
+            BackColor = Color.Transparent
+        };
+        _btnTakeoverAll = new PillButton("接管全部 (Ctrl+Alt+Space)")
+        {
+            FillColor = Color.FromArgb(239, 246, 255),
+            HoverColor = Color.FromArgb(219, 234, 254),
+            BorderColor = Color.FromArgb(191, 219, 254),
+            ForeColor = Color.FromArgb(29, 78, 216),
+            Margin = new Padding(0)
+        };
+        _btnTakeoverAll.UpdateAutoWidth(28);
+        _btnTakeoverAll.Click += async (_, _) => await _ctx.TakeoverAllAsync();
+        daemonActions.Controls.Add(_btnTakeoverAll);
+
+        daemonCard.Controls.Add(daemonActions);
+        daemonCard.Controls.Add(daemonRow);
+        daemonCard.Height = 122;
+
+        // --- Section 3: Running Stages (Zero-flicker, tucked inside Settings) ---
+        var stagesCard = new RoundedPanel
+        {
+            CornerRadius = 16,
+            FillColor = Color.White,
+            BorderColor = Color.FromArgb(226, 232, 240),
+            Padding = new Padding(16, 12, 16, 14),
+            Margin = new Padding(0, 0, 0, 6),
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink
+        };
+
+        var stagesHeaderRow = new Panel
+        {
+            Height = 30,
+            Dock = DockStyle.Top,
+            BackColor = Color.Transparent
+        };
+        _stagesHeaderLabel = new Label
+        {
+            Text = "运行中的 Stages (0)",
+            Font = new Font("Microsoft YaHei UI", 9.0f, FontStyle.Bold),
+            ForeColor = Color.FromArgb(71, 85, 105),
+            AutoSize = true,
+            Location = new Point(0, 5)
+        };
+        var btnRefreshStages = new PillButton("刷新") { Height = 26, Width = 58, Font = new Font("Microsoft YaHei UI", 8.0f) };
+        btnRefreshStages.Click += async (_, _) =>
+        {
+            await _ctx.RefreshAndRebuildMenuAsync();
+            RenderStages(force: true);
+        };
+        stagesHeaderRow.Resize += (_, _) => btnRefreshStages.Location = new Point(stagesHeaderRow.Width - btnRefreshStages.Width, 1);
+        stagesHeaderRow.Controls.AddRange(new Control[] { _stagesHeaderLabel, btnRefreshStages });
+
+        _stagesPanel = new BufferedFlowPanel
+        {
+            Dock = DockStyle.Top,
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            BackColor = Color.Transparent,
+            Padding = new Padding(0, 6, 0, 0)
+        };
+
+        stagesCard.Controls.Add(_stagesPanel);
+        stagesCard.Controls.Add(stagesHeaderRow);
+
+        settingsStack.Controls.AddRange(new Control[] { generalCard, daemonCard, stagesCard });
+        _settingsScrollBody.Controls.Add(settingsStack);
+
+        void SyncSettingsCardWidths()
+        {
+            int contentW = Math.Max(320, _settingsScrollBody.ClientSize.Width - 18);
+            settingsStack.Width = contentW;
+            generalCard.Width = contentW;
+            daemonCard.Width = contentW;
+            stagesCard.MinimumSize = new Size(contentW, 90);
+            stagesCard.MaximumSize = new Size(contentW, 0);
+            stagesCard.Width = contentW;
+            if (_settingsVisible)
+            {
+                RenderStages(force: true);
+            }
+        }
+        _settingsScrollBody.Resize += (_, _) => SyncSettingsCardWidths();
+
+        _settingsCard.Controls.Add(_settingsScrollBody);
+        _settingsCard.Controls.Add(settingsHeader);
+        _settingsOverlay.Controls.Add(_settingsCard);
+        _settingsOverlay.Resize += (_, _) =>
+        {
+            CenterSettingsCard();
+            SyncSettingsCardWidths();
+        };
+
+        // Assemble root hierarchy
+        Controls.Add(_homeGrid);
+        Controls.Add(_topBar);
+        Controls.Add(_dockCard);
+        Controls.Add(_toastPill);
+        Controls.Add(_folderOverlay);
+        Controls.Add(_settingsOverlay);
+
+        _dockCard.BringToFront();
+        _toastPill.BringToFront();
+        _folderOverlay.BringToFront();
+        _settingsOverlay.BringToFront();
+
+        Resize += (_, _) =>
+        {
+            RebuildWallpaper();
+            LayoutChrome();
+            Invalidate();
+        };
 
         // Hide to tray instead of exiting when user closes the window
         FormClosing += (_, e) =>
@@ -396,7 +641,7 @@ internal sealed class LauncherForm : Form
             if (e.CloseReason == CloseReason.UserClosing)
             {
                 e.Cancel = true;
-                CloseFolderOverlay();
+                CloseAllOverlays();
                 Hide();
             }
         };
@@ -421,7 +666,11 @@ internal sealed class LauncherForm : Form
 
         Load += async (_, _) =>
         {
+            RebuildWallpaper();
+            LayoutChrome();
             CenterFolderCard();
+            CenterSettingsCard();
+            SyncSettingsCardWidths();
             await RefreshAppsAsync(forceRender: true);
             _autoDiscoverTimer.Start();
         };
@@ -432,6 +681,154 @@ internal sealed class LauncherForm : Form
                 await RefreshAppsAsync(forceRender: false);
             }
         };
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        Win11WindowHelper.ApplyWin11Chrome(Handle);
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == Win11WindowHelper.WM_NCHITTEST)
+        {
+            if (Win11WindowHelper.TryHitTestResizeBorder(this, ref m))
+            {
+                return;
+            }
+        }
+        base.WndProc(ref m);
+    }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (keyData == Keys.Escape)
+        {
+            if (_settingsVisible)
+            {
+                CloseSettingsOverlay();
+                return true;
+            }
+            if (_openFolderId is not null)
+            {
+                CloseFolderOverlay();
+                return true;
+            }
+            if (!string.IsNullOrEmpty(_searchBox.SearchText))
+            {
+                _searchBox.ClearSearch();
+                return true;
+            }
+        }
+        else if (keyData == (Keys.Control | Keys.F))
+        {
+            CloseAllOverlays();
+            _searchBox.FocusInput();
+            return true;
+        }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        if (_wallpaper is null || _wallpaper.Width != ClientSize.Width || _wallpaper.Height != ClientSize.Height)
+        {
+            RebuildWallpaper();
+        }
+        if (_wallpaper is not null)
+        {
+            e.Graphics.DrawImageUnscaled(_wallpaper, 0, 0);
+        }
+        else
+        {
+            base.OnPaintBackground(e);
+        }
+
+        // Crisp subtle window border
+        using var borderPen = new Pen(Color.FromArgb(65, 148, 163, 184), 1f);
+        e.Graphics.DrawRectangle(borderPen, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
+    }
+
+    private void RebuildWallpaper()
+    {
+        if (ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
+        _wallpaper?.Dispose();
+        _wallpaper = UiGraphics.RenderWallpaper(ClientSize.Width, ClientSize.Height);
+    }
+
+    private void LayoutChrome()
+    {
+        // Position status dot cleanly to the right of FocusStage title at any DPI
+        _statusDot.Location = new Point(_titleLbl.Right + 8, _titleLbl.Top + (_titleLbl.Height - _statusDot.Height) / 2 + 1);
+
+        // Top bar layout: centered search pill + right-aligned window buttons
+        int searchW = Math.Min(320, Math.Max(180, ClientSize.Width - 360));
+        _searchBox.Width = searchW;
+        _searchBox.Location = new Point((ClientSize.Width - searchW) / 2, (_topBar.Height - _searchBox.Height) / 2);
+
+        _btnClose.Location = new Point(ClientSize.Width - _btnClose.Width - 14, (_topBar.Height - _btnClose.Height) / 2);
+        _btnMinimize.Location = new Point(_btnClose.Left - _btnMinimize.Width - 4, (_topBar.Height - _btnMinimize.Height) / 2);
+
+        // Floating bottom dock sized to fit all items symmetrically and centered
+        if (_dockCard.Controls.Count > 0)
+        {
+            var flow = _dockCard.Controls[0];
+            flow.PerformLayout();
+            int neededW = flow.PreferredSize.Width + 32;
+            _dockCard.Width = Math.Max(360, neededW);
+            _dockCard.Height = Math.Max(68, flow.PreferredSize.Height + 16);
+            flow.Location = new Point(
+                Math.Max(0, (_dockCard.Width - flow.Width) / 2),
+                Math.Max(0, (_dockCard.Height - flow.Height) / 2 - 1));
+        }
+        _dockCard.Location = new Point(
+            Math.Max(12, (ClientSize.Width - _dockCard.Width) / 2),
+            ClientSize.Height - _dockCard.Height - 14);
+
+        PositionToast();
+    }
+
+    private void PositionToast()
+    {
+        _toastPill.Location = new Point(
+            Math.Max(16, (ClientSize.Width - _toastPill.Width) / 2),
+            _dockCard.Top - _toastPill.Height - 10);
+    }
+
+    private void ShowToast(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message)) return;
+        _toastPill.SetMessage(message, Math.Max(220, ClientSize.Width - 80));
+        PositionToast();
+        _toastPill.Visible = true;
+        _toastPill.BringToFront();
+        if (_folderOverlay.Visible) _folderOverlay.BringToFront();
+        if (_settingsOverlay.Visible) _settingsOverlay.BringToFront();
+        _toastTimer.Stop();
+        _toastTimer.Start();
+    }
+
+    private static RoundedPanel CreateSettingsGroupCard(string sectionTitle)
+    {
+        var card = new RoundedPanel
+        {
+            CornerRadius = 16,
+            FillColor = Color.White,
+            BorderColor = Color.FromArgb(226, 232, 240),
+            Padding = new Padding(16, 12, 16, 12),
+            Margin = new Padding(0, 0, 0, 12)
+        };
+        var title = new Label
+        {
+            Text = sectionTitle,
+            Dock = DockStyle.Top,
+            Height = 24,
+            Font = new Font("Microsoft YaHei UI", 8.6f, FontStyle.Bold),
+            ForeColor = Color.FromArgb(100, 116, 139)
+        };
+        card.Controls.Add(title);
+        return card;
     }
 
     private void SetupDownloadsWatcher()
@@ -469,38 +866,6 @@ internal sealed class LauncherForm : Form
         }
     }
 
-    private static Button MakeHeaderButton(string text, Color bg)
-    {
-        var btn = new Button
-        {
-            Text = text,
-            AutoSize = true,
-            Height = 32,
-            FlatStyle = FlatStyle.Flat,
-            BackColor = bg,
-            ForeColor = Color.White,
-            Font = new Font("Microsoft YaHei UI", 8.8f, FontStyle.Bold),
-            Padding = new Padding(10, 0, 10, 0),
-            Margin = new Padding(8, 0, 0, 0),
-            Cursor = Cursors.Hand
-        };
-        btn.FlatAppearance.BorderSize = 0;
-        return btn;
-    }
-
-    private static Button MakeToolButton(string text) => new()
-    {
-        Text = text,
-        AutoSize = true,
-        Height = 28,
-        FlatStyle = FlatStyle.System,
-        Font = new Font("Microsoft YaHei UI", 8.8f),
-        Margin = new Padding(0, 0, 6, 0),
-        Cursor = Cursors.Hand
-    };
-
-    private void SetFooter(string text) => _footerLabel.Text = text;
-
     public void UpdateDaemonAndStages(bool daemonAlive, List<StageDto> stages)
     {
         if (InvokeRequired)
@@ -508,28 +873,42 @@ internal sealed class LauncherForm : Form
             BeginInvoke(() => UpdateDaemonAndStages(daemonAlive, stages));
             return;
         }
+
+        bool daemonChanged = !_daemonStateInitialized || _daemonAlive != daemonAlive || _lastStageCount != stages.Count;
+        _daemonStateInitialized = true;
         _daemonAlive = daemonAlive;
+        _lastStageCount = stages.Count;
         _stages = stages;
-        _statusLabel.Text = daemonAlive
-            ? $"focusstaged 运行中 · 当前 {_stages.Count} 个后台/桌面舞台"
-            : "focusstaged 未运行（双击任意应用时会自动拉起）";
-        _btnStartStopDaemon.Text = daemonAlive ? "停止守护" : "启动守护";
-        _btnTakeoverAll.Enabled = daemonAlive && _stages.Count > 0;
-        _btnStagesToggle.Text = $"运行中舞台 ({_stages.Count})";
-        if (_stagesVisible)
+
+        if (daemonChanged)
         {
-            RenderStages();
+            var tip = daemonAlive
+                ? $"focusstaged 运行中 · {_stages.Count} 个活跃舞台"
+                : "focusstaged 待机中（启动应用时自动拉起）";
+            _toolTip.SetToolTip(_statusDot, tip);
+            _statusDot.Invalidate();
+
+            _settingsDaemonLabel.Text = daemonAlive
+                ? $"focusstaged 运行中 · {_stages.Count} 个活跃舞台"
+                : "focusstaged 未运行（启动应用时自动拉起）";
+            _settingsDaemonDot.Invalidate();
+            _btnStartStopDaemon.Text = daemonAlive ? "停止守护" : "启动守护";
+            _btnTakeoverAll.Enabled = daemonAlive && _stages.Count > 0;
+            _stagesHeaderLabel.Text = $"运行中的 Stages ({_stages.Count})";
+        }
+
+        // Only re-render stages inside Settings when Settings is open AND the stage list actually changed (no flickering!)
+        if (_settingsVisible)
+        {
+            RenderStages(force: false);
         }
     }
 
-    private void ToggleStagesDrawer()
+    private static string BuildStagesSignature(List<StageDto> stages)
     {
-        _stagesVisible = !_stagesVisible;
-        _stagesDrawer.Visible = _stagesVisible;
-        if (_stagesVisible)
-        {
-            RenderStages();
-        }
+        if (stages.Count == 0) return "";
+        return string.Join("|", stages.Select(s =>
+            $"{s.StageId}:{s.App}:{s.Title}:{s.Display}:{s.Kind}:{s.InputOwner.Type}:{s.InputOwner.AgentName}"));
     }
 
     public async Task RefreshAppsAsync(bool forceRender = true)
@@ -543,7 +922,7 @@ internal sealed class LauncherForm : Form
             {
                 if (forceRender)
                 {
-                    SetFooter($"读取 Linux 应用失败: {err}");
+                    ShowToast($"读取 Linux 应用失败: {err}");
                 }
                 return;
             }
@@ -565,7 +944,7 @@ internal sealed class LauncherForm : Form
                 }
                 if (listChanged && !forceRender)
                 {
-                    SetFooter($"已自动检测到应用更新，当前共 {_apps.Count} 个应用/安装包。");
+                    ShowToast($"已自动检测到应用更新，当前共 {_apps.Count} 个应用");
                 }
             }
         }
@@ -577,7 +956,7 @@ internal sealed class LauncherForm : Form
 
     private void RenderHomeGrid()
     {
-        var filter = _searchBox.Text.Trim();
+        var filter = _searchBox.SearchText.Trim();
         _homeGrid.SuspendLayout();
         _homeGrid.Controls.Clear();
 
@@ -592,7 +971,7 @@ internal sealed class LauncherForm : Form
 
             if (matched.Count == 0)
             {
-                _homeGrid.Controls.Add(MakeHintLabel($"未找到匹配 “{filter}” 的应用。"));
+                _homeGrid.Controls.Add(MakeHintLabel($"未找到匹配 “{filter}” 的应用"));
             }
             else
             {
@@ -607,7 +986,7 @@ internal sealed class LauncherForm : Form
 
         if (_apps.Count == 0)
         {
-            _homeGrid.Controls.Add(MakeHintLabel("暂未发现 Linux 应用，可点击右上角“应用中心”安装，或直接在浏览器下载 .AppImage / .deb。"));
+            _homeGrid.Controls.Add(MakeHintLabel("暂未发现 Linux 应用，可点击底部“应用中心”安装，或直接下载 .AppImage / .deb"));
             _homeGrid.ResumeLayout();
             return;
         }
@@ -635,8 +1014,9 @@ internal sealed class LauncherForm : Form
     {
         Text = text,
         AutoSize = true,
-        Padding = new Padding(12),
-        ForeColor = Color.FromArgb(100, 116, 139)
+        Padding = new Padding(8, 12, 8, 12),
+        ForeColor = Color.FromArgb(100, 116, 139),
+        BackColor = Color.Transparent
     };
 
     private Control BuildFolderTile(LauncherFolder folder)
@@ -646,7 +1026,6 @@ internal sealed class LauncherForm : Form
         {
             TileKey = tileKey,
             TitleText = folder.Name,
-            SubBadgeText = folder.AppIds.Count.ToString(),
             IsSelected = _selectedItemKey == tileKey,
             IsFolder = true,
             AllowDrop = true
@@ -695,7 +1074,7 @@ internal sealed class LauncherForm : Form
                 _layout.MoveAppToFolder(payload.AppId, folder.Id);
                 RenderHomeGrid();
                 if (_openFolderId is not null) RenderFolderModal();
-                SetFooter($"已将应用移入文件夹 “{folder.Name}”。");
+                ShowToast($"已移入文件夹 “{folder.Name}”");
             }
         };
 
@@ -770,7 +1149,7 @@ internal sealed class LauncherForm : Form
                     var folder = _layout.MergeAppsIntoNewFolder(payload.AppId, app.Id, "新建文件夹");
                     RenderHomeGrid();
                     OpenFolderOverlay(folder.Id);
-                    SetFooter($"已创建文件夹 “{folder.Name}”。");
+                    ShowToast($"已创建文件夹 “{folder.Name}”");
                 }
             };
         }
@@ -789,11 +1168,18 @@ internal sealed class LauncherForm : Form
         }
     }
 
+    private void CloseAllOverlays()
+    {
+        CloseFolderOverlay();
+        CloseSettingsOverlay();
+    }
+
     private void OpenFolderOverlay(string folderId)
     {
+        CloseSettingsOverlay();
         _openFolderId = folderId;
         RenderFolderModal();
-        _folderOverlay.CaptureBackdropFrom(_homeGrid);
+        _folderOverlay.CaptureBackdropFrom(this);
         _folderOverlay.Visible = true;
         _folderOverlay.BringToFront();
         CenterFolderCard();
@@ -808,12 +1194,41 @@ internal sealed class LauncherForm : Form
     private void CenterFolderCard()
     {
         if (_folderOverlay.Width <= 0 || _folderOverlay.Height <= 0) return;
-        int w = Math.Min(600, Math.Max(360, _folderOverlay.Width - 100));
-        int h = Math.Min(450, Math.Max(280, _folderOverlay.Height - 90));
+        int w = Math.Min(580, Math.Max(360, _folderOverlay.Width - 100));
+        int h = Math.Min(430, Math.Max(280, _folderOverlay.Height - 100));
         _folderCard.Size = new Size(w, h);
         _folderCard.Location = new Point(
             (_folderOverlay.Width - w) / 2,
             (_folderOverlay.Height - h) / 2);
+    }
+
+    private void OpenSettingsOverlay()
+    {
+        CloseFolderOverlay();
+        _settingsVisible = true;
+        _toggleStartup.Checked = ShortcutManager.IsStartupEnabled();
+        RenderStages(force: true);
+        _settingsOverlay.CaptureBackdropFrom(this);
+        _settingsOverlay.Visible = true;
+        _settingsOverlay.BringToFront();
+        CenterSettingsCard();
+    }
+
+    private void CloseSettingsOverlay()
+    {
+        _settingsVisible = false;
+        _settingsOverlay.Visible = false;
+    }
+
+    private void CenterSettingsCard()
+    {
+        if (_settingsOverlay.Width <= 0 || _settingsOverlay.Height <= 0) return;
+        int w = Math.Min(540, Math.Max(380, _settingsOverlay.Width - 96));
+        int h = Math.Min(540, Math.Max(340, _settingsOverlay.Height - 80));
+        _settingsCard.Size = new Size(w, h);
+        _settingsCard.Location = new Point(
+            (_settingsOverlay.Width - w) / 2,
+            (_settingsOverlay.Height - h) / 2);
     }
 
     private void RenderFolderModal()
@@ -832,7 +1247,7 @@ internal sealed class LauncherForm : Form
 
         if (folder.AppIds.Count == 0)
         {
-            _folderGrid.Controls.Add(MakeHintLabel("文件夹是空的，可拖拽应用到此文件夹或右键应用“移动到文件夹”。"));
+            _folderGrid.Controls.Add(MakeHintLabel("文件夹为空，可拖拽应用到此文件夹或右键应用“移动到文件夹”"));
         }
         else
         {
@@ -845,6 +1260,123 @@ internal sealed class LauncherForm : Form
             }
         }
         _folderGrid.ResumeLayout();
+    }
+
+    private void RenderStages(bool force)
+    {
+        var sig = BuildStagesSignature(_stages);
+        if (!force && sig == _lastStagesSignature)
+        {
+            return;
+        }
+        _lastStagesSignature = sig;
+        _stagesHeaderLabel.Text = $"运行中的 Stages ({_stages.Count})";
+
+        _stagesPanel.SuspendLayout();
+        _stagesPanel.Controls.Clear();
+
+        int cardWidth = Math.Max(260, _stagesPanel.Parent is not null ? _stagesPanel.Parent.ClientSize.Width - 36 : 420);
+
+        if (_stages.Count == 0)
+        {
+            _stagesPanel.Controls.Add(new Label
+            {
+                Text = "当前没有运行中的 Stage",
+                AutoSize = true,
+                Padding = new Padding(2, 6, 2, 4),
+                ForeColor = Color.FromArgb(148, 163, 184),
+                Font = new Font("Microsoft YaHei UI", 8.6f)
+            });
+            _stagesPanel.ResumeLayout();
+            return;
+        }
+
+        foreach (var stage in _stages)
+        {
+            var card = new RoundedPanel
+            {
+                Width = cardWidth,
+                Height = 76,
+                CornerRadius = 12,
+                FillColor = Color.FromArgb(248, 250, 252),
+                BorderColor = Color.FromArgb(226, 232, 240),
+                Margin = new Padding(0, 0, 0, 8),
+                Padding = new Padding(12, 8, 12, 8)
+            };
+
+            var title = string.IsNullOrWhiteSpace(stage.Title) ? stage.App : stage.Title;
+            var ownerTag = stage.InputOwner.Type switch
+            {
+                "agent" => $"AI:{stage.InputOwner.AgentName ?? "agent"}",
+                "frozen" => "已冻结",
+                _ => "人类"
+            };
+            var dispTag = stage.Display == "desktop" ? "桌面显示" : "后台运行";
+
+            var lblTitle = new Label
+            {
+                Text = $"[{stage.StageId}] {title}",
+                Font = new Font("Microsoft YaHei UI", 8.8f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(30, 41, 59),
+                Location = new Point(12, 8),
+                Size = new Size(cardWidth - 24, 20),
+                AutoEllipsis = true,
+                BackColor = Color.Transparent
+            };
+            var lblMeta = new Label
+            {
+                Text = $"{dispTag} · {ownerTag} · {stage.Kind}",
+                Font = new Font("Microsoft YaHei UI", 7.9f),
+                ForeColor = Color.FromArgb(100, 116, 139),
+                Location = new Point(12, 27),
+                Size = new Size(cardWidth - 24, 16),
+                AutoEllipsis = true,
+                BackColor = Color.Transparent
+            };
+
+            var actions = new FlowLayoutPanel
+            {
+                Location = new Point(10, 45),
+                Size = new Size(cardWidth - 20, 26),
+                WrapContents = false,
+                BackColor = Color.Transparent
+            };
+
+            var stageId = stage.StageId;
+            var isDesktop = stage.Display == "desktop";
+
+            var btnTake = MakeStageActionBtn("接管");
+            btnTake.Click += async (_, _) => await _ctx.RunControlAndRefreshAsync("takeover", stageId);
+
+            var btnVis = MakeStageActionBtn(isDesktop ? "隐藏" : "显示");
+            btnVis.Click += async (_, _) => await _ctx.RunControlAndRefreshAsync(isDesktop ? "hide" : "show", stageId);
+
+            var btnClose = MakeStageActionBtn("关闭");
+            btnClose.ForeColor = Color.FromArgb(185, 28, 28);
+            btnClose.FillColor = Color.FromArgb(254, 242, 242);
+            btnClose.HoverColor = Color.FromArgb(254, 226, 226);
+            btnClose.BorderColor = Color.FromArgb(254, 202, 202);
+            btnClose.Click += async (_, _) => await _ctx.RunControlAndRefreshAsync("close", stageId);
+
+            actions.Controls.AddRange(new Control[] { btnTake, btnVis, btnClose });
+            card.Controls.AddRange(new Control[] { lblTitle, lblMeta, actions });
+            _stagesPanel.Controls.Add(card);
+        }
+
+        _stagesPanel.ResumeLayout();
+    }
+
+    private static PillButton MakeStageActionBtn(string text)
+    {
+        var btn = new PillButton(text)
+        {
+            Height = 24,
+            CornerRadius = 7,
+            Font = new Font("Microsoft YaHei UI", 7.9f),
+            Margin = new Padding(0, 0, 6, 0)
+        };
+        btn.UpdateAutoWidth(18);
+        return btn;
     }
 
     private void ShowAppMenu(LinuxAppDto app, string? inFolderId, Control anchor, Point loc)
@@ -865,7 +1397,7 @@ internal sealed class LauncherForm : Form
                 try
                 {
                     ShortcutManager.CreateStartMenuAppShortcut(_distro, app, alsoTopLevel: true);
-                    SetFooter($"已将 “{app.DisplayName}” 添加到 Windows 开始菜单（可右键固定到开始屏幕或任务栏）。");
+                    ShowToast($"已将 “{app.DisplayName}” 添加到开始菜单");
                 }
                 catch (Exception ex)
                 {
@@ -880,7 +1412,7 @@ internal sealed class LauncherForm : Form
                 try
                 {
                     var path = ShortcutManager.CreateDesktopAppShortcut(_distro, app);
-                    SetFooter($"已创建桌面快捷方式：{Path.GetFileName(path)}");
+                    ShowToast($"已创建桌面快捷方式：{Path.GetFileName(path)}");
                 }
                 catch (Exception ex)
                 {
@@ -903,7 +1435,7 @@ internal sealed class LauncherForm : Form
                 _layout.MoveAppToFolder(app.Id, targetFolder.Id);
                 RenderHomeGrid();
                 if (_openFolderId is not null) RenderFolderModal();
-                SetFooter($"已将 “{app.DisplayName}” 移入 “{targetFolder.Name}”。");
+                ShowToast($"已将 “{app.DisplayName}” 移入 “{targetFolder.Name}”");
             };
             moveSub.DropDownItems.Add(mi);
         }
@@ -919,7 +1451,7 @@ internal sealed class LauncherForm : Form
             var folder = _layout.CreateFolder(name, app.Id);
             RenderHomeGrid();
             if (_openFolderId is not null) RenderFolderModal();
-            SetFooter($"已创建文件夹 “{folder.Name}” 并移入 “{app.DisplayName}”。");
+            ShowToast($"已创建文件夹 “{folder.Name}” 并移入 “{app.DisplayName}”");
         };
         moveSub.DropDownItems.Add(newFolderMove);
         menu.Items.Add(moveSub);
@@ -932,7 +1464,7 @@ internal sealed class LauncherForm : Form
                 _layout.MoveAppToRoot(app.Id);
                 RenderHomeGrid();
                 RenderFolderModal();
-                SetFooter($"已将 “{app.DisplayName}” 移回主桌面。");
+                ShowToast($"已将 “{app.DisplayName}” 移回主桌面");
             };
             menu.Items.Add(moveOut);
         }
@@ -988,7 +1520,7 @@ internal sealed class LauncherForm : Form
                     added++;
                 }
             }
-            SetFooter($"已将文件夹 “{folder.Name}” 内 {added} 个应用添加到 Windows 开始菜单。");
+            ShowToast($"已将文件夹 “{folder.Name}” 内 {added} 个应用添加到开始菜单");
         };
 
         var dissolveItem = new ToolStripMenuItem("解散文件夹（应用移回主桌面）");
@@ -997,7 +1529,7 @@ internal sealed class LauncherForm : Form
             _layout.DissolveFolder(folder.Id);
             if (_openFolderId == folder.Id) CloseFolderOverlay();
             RenderHomeGrid();
-            SetFooter($"已解散文件夹 “{folder.Name}”。");
+            ShowToast($"已解散文件夹 “{folder.Name}”");
         };
 
         menu.Items.AddRange(new ToolStripItem[]
@@ -1019,7 +1551,7 @@ internal sealed class LauncherForm : Form
         {
             _layout.AutoOrganize(_apps);
             RenderHomeGrid();
-            SetFooter("已按类别自动整理桌面文件夹。");
+            ShowToast("已按类别自动整理桌面文件夹");
         };
 
         var appCenterItem = new ToolStripMenuItem("打开 Ubuntu 应用中心");
@@ -1031,9 +1563,12 @@ internal sealed class LauncherForm : Form
         var refreshItem = new ToolStripMenuItem("刷新应用列表");
         refreshItem.Click += async (_, _) => await RefreshAppsAsync(forceRender: true);
 
+        var settingsItem = new ToolStripMenuItem("设置...");
+        settingsItem.Click += (_, _) => OpenSettingsOverlay();
+
         menu.Items.AddRange(new ToolStripItem[]
         {
-            newFolderItem, organizeItem, new ToolStripSeparator(), appCenterItem, customCmdItem, refreshItem
+            newFolderItem, organizeItem, new ToolStripSeparator(), appCenterItem, customCmdItem, refreshItem, new ToolStripSeparator(), settingsItem
         });
         menu.Show(anchor, loc);
     }
@@ -1044,7 +1579,7 @@ internal sealed class LauncherForm : Form
         if (name is null) return;
         _layout.CreateFolder(name);
         RenderHomeGrid();
-        SetFooter($"已创建文件夹 “{name}”，可将应用拖入或右键移入。");
+        ShowToast($"已创建文件夹 “{name}”");
     }
 
     private void PromptRenameCurrentFolder()
@@ -1083,9 +1618,9 @@ internal sealed class LauncherForm : Form
                 MessageBoxIcon.Question);
             if (confirm != DialogResult.Yes) return;
 
-            SetFooter($"正在安装 {app.DisplayName}...");
+            ShowToast($"正在安装 {app.DisplayName}...");
             var (ok, msg) = await ShortcutManager.InstallDebPackageAsync(_distro, app.Cmd);
-            SetFooter(ok ? msg : $"安装失败: {msg}");
+            ShowToast(ok ? msg : $"安装失败: {msg}");
             if (ok)
             {
                 await RefreshAppsAsync(forceRender: true);
@@ -1098,7 +1633,7 @@ internal sealed class LauncherForm : Form
             return;
         }
 
-        SetFooter($"正在启动 {app.DisplayName}...");
+        ShowToast($"正在启动 {app.DisplayName}...");
         var args = new List<string> { "launch", "--ensure-daemon", "--wm-class", app.WmClass, app.Cmd };
         if (app.Args.Count > 0)
         {
@@ -1108,21 +1643,21 @@ internal sealed class LauncherForm : Form
         var (launchOk, launchMsg) = await _ctx.RunControlWithFeedbackAsync(args.ToArray());
         if (launchOk)
         {
-            SetFooter($"已启动 {app.DisplayName}。");
+            ShowToast($"已启动 {app.DisplayName}");
         }
         else
         {
-            SetFooter($"启动 {app.DisplayName} 失败: {launchMsg}");
+            ShowToast($"启动 {app.DisplayName} 失败");
             MessageBox.Show(this, $"启动 {app.DisplayName} 失败：\n{launchMsg}", "FocusStage", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
     private async Task OpenOrInstallAppCenterAsync()
     {
-        _btnAppCenter.Enabled = false;
+        _dockAppCenter.Enabled = false;
         try
         {
-            SetFooter("正在查找 Ubuntu 应用中心...");
+            ShowToast("正在查找 Ubuntu 应用中心...");
             var cmd = await ShortcutManager.FindInstalledAppCenterCommandAsync(_distro);
             if (string.IsNullOrWhiteSpace(cmd))
             {
@@ -1134,15 +1669,15 @@ internal sealed class LauncherForm : Form
                     MessageBoxIcon.Question);
                 if (confirm != DialogResult.Yes)
                 {
-                    SetFooter("已取消安装应用中心。");
+                    ShowToast("已取消安装应用中心");
                     return;
                 }
 
-                SetFooter("正在安装 Ubuntu 应用中心（首次约需 1-2 分钟）...");
+                ShowToast("正在安装 Ubuntu 应用中心（首次约需 1-2 分钟）...");
                 var (instOk, instCmd, instMsg) = await ShortcutManager.InstallAppCenterAsync(_distro);
                 if (!instOk)
                 {
-                    SetFooter($"安装应用中心失败: {instMsg}");
+                    ShowToast("安装应用中心失败");
                     MessageBox.Show(this, $"安装应用中心失败：\n{instMsg}", "FocusStage", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
@@ -1150,9 +1685,9 @@ internal sealed class LauncherForm : Form
                 await RefreshAppsAsync(forceRender: true);
             }
 
-            SetFooter($"正在启动应用中心 ({cmd})...");
+            ShowToast($"正在启动应用中心 ({cmd})...");
             var (ok, msg) = await _ctx.RunControlWithFeedbackAsync("launch", "--ensure-daemon", "--wm-class", $"focusstage-{cmd}", cmd);
-            SetFooter(ok ? $"已打开应用中心 ({cmd})，在其中安装的应用会自动同步到这里。" : $"启动应用中心失败: {msg}");
+            ShowToast(ok ? $"已打开应用中心 ({cmd})" : $"启动应用中心失败");
             if (!ok)
             {
                 MessageBox.Show(this, $"启动应用中心失败：\n{msg}", "FocusStage", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -1160,18 +1695,18 @@ internal sealed class LauncherForm : Form
         }
         finally
         {
-            _btnAppCenter.Enabled = true;
+            _dockAppCenter.Enabled = true;
         }
     }
 
     private async Task HandleSyncStartMenuAsync()
     {
         _btnSyncStartMenu.Enabled = false;
-        SetFooter("正在同步所有 Linux 应用到 Windows 开始菜单...");
+        ShowToast("正在同步所有 Linux 应用到 Windows 开始菜单...");
         try
         {
-            var (ok, msg, _) = await ShortcutManager.SyncAllAsync(_distro, createDesktopForLauncher: true, createStartupTray: _chkStartup.Checked);
-            SetFooter(msg);
+            var (ok, msg, _) = await ShortcutManager.SyncAllAsync(_distro, createDesktopForLauncher: true, createStartupTray: _toggleStartup.Checked);
+            ShowToast(msg);
             MessageBox.Show(
                 this,
                 ok
@@ -1187,105 +1722,19 @@ internal sealed class LauncherForm : Form
         }
     }
 
-    private void RenderStages()
-    {
-        _stagesPanel.SuspendLayout();
-        _stagesPanel.Controls.Clear();
-
-        if (_stages.Count == 0)
-        {
-            _stagesPanel.Controls.Add(MakeHintLabel("当前没有运行中的 Stage。"));
-            _stagesPanel.ResumeLayout();
-            return;
-        }
-
-        int cardWidth = Math.Max(240, _stagesPanel.ClientSize.Width - 16);
-        foreach (var stage in _stages)
-        {
-            var card = new Panel
-            {
-                Width = cardWidth,
-                Height = 84,
-                BackColor = Color.White,
-                Margin = new Padding(0, 0, 0, 8),
-                Padding = new Padding(10)
-            };
-            card.Paint += (_, e) =>
-            {
-                using var pen = new Pen(Color.FromArgb(222, 228, 236));
-                e.Graphics.DrawRectangle(pen, 0, 0, card.Width - 1, card.Height - 1);
-            };
-
-            var title = string.IsNullOrWhiteSpace(stage.Title) ? stage.App : stage.Title;
-            var ownerTag = stage.InputOwner.Type switch
-            {
-                "agent" => $"AI:{stage.InputOwner.AgentName ?? "agent"}",
-                "frozen" => "已冻结",
-                _ => "人类"
-            };
-            var dispTag = stage.Display == "desktop" ? "桌面显示" : "后台运行";
-
-            var lblTitle = new Label
-            {
-                Text = $"[{stage.StageId}] {title}",
-                Font = new Font("Microsoft YaHei UI", 9.0f, FontStyle.Bold),
-                Location = new Point(10, 8),
-                Size = new Size(cardWidth - 20, 20),
-                AutoEllipsis = true
-            };
-            var lblMeta = new Label
-            {
-                Text = $"{dispTag} · {ownerTag} · {stage.Kind}",
-                Font = new Font("Microsoft YaHei UI", 8.1f),
-                ForeColor = Color.FromArgb(100, 116, 139),
-                Location = new Point(10, 29),
-                Size = new Size(cardWidth - 20, 18),
-                AutoEllipsis = true
-            };
-
-            var actions = new FlowLayoutPanel
-            {
-                Location = new Point(8, 50),
-                Size = new Size(cardWidth - 16, 28),
-                WrapContents = false
-            };
-
-            var btnTake = MakeMiniBtn("接管");
-            btnTake.Click += async (_, _) => await _ctx.RunControlAndRefreshAsync("takeover", stage.StageId);
-
-            var btnVis = MakeMiniBtn(stage.Display == "desktop" ? "隐藏" : "显示");
-            btnVis.Click += async (_, _) => await _ctx.RunControlAndRefreshAsync(stage.Display == "desktop" ? "hide" : "show", stage.StageId);
-
-            var btnClose = MakeMiniBtn("关闭");
-            btnClose.ForeColor = Color.FromArgb(185, 28, 28);
-            btnClose.Click += async (_, _) => await _ctx.RunControlAndRefreshAsync("close", stage.StageId);
-
-            actions.Controls.AddRange(new Control[] { btnTake, btnVis, btnClose });
-            card.Controls.AddRange(new Control[] { lblTitle, lblMeta, actions });
-            _stagesPanel.Controls.Add(card);
-        }
-        _stagesPanel.ResumeLayout();
-    }
-
-    private static Button MakeMiniBtn(string text) => new()
-    {
-        Text = text,
-        AutoSize = true,
-        Height = 24,
-        FlatStyle = FlatStyle.System,
-        Font = new Font("Microsoft YaHei UI", 8.1f),
-        Margin = new Padding(0, 0, 6, 0)
-    };
-
     protected override void Dispose(bool disposing)
     {
         if (disposing)
         {
+            _toastTimer.Stop();
+            _toastTimer.Dispose();
             _autoDiscoverTimer.Stop();
             _autoDiscoverTimer.Dispose();
             _debounceTimer.Stop();
             _debounceTimer.Dispose();
             _downloadsWatcher?.Dispose();
+            _toolTip.Dispose();
+            _wallpaper?.Dispose();
             foreach (var img in _iconCache.Values) img.Dispose();
             _iconCache.Clear();
         }
@@ -1293,273 +1742,6 @@ internal sealed class LauncherForm : Form
     }
 
     private sealed record DragAppPayload(string AppId, string? FromFolderId);
-
-    private sealed class BufferedFlowPanel : FlowLayoutPanel
-    {
-        public BufferedFlowPanel()
-        {
-            DoubleBuffered = true;
-            SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
-        }
-    }
-
-    private sealed class RoundedPanel : Panel
-    {
-        public int CornerRadius { get; set; } = 18;
-        public Color FillColor { get; set; } = Color.White;
-        public Color BorderColor { get; set; } = Color.FromArgb(215, 222, 232);
-
-        public RoundedPanel()
-        {
-            DoubleBuffered = true;
-            SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint, true);
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            var rect = new Rectangle(1, 1, Width - 3, Height - 3);
-            using var path = BuildRoundPath(rect, CornerRadius);
-            using var fill = new SolidBrush(FillColor);
-            using var pen = new Pen(BorderColor, 1.2f);
-            e.Graphics.FillPath(fill, path);
-            e.Graphics.DrawPath(pen, path);
-            base.OnPaint(e);
-        }
-    }
-
-    private sealed class DimOverlayPanel : Panel
-    {
-        private Bitmap? _backdrop;
-        public event EventHandler? BackdropClicked;
-
-        public DimOverlayPanel()
-        {
-            DoubleBuffered = true;
-            SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint, true);
-            MouseDown += (_, _) => BackdropClicked?.Invoke(this, EventArgs.Empty);
-        }
-
-        public void CaptureBackdropFrom(Control source)
-        {
-            _backdrop?.Dispose();
-            _backdrop = null;
-            if (source.Width <= 0 || source.Height <= 0) return;
-            try
-            {
-                var bmp = new Bitmap(source.Width, source.Height);
-                source.DrawToBitmap(bmp, new Rectangle(0, 0, source.Width, source.Height));
-                _backdrop = bmp;
-            }
-            catch
-            {
-                _backdrop = null;
-            }
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            if (_backdrop is not null)
-            {
-                e.Graphics.DrawImage(_backdrop, new Rectangle(0, 0, Width, Height));
-            }
-            else
-            {
-                e.Graphics.Clear(Color.FromArgb(220, 228, 238));
-            }
-            using var dim = new SolidBrush(Color.FromArgb(115, 15, 23, 42));
-            e.Graphics.FillRectangle(dim, ClientRectangle);
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                _backdrop?.Dispose();
-                _backdrop = null;
-            }
-            base.Dispose(disposing);
-        }
-    }
-
-    private sealed class DesktopIconTile : Control
-    {
-        private bool _hovered;
-        private bool _isSelected;
-        private bool _isDropTarget;
-
-        public string TileKey { get; set; } = "";
-        public string TitleText { get; set; } = "";
-        public string? SubBadgeText { get; set; }
-        public Image? AppIcon { get; set; }
-        public bool IsFolder { get; set; }
-        public List<Image> FolderPreviewIcons { get; set; } = new();
-
-        public bool IsSelected
-        {
-            get => _isSelected;
-            set { _isSelected = value; Invalidate(); }
-        }
-
-        public bool IsDropTarget
-        {
-            get => _isDropTarget;
-            set { _isDropTarget = value; Invalidate(); }
-        }
-
-        public DesktopIconTile()
-        {
-            Size = new Size(108, 114);
-            Margin = new Padding(8, 8, 8, 10);
-            Cursor = Cursors.Hand;
-            SetStyle(
-                ControlStyles.OptimizedDoubleBuffer
-                | ControlStyles.AllPaintingInWmPaint
-                | ControlStyles.UserPaint
-                | ControlStyles.SupportsTransparentBackColor
-                | ControlStyles.StandardDoubleClick,
-                true);
-            BackColor = Color.Transparent;
-        }
-
-        protected override void OnMouseEnter(EventArgs e)
-        {
-            _hovered = true;
-            Invalidate();
-            base.OnMouseEnter(e);
-        }
-
-        protected override void OnMouseLeave(EventArgs e)
-        {
-            _hovered = false;
-            Invalidate();
-            base.OnMouseLeave(e);
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            var g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-
-            // Outer hover / selection pill
-            if (_isSelected || _hovered || _isDropTarget)
-            {
-                var tileRect = new Rectangle(2, 2, Width - 5, Height - 5);
-                using var tilePath = BuildRoundPath(tileRect, 14);
-                var bg = _isDropTarget
-                    ? Color.FromArgb(219, 234, 254)
-                    : _isSelected
-                        ? Color.FromArgb(224, 236, 255)
-                        : Color.FromArgb(232, 238, 247);
-                using var bgBrush = new SolidBrush(bg);
-                g.FillPath(bgBrush, tilePath);
-
-                if (_isSelected || _isDropTarget)
-                {
-                    using var borderPen = new Pen(Color.FromArgb(59, 130, 246), 1.6f);
-                    g.DrawPath(borderPen, tilePath);
-                }
-            }
-
-            // Icon squircle (64x64 centered at top)
-            var boxRect = new Rectangle((Width - 64) / 2, 8, 64, 64);
-            using var boxPath = BuildRoundPath(boxRect, 16);
-
-            if (IsFolder)
-            {
-                using var folderBg = new SolidBrush(Color.FromArgb(226, 234, 246));
-                using var folderBorder = new Pen(Color.FromArgb(191, 206, 226), 1.2f);
-                g.FillPath(folderBg, boxPath);
-                g.DrawPath(folderBorder, boxPath);
-
-                // Draw 2x2 mini icons inside folder squircle
-                int miniSize = 22;
-                int gap = 4;
-                int startX = boxRect.X + (boxRect.Width - (miniSize * 2 + gap)) / 2;
-                int startY = boxRect.Y + (boxRect.Height - (miniSize * 2 + gap)) / 2;
-                for (int idx = 0; idx < 4; idx++)
-                {
-                    int col = idx % 2;
-                    int row = idx / 2;
-                    var mr = new Rectangle(startX + col * (miniSize + gap), startY + row * (miniSize + gap), miniSize, miniSize);
-                    if (idx < FolderPreviewIcons.Count)
-                    {
-                        g.DrawImage(FolderPreviewIcons[idx], mr);
-                    }
-                    else
-                    {
-                        using var slotPath = BuildRoundPath(mr, 5);
-                        using var slotBrush = new SolidBrush(Color.FromArgb(207, 218, 234));
-                        g.FillPath(slotBrush, slotPath);
-                    }
-                }
-            }
-            else
-            {
-                using var appBg = new SolidBrush(Color.White);
-                using var appBorder = new Pen(Color.FromArgb(218, 226, 237), 1.0f);
-                g.FillPath(appBg, boxPath);
-                g.DrawPath(appBorder, boxPath);
-
-                if (AppIcon is not null)
-                {
-                    var iconRect = new Rectangle(boxRect.X + 10, boxRect.Y + 10, 44, 44);
-                    g.DrawImage(AppIcon, iconRect);
-                }
-            }
-
-            // Optional mini badge (count for folders, DEB/APP for downloads)
-            if (!string.IsNullOrWhiteSpace(SubBadgeText))
-            {
-                using var badgeFont = new Font("Microsoft YaHei UI", 7.0f, FontStyle.Bold);
-                var sz = g.MeasureString(SubBadgeText, badgeFont);
-                int bw = Math.Max(18, (int)Math.Ceiling(sz.Width) + 8);
-                int bh = 16;
-                var br = new Rectangle(boxRect.Right - bw + 4, boxRect.Top - 2, bw, bh);
-                using var bp = BuildRoundPath(br, 8);
-                var badgeColor = IsFolder
-                    ? Color.FromArgb(71, 85, 105)
-                    : SubBadgeText == "DEB"
-                        ? Color.FromArgb(217, 119, 6)
-                        : Color.FromArgb(16, 163, 127);
-                using var bb = new SolidBrush(badgeColor);
-                using var bf = new SolidBrush(Color.White);
-                using var bsf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-                g.FillPath(bb, bp);
-                g.DrawString(SubBadgeText, badgeFont, bf, br, bsf);
-            }
-
-            // Label underneath icon
-            var textRect = new Rectangle(4, boxRect.Bottom + 5, Width - 8, Height - boxRect.Bottom - 7);
-            using var labelFont = new Font("Microsoft YaHei UI", 8.5f, FontStyle.Regular);
-            using var labelBrush = new SolidBrush(Color.FromArgb(30, 41, 59));
-            using var sf = new StringFormat
-            {
-                Alignment = StringAlignment.Center,
-                LineAlignment = StringAlignment.Near,
-                Trimming = StringTrimming.EllipsisCharacter
-            };
-            g.DrawString(TitleText, labelFont, labelBrush, textRect, sf);
-        }
-    }
-
-    private static GraphicsPath BuildRoundPath(Rectangle rect, int radius)
-    {
-        int d = Math.Min(radius * 2, Math.Min(rect.Width, rect.Height));
-        var path = new GraphicsPath();
-        if (d <= 0)
-        {
-            path.AddRectangle(rect);
-            return path;
-        }
-        path.AddArc(rect.X, rect.Y, d, d, 180, 90);
-        path.AddArc(rect.Right - d, rect.Y, d, d, 270, 90);
-        path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0, 90);
-        path.AddArc(rect.X, rect.Bottom - d, d, d, 90, 90);
-        path.CloseFigure();
-        return path;
-    }
 
     private static class PromptDialog
     {
@@ -1585,16 +1767,8 @@ internal sealed class LauncherForm : Form
             };
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
 
-            var lbl = new Label
-            {
-                Text = prompt,
-                AutoSize = true
-            };
-            var tb = new TextBox
-            {
-                Text = defaultValue,
-                Dock = DockStyle.Fill
-            };
+            var lbl = new Label { Text = prompt, AutoSize = true };
+            var tb = new TextBox { Text = defaultValue, Dock = DockStyle.Fill };
             tb.SelectAll();
 
             var buttons = new FlowLayoutPanel
@@ -1606,18 +1780,8 @@ internal sealed class LauncherForm : Form
                 WrapContents = false,
                 Margin = new Padding(0)
             };
-            var cancel = new Button
-            {
-                Text = "取消",
-                AutoSize = true,
-                DialogResult = DialogResult.Cancel
-            };
-            var ok = new Button
-            {
-                Text = "确定",
-                AutoSize = true,
-                DialogResult = DialogResult.OK
-            };
+            var cancel = new Button { Text = "取消", AutoSize = true, DialogResult = DialogResult.Cancel };
+            var ok = new Button { Text = "确定", AutoSize = true, DialogResult = DialogResult.OK };
             buttons.Controls.Add(cancel);
             buttons.Controls.Add(ok);
 

@@ -594,7 +594,7 @@ internal sealed class FocusStageTrayContext : ApplicationContext
         await RefreshAndRebuildMenuAsync();
     }
 
-    private async Task RefreshAndRebuildMenuAsync()
+    public async Task RefreshAndRebuildMenuAsync()
     {
         await RefreshStateAsync();
         BuildMenu();
