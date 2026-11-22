@@ -63,33 +63,45 @@ WSL2
 
 ## 快速开始
 
-### 1. 构建并安装 WSL2 端（`focusstaged` + `focusstage`）
+### 1. 一键安装（推荐）
 
-```bash
-CARGO_TARGET_DIR=$HOME/.cache/focusstage-target cargo build --workspace
-sudo cp $HOME/.cache/focusstage-target/debug/focusstaged /usr/local/bin/focusstaged
-sudo cp $HOME/.cache/focusstage-target/debug/focusstage /usr/local/bin/focusstage
+在 Windows PowerShell 中运行安装器，会自动构建并安装 WSL2 端（`focusstaged` / `focusstage` / `focusstage-launch`）、发布 Windows 启动器与托盘程序 `FocusStage.exe` 到 `%LOCALAPPDATA%\FocusStage`，并同步所有 Linux 应用到 Windows 开始菜单及桌面入口：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/install.ps1
 ```
 
-### 2. 启动合成器与使用 CLI / MCP
+安装完成后：
+- 双击桌面或开始菜单中的 **FocusStage** 打开统一应用启动器（关闭窗口会自动缩回右下角托盘）。
+- 开始菜单 `Programs\FocusStage\` 下会自动生成全部 Linux 应用的独立快捷方式（带图标），可右键“固定到开始屏幕”或“固定到任务栏”。
+- 如需卸载可运行 `powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1`。
+
+### 2. 手动构建与 CLI / MCP 用法
 
 ```bash
-# 启动带 WSLg 窗口呈现的合成器（无头调试可加 --headless）
-focusstaged
+cargo build --workspace --release
+sudo install -m 755 target/release/focusstaged /usr/local/bin/focusstaged
+sudo install -m 755 target/release/focusstage /usr/local/bin/focusstage
+sudo install -m 755 scripts/focusstage-launch /usr/local/bin/focusstage-launch
 
-# 启动不同类型 Stage
-focusstage launch foot
-focusstage launch --kind x11 xterm
-focusstage launch --kind chromium chromium
+# 为每个 Linux 应用生成 FocusStage 桌面入口，使 Win11 开始菜单 / 任务栏固定直接走 FocusStage
+sudo focusstage sync-apps
+
+# 列出已发现的 Linux GUI 应用（含图标路径）
+focusstage --json list-apps
+
+# 启动不同类型 Stage（加 --ensure-daemon 自动拉起守护进程）
+focusstage launch --ensure-daemon foot
+focusstage launch --ensure-daemon --kind x11 xterm
+focusstage launch --ensure-daemon --kind chromium chromium
 
 # MCP 客户端配置（stdio）
 wsl.exe -d Ubuntu -e focusstage mcp
 ```
 
-### 3. 构建并运行 Windows 11 托盘（`FocusStageTray`）
+### 3. 运行 Windows 11 启动器与托盘（`FocusStage.exe`）
 
 ```powershell
-dotnet build tray/FocusStageTray.csproj -c Release
 dotnet run --project tray/FocusStageTray.csproj -c Release
 ```
 

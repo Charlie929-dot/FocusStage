@@ -10,16 +10,31 @@ use smithay::backend::renderer::utils::draw_render_elements;
 use smithay::backend::renderer::{
     Bind, Color32F, ExportMem, Frame, Offscreen, Renderer,
 };
-use smithay::desktop::{PopupKind, PopupManager};
+use smithay::desktop::PopupManager;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::compositor::{
-    with_surface_tree_downward, SurfaceAttributes, TraversalAction,
+    with_surface_tree_downward, with_states, SurfaceAttributes, TraversalAction,
 };
+use smithay::wayland::shell::xdg::SurfaceCachedState;
 
 use crate::stage::{Stage, StageToplevel};
+
+/// Return the Wayland toplevel's `xdg_surface.set_window_geometry` top-left offset
+/// (non-zero for CSD clients with drop shadows around the main buffer).
+pub fn wayland_window_geometry_loc(surface: &WlSurface) -> Point<i32, smithay::utils::Logical> {
+    with_states(surface, |states| {
+        states
+            .cached_state
+            .get::<SurfaceCachedState>()
+            .current()
+            .geometry
+            .map(|geo| geo.loc)
+    })
+    .unwrap_or_default()
+}
 
 pub struct OffscreenCore {
     pub renderer: PixmanRenderer,
@@ -94,16 +109,11 @@ impl OffscreenCore {
                 StageToplevel::Wayland(wl_tl) => {
                     let root = wl_tl.wl_surface();
                     let popups: Vec<_> = PopupManager::popups_for_surface(root).collect();
-                    // Push popups in reverse so topmost popup is first
-                    for (popup, popup_loc) in popups.into_iter().rev() {
+                    // PopupManager yields topmost child popups before their parents, matching
+                    // draw_render_elements' front-to-back order (elements[0] is topmost).
+                    for (popup, popup_loc) in popups {
                         let psurf = popup.wl_surface();
-                        let p_geo_loc = match popup {
-                            PopupKind::Xdg(ref xdg) => {
-                                let geo = xdg.with_pending_state(|s| s.geometry);
-                                popup_loc - geo.loc
-                            }
-                            PopupKind::InputMethod(_) => popup_loc,
-                        };
+                        let p_geo_loc = popup_loc - popup.geometry().loc;
                         let loc_phys = Point::<i32, Physical>::from((
                             ((p_geo_loc.x as f64) * scale).round() as i32,
                             ((p_geo_loc.y as f64) * scale).round() as i32,
@@ -119,10 +129,15 @@ impl OffscreenCore {
                         elements.append(&mut popup_elems);
                     }
 
+                    let geo_loc = wayland_window_geometry_loc(root);
+                    let root_loc_phys = Point::<i32, Physical>::from((
+                        (-(geo_loc.x as f64) * scale).round() as i32,
+                        (-(geo_loc.y as f64) * scale).round() as i32,
+                    ));
                     let mut main_elems = render_elements_from_surface_tree(
                         &mut self.renderer,
                         root,
-                        (0, 0),
+                        root_loc_phys,
                         Scale::from(scale),
                         1.0,
                         Kind::Unspecified,

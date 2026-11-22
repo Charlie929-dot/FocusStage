@@ -14,8 +14,7 @@ use tracing::{info, warn};
 use crate::protocol::{
     ActStatus, ControlRequest, ControlResponse, DisplayState, InputOwner, SavedRect,
 };
-use crate::router::{InputSource, PendingActJob};
-use crate::sink::DisplaySink;
+use crate::router::{InputSource, PendingActJob, SettleState};
 use crate::stage::{Lease, StageToplevel};
 use crate::state::FocusStageState;
 
@@ -189,6 +188,7 @@ impl FocusStageState {
                 width,
                 height,
                 show_on_desktop,
+                wm_class,
             } => {
                 let resp = match self.launch_stage(
                     app,
@@ -199,6 +199,7 @@ impl FocusStageState {
                     width,
                     height,
                     show_on_desktop,
+                    wm_class,
                 ) {
                     Ok((stage_id, pid)) => ControlResponse::Launched { stage_id, pid },
                     Err(e) => ControlResponse::Error {
@@ -540,6 +541,7 @@ impl FocusStageState {
                         remaining,
                         executed_steps,
                         wait_until: Some(Instant::now() + dur),
+                        settling: None,
                         reply_tx,
                     });
                     return;
@@ -558,6 +560,27 @@ impl FocusStageState {
                     return;
                 }
             }
+        }
+
+        if executed_steps > 0 {
+            let cur_seq = self.stages.get(&stage_id).map(|s| s.frame_seq).unwrap_or(0);
+            let now = Instant::now();
+            self.pending_act_jobs.push(PendingActJob {
+                stage_id,
+                lease_id,
+                remaining,
+                executed_steps,
+                wait_until: None,
+                settling: Some(SettleState {
+                    initial_seq: cur_seq,
+                    last_seq: cur_seq,
+                    quiet_since: now,
+                    started_at: now,
+                    deadline: now + Duration::from_millis(1200),
+                }),
+                reply_tx,
+            });
+            return;
         }
 
         let frame_seq = self.stages.get(&stage_id).map(|s| s.frame_seq).unwrap_or(0);
@@ -628,7 +651,7 @@ impl FocusStageState {
                 }
             }
             DisplayState::Desktop => {
-                let (title, rect) = {
+                let (title, wm_class, rect) = {
                     let stage = self.stages.get(stage_id).unwrap();
                     let rect = stage.saved_rect.unwrap_or(SavedRect {
                         x: 100,
@@ -636,10 +659,10 @@ impl FocusStageState {
                         width: stage.logical_size.w.max(1) as u32,
                         height: stage.logical_size.h.max(1) as u32,
                     });
-                    (stage.title.clone(), rect)
+                    (stage.title.clone(), stage.wm_class.clone(), rect)
                 };
                 if let Some(ref mut sink) = self.wslg_sink {
-                    sink.show(stage_id, &title, rect);
+                    sink.show(stage_id, &title, &wm_class, rect);
                 }
                 if let Some(stage) = self.stages.get_mut(stage_id) {
                     stage.dirty_for_sink = true;

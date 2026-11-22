@@ -8,6 +8,7 @@ use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::calloop::LoopHandle;
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_seat, wl_surface::WlSurface};
@@ -18,6 +19,7 @@ use smithay::wayland::compositor::{
     CompositorClientState, CompositorHandler, CompositorState,
 };
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
@@ -30,8 +32,8 @@ use smithay::xwayland::xwm::XwmId;
 use smithay::xwayland::{X11Surface, X11Wm, XWaylandClientData};
 use smithay::{
     delegate_compositor, delegate_output, delegate_seat, delegate_shm,
-    delegate_single_pixel_buffer, delegate_viewporter, delegate_xdg_shell,
-    delegate_xwayland_shell,
+    delegate_single_pixel_buffer, delegate_viewporter, delegate_xdg_decoration,
+    delegate_xdg_shell, delegate_xwayland_shell,
 };
 use tracing::{debug, info};
 
@@ -41,6 +43,7 @@ use crate::offscreen::OffscreenCore;
 use crate::protocol::{DisplayState, StageKind};
 use crate::router::{PendingActJob, StageTextInputManagerState};
 use crate::sink::wslg::WslgSink;
+use crate::sink::wslg_wayland::WslgWaylandSink;
 use crate::sink::DisplaySink;
 use crate::stage::{Stage, StageToplevel};
 
@@ -71,6 +74,7 @@ pub struct FocusStageState {
 
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    pub xdg_decoration_state: XdgDecorationState,
     pub shm_state: ShmState,
     pub seat_state: SeatState<Self>,
     pub output_manager_state: OutputManagerState,
@@ -97,7 +101,7 @@ pub struct FocusStageState {
 
     pub pending_act_jobs: Vec<PendingActJob>,
     pub a11y: A11yCollector,
-    pub wslg_sink: Option<WslgSink>,
+    pub wslg_sink: Option<Box<dyn DisplaySink>>,
     pub should_quit: bool,
 }
 
@@ -113,6 +117,7 @@ impl FocusStageState {
     ) -> Self {
         let compositor_state = CompositorState::new::<Self>(dh);
         let xdg_shell_state = XdgShellState::new::<Self>(dh);
+        let xdg_decoration_state = XdgDecorationState::new::<Self>(dh);
         let shm_state = ShmState::new::<Self>(dh, vec![]);
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(dh, "seat-0");
@@ -129,19 +134,27 @@ impl FocusStageState {
         let (clipboard_update_tx, clipboard_update_rx) = mpsc::channel();
         let a11y = A11yCollector::spawn();
 
-        let wslg_sink = if enable_wslg {
-            let disp = std::env::var("WSLG_DISPLAY")
-                .ok()
-                .or_else(|| std::env::var("DISPLAY").ok());
-            match disp.as_deref() {
-                Some(d) if !d.is_empty() => match WslgSink::connect(Some(d)) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        info!("WSLg sink unavailable ({}): running headless", e);
-                        None
+        let wslg_sink: Option<Box<dyn DisplaySink>> = if enable_wslg {
+            match WslgWaylandSink::connect() {
+                Ok(ws) => Some(Box::new(ws)),
+                Err(wl_err) => {
+                    let disp = std::env::var("WSLG_DISPLAY")
+                        .ok()
+                        .or_else(|| std::env::var("DISPLAY").ok());
+                    match disp.as_deref() {
+                        Some(d) if !d.is_empty() => match WslgSink::connect(Some(d)) {
+                            Ok(s) => Some(Box::new(s)),
+                            Err(e) => {
+                                info!("WSLg sink unavailable (wl: {}, x11: {}): running headless", wl_err, e);
+                                None
+                            }
+                        },
+                        _ => {
+                            info!("WSLg sink unavailable (wl: {}): running headless", wl_err);
+                            None
+                        }
                     }
-                },
-                _ => None,
+                }
             }
         } else {
             None
@@ -156,6 +169,7 @@ impl FocusStageState {
             default_scale,
             compositor_state,
             xdg_shell_state,
+            xdg_decoration_state,
             shm_state,
             seat_state,
             output_manager_state,
@@ -285,6 +299,7 @@ impl XdgShellHandler for FocusStageState {
 
         let mut show_rect = None;
         let mut show_title = String::new();
+        let mut show_wm_class = String::new();
         if let Some(stage) = self.stages.get_mut(&stage_id) {
             stage.wayland_clients.insert(client.id(), client.clone());
             stage.toplevels.push(StageToplevel::Wayland(surface.clone()));
@@ -292,6 +307,7 @@ impl XdgShellHandler for FocusStageState {
             if stage.display == DisplayState::Desktop {
                 show_rect = stage.saved_rect;
                 show_title = stage.title.clone();
+                show_wm_class = stage.wm_class.clone();
             }
         }
 
@@ -299,7 +315,7 @@ impl XdgShellHandler for FocusStageState {
         self.ensure_virtual_focus(&stage_id);
 
         if let (Some(ref mut sink), Some(rect)) = (&mut self.wslg_sink, show_rect) {
-            sink.show(&stage_id, &show_title, rect);
+            sink.show(&stage_id, &show_title, &show_wm_class, rect);
         }
     }
 
@@ -358,6 +374,81 @@ impl XdgShellHandler for FocusStageState {
             }
         }
     }
+
+    fn move_request(&mut self, surface: ToplevelSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
+        if let Some(client) = surface.wl_surface().client() {
+            if let Some(stage_id) = self.stage_id_for_client(&client.id()) {
+                if let Some(ref mut sink) = self.wslg_sink {
+                    sink.begin_move(&stage_id);
+                }
+            }
+        }
+    }
+
+    fn resize_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _seat: wl_seat::WlSeat,
+        _serial: Serial,
+        edges: xdg_toplevel::ResizeEdge,
+    ) {
+        let dir = match edges {
+            xdg_toplevel::ResizeEdge::TopLeft => 0,
+            xdg_toplevel::ResizeEdge::Top => 1,
+            xdg_toplevel::ResizeEdge::TopRight => 2,
+            xdg_toplevel::ResizeEdge::Right => 3,
+            xdg_toplevel::ResizeEdge::BottomRight => 4,
+            xdg_toplevel::ResizeEdge::Bottom => 5,
+            xdg_toplevel::ResizeEdge::BottomLeft => 6,
+            xdg_toplevel::ResizeEdge::Left => 7,
+            _ => return,
+        };
+        if let Some(client) = surface.wl_surface().client() {
+            if let Some(stage_id) = self.stage_id_for_client(&client.id()) {
+                if let Some(ref mut sink) = self.wslg_sink {
+                    sink.begin_resize(&stage_id, dir);
+                }
+            }
+        }
+    }
+
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(client) = surface.wl_surface().client() {
+            if let Some(stage_id) = self.stage_id_for_client(&client.id()) {
+                if let Some(ref mut sink) = self.wslg_sink {
+                    sink.minimize(&stage_id);
+                }
+            }
+        }
+    }
+
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        surface.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Maximized);
+        });
+        surface.send_configure();
+        if let Some(client) = surface.wl_surface().client() {
+            if let Some(stage_id) = self.stage_id_for_client(&client.id()) {
+                if let Some(ref mut sink) = self.wslg_sink {
+                    sink.set_maximized(&stage_id, true);
+                }
+            }
+        }
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        surface.with_pending_state(|state| {
+            state.states.unset(xdg_toplevel::State::Maximized);
+        });
+        surface.send_configure();
+        if let Some(client) = surface.wl_surface().client() {
+            if let Some(stage_id) = self.stage_id_for_client(&client.id()) {
+                if let Some(ref mut sink) = self.wslg_sink {
+                    sink.set_maximized(&stage_id, false);
+                }
+            }
+        }
+    }
 }
 
 impl ShmHandler for FocusStageState {
@@ -381,8 +472,36 @@ impl SeatHandler for FocusStageState {
     fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
 }
 
+impl XdgDecorationHandler for FocusStageState {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ClientSide);
+        });
+        toplevel.send_configure();
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
+        let chosen = match mode {
+            DecorationMode::ClientSide | DecorationMode::ServerSide => DecorationMode::ClientSide,
+            _ => DecorationMode::ClientSide,
+        };
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(chosen);
+        });
+        toplevel.send_configure();
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ClientSide);
+        });
+        toplevel.send_configure();
+    }
+}
+
 delegate_compositor!(FocusStageState);
 delegate_xdg_shell!(FocusStageState);
+delegate_xdg_decoration!(FocusStageState);
 delegate_shm!(FocusStageState);
 delegate_seat!(FocusStageState);
 delegate_output!(FocusStageState);

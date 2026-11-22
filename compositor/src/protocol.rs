@@ -62,6 +62,8 @@ pub struct StageInfo {
     pub frame_seq: u64,
     pub has_surface: bool,
     pub scale: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wm_class: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +174,8 @@ pub enum ControlRequest {
         height: Option<u32>,
         #[serde(default)]
         show_on_desktop: Option<bool>,
+        #[serde(default)]
+        wm_class: Option<String>,
     },
     Close {
         stage_id: String,

@@ -17,8 +17,9 @@ smithay = { version = "0.7.0", default-features = false, features = [
     "xwayland",
     "x11rb_event_source",
 ] }
-wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
+wayland-protocols = { version = "0.32", features = ["server", "client", "staging", "unstable"] }
 wayland-server = "0.31"
+wayland-client = "0.31"
 x11rb = { version = "0.14", features = ["allow-unsafe-code", "xfixes"] }
 xkbcommon = { version = "0.8", features = ["wayland"] }
 drm-fourcc = "2.2"

@@ -6,7 +6,7 @@
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <AssemblyName>FocusStageTray</AssemblyName>
+    <AssemblyName>FocusStage</AssemblyName>
     <RootNamespace>FocusStageTray</RootNamespace>
   </PropertyGroup>
 

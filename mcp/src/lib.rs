@@ -221,6 +221,7 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
             let height = args.get("height").and_then(|v| v.as_u64()).map(|n| n as u32);
             let show_on_desktop = args.get("show_on_desktop").and_then(|v| v.as_bool());
             let cwd = args.get("cwd").and_then(|v| v.as_str()).map(String::from);
+            let wm_class = args.get("wm_class").and_then(|v| v.as_str()).map(String::from);
 
             let req = ControlRequest::Launch {
                 app,
@@ -231,6 +232,7 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
                 width,
                 height,
                 show_on_desktop,
+                wm_class,
             };
             match client.call(&req) {
                 Ok(ControlResponse::Launched { stage_id, pid }) => {
@@ -322,7 +324,7 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
             let follow_observe = args
                 .get("observe")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .unwrap_or(true);
             let som_enabled = args.get("som").and_then(|v| v.as_bool()).unwrap_or(true);
 
             match client.call(&ControlRequest::Act {
@@ -558,16 +560,38 @@ fn observe_with_som(
     }
 }
 
-fn merge_act_and_observe(act_meta: Value, obs: Value) -> Value {
+fn merge_act_and_observe(mut act_meta: Value, obs: Value) -> Value {
     let is_err = obs.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
-    let mut content = vec![json!({
-        "type": "text",
-        "text": serde_json::to_string(&act_meta).unwrap()
-    })];
+    let mut content = Vec::new();
+    let mut image_item: Option<Value> = None;
+
     if let Some(arr) = obs.get("content").and_then(|v| v.as_array()) {
         for item in arr {
-            content.push(item.clone());
+            let kind = item.get("type").and_then(|v| v.as_str());
+            if kind == Some("image") {
+                image_item = Some(item.clone());
+            } else if kind == Some("text") {
+                if let Some(txt) = item.get("text").and_then(|v| v.as_str()) {
+                    if let Ok(Value::Object(obs_map)) = serde_json::from_str::<Value>(txt) {
+                        if let Some(act_map) = act_meta.as_object_mut() {
+                            for (k, v) in obs_map {
+                                act_map.insert(k, v);
+                            }
+                            continue;
+                        }
+                    }
+                    act_meta["observe_message"] = Value::String(txt.to_string());
+                }
+            }
         }
+    }
+
+    content.push(json!({
+        "type": "text",
+        "text": serde_json::to_string(&act_meta).unwrap()
+    }));
+    if let Some(img) = image_item {
+        content.push(img);
     }
     json!({ "content": content, "isError": is_err })
 }
@@ -936,7 +960,8 @@ fn mcp_tools_schema() -> Vec<Value> {
                     "cwd": { "type": "string" },
                     "width": { "type": "integer" },
                     "height": { "type": "integer" },
-                    "show_on_desktop": { "type": "boolean" }
+                    "show_on_desktop": { "type": "boolean" },
+                    "wm_class": { "type": "string", "description": "Optional WM_CLASS override for WSLg window grouping/icon matching" }
                 },
                 "required": ["app"]
             }
@@ -984,13 +1009,13 @@ fn mcp_tools_schema() -> Vec<Value> {
         }),
         json!({
             "name": "stage_act",
-            "description": "Execute a sequence of input actions on a leased Stage. Targets accept MarkScreen 2-letter mark codes from stage_observe (e.g. 'AE', case-insensitive, or 'P3'), [x, y] Stage logical coordinates, or explicit x/y fields. Supports click (with clicks=2/button), double_click, move/hover, drag (from/to or by), scroll (direction up/down/left/right or dx/dy), key (single key or chord like 'Ctrl+A' or array), type_text/type (with optional target click, mode='cover', send=true), and wait/sleep.",
+            "description": "Execute a sequence of input actions on a leased Stage, wait for UI settle, and automatically return a fresh SoM-annotated screenshot by default (set observe=false to skip). Targets accept MarkScreen 2-letter mark codes from stage_observe (e.g. 'AE', case-insensitive, or 'P3'), [x, y] Stage logical coordinates, or explicit x/y fields. Supports click (with clicks=2/button), double_click, move/hover, drag (from/to or by), scroll (direction up/down/left/right or dx/dy), key (single key or chord like 'Ctrl+A' or array), type_text/type (with optional target click, mode='cover', send=true), and wait/sleep.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "lease": { "type": "string" },
                     "based_on": { "type": "integer", "description": "Optional frame_seq for stale-frame guard" },
-                    "observe": { "type": "boolean", "default": false, "description": "If true, immediately capture and return a fresh SoM-annotated screenshot after executing actions" },
+                    "observe": { "type": "boolean", "default": true, "description": "Wait for UI settle and return a fresh SoM-annotated screenshot after executing actions (default true; pass false to skip)" },
                     "som": { "type": "boolean", "default": true },
                     "actions": {
                         "type": "array",

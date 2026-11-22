@@ -1,4 +1,5 @@
 pub mod wslg;
+pub mod wslg_wayland;
 
 use crate::protocol::SavedRect;
 
@@ -49,10 +50,15 @@ pub enum SinkInputEvent {
 }
 
 pub trait DisplaySink {
-    fn show(&mut self, stage_id: &str, title: &str, rect: SavedRect);
+    fn show(&mut self, stage_id: &str, title: &str, wm_class: &str, rect: SavedRect);
     fn hide(&mut self, stage_id: &str) -> Option<SavedRect>;
     fn destroy(&mut self, stage_id: &str);
     fn present(&mut self, stage_id: &str, width: u32, height: u32, bgra: &[u8]);
     fn set_title(&mut self, stage_id: &str, title: &str);
+    fn begin_move(&mut self, _stage_id: &str) {}
+    fn begin_resize(&mut self, _stage_id: &str, _direction: u32) {}
+    fn minimize(&mut self, _stage_id: &str) {}
+    fn set_maximized(&mut self, _stage_id: &str, _maximized: bool) {}
+    fn set_host_clipboard(&mut self, _text: &str) {}
     fn poll_events(&mut self) -> Vec<SinkInputEvent>;
 }

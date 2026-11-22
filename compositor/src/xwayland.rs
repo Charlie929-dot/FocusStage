@@ -12,7 +12,6 @@ use tracing::{debug, info, warn};
 
 use crate::clipboard::pick_text_mime;
 use crate::protocol::DisplayState;
-use crate::sink::DisplaySink;
 use crate::stage::StageToplevel;
 use crate::state::FocusStageState;
 
@@ -98,12 +97,12 @@ impl XwmHandler for FocusStageState {
         }
         if need_show {
             if let (Some(ref mut sink), Some(r)) = (&mut self.wslg_sink, rect) {
-                let t = self
+                let (t, cls) = self
                     .stages
                     .get(&stage_id)
-                    .map(|s| s.title.clone())
+                    .map(|s| (s.title.clone(), s.wm_class.clone()))
                     .unwrap_or_default();
-                sink.show(&stage_id, &t, r);
+                sink.show(&stage_id, &t, &cls, r);
             }
         }
         self.ensure_virtual_focus(&stage_id);
@@ -259,6 +258,12 @@ impl XwmHandler for FocusStageState {
                 }
             }
         }
+    }
+
+    fn disconnected(&mut self, xwm: XwmId) {
+        self.xwms.remove(&xwm);
+        self.xwm_to_stage.remove(&xwm);
+        self.x11_override_windows.remove(&xwm);
     }
 }
 

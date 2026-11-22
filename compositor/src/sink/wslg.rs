@@ -21,6 +21,12 @@ x11rb::atom_manager! {
         WM_PROTOCOLS,
         WM_DELETE_WINDOW,
         WM_NORMAL_HINTS,
+        WM_CHANGE_STATE,
+        _MOTIF_WM_HINTS,
+        _NET_WM_MOVERESIZE,
+        _NET_WM_STATE,
+        _NET_WM_STATE_MAXIMIZED_VERT,
+        _NET_WM_STATE_MAXIMIZED_HORZ,
         UTF8_STRING,
         CLIPBOARD,
         TARGETS,
@@ -142,7 +148,40 @@ impl WslgSink {
         let _ = self.conn.flush();
     }
 
-    fn ensure_proxy_window(&mut self, stage_id: &str, title: &str, rect: SavedRect) -> Result<Window, String> {
+    fn send_net_wm_moveresize(&self, stage_id: &str, direction: u32) {
+        let Some(pw) = self.windows.get(stage_id) else {
+            return;
+        };
+        let (root_x, root_y) = match self.conn.query_pointer(self.root).ok().and_then(|c| c.reply().ok()) {
+            Some(r) => (r.root_x as i32 as u32, r.root_y as i32 as u32),
+            None => (
+                (pw.rect.x + (pw.rect.width as i32 / 2)) as u32,
+                (pw.rect.y + 12) as u32,
+            ),
+        };
+        let _ = self.conn.ungrab_pointer(x11rb::CURRENT_TIME);
+        let msg = ClientMessageEvent::new(
+            32,
+            pw.window,
+            self.atoms._NET_WM_MOVERESIZE,
+            [root_x, root_y, direction, 1, 1],
+        );
+        let _ = self.conn.send_event(
+            false,
+            self.root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            msg,
+        );
+        let _ = self.conn.flush();
+    }
+
+    fn ensure_proxy_window(
+        &mut self,
+        stage_id: &str,
+        title: &str,
+        wm_class: &str,
+        rect: SavedRect,
+    ) -> Result<Window, String> {
         if let Some(existing) = self.windows.get(stage_id) {
             return Ok(existing.window);
         }
@@ -189,13 +228,19 @@ impl WslgSink {
             &[self.atoms.WM_DELETE_WINDOW],
         );
 
-        // Set WM_CLASS = "focusstage\0FocusStage\0"
+        // Set WM_CLASS = "<instance>\0<class>\0" so WSLg RAIL binds per-app icon, grouping, and pinning
+        let cls = if wm_class.trim().is_empty() {
+            "FocusStage"
+        } else {
+            wm_class.trim()
+        };
+        let wm_class_prop = format!("{cls}\0{cls}\0");
         let _ = self.conn.change_property8(
             PropMode::REPLACE,
             win,
             AtomEnum::WM_CLASS,
             AtomEnum::STRING,
-            b"focusstage\0FocusStage\0",
+            wm_class_prop.as_bytes(),
         );
 
         // Advertise XdndAware version 5
@@ -205,6 +250,16 @@ impl WslgSink {
             self.atoms.XdndAware,
             AtomEnum::ATOM,
             &[5],
+        );
+
+        // Request borderless/undecorated window from WSLg Weston XWM so only the app's own content renders
+        let motif_hints: [u32; 5] = [2, 0, 0, 0, 0];
+        let _ = self.conn.change_property32(
+            PropMode::REPLACE,
+            win,
+            self.atoms._MOTIF_WM_HINTS,
+            self.atoms._MOTIF_WM_HINTS,
+            &motif_hints,
         );
 
         self.apply_title_and_hints(win, title, rect);
@@ -225,7 +280,11 @@ impl WslgSink {
     }
 
     fn apply_title_and_hints(&self, win: Window, title: &str, rect: SavedRect) {
-        let full_title = format!("[FocusStage] {title}");
+        let full_title = if title.trim().is_empty() {
+            "FocusStage"
+        } else {
+            title.trim()
+        };
         let _ = self.conn.change_property8(
             PropMode::REPLACE,
             win,
@@ -348,8 +407,8 @@ impl WslgSink {
 }
 
 impl DisplaySink for WslgSink {
-    fn show(&mut self, stage_id: &str, title: &str, rect: SavedRect) {
-        let win = match self.ensure_proxy_window(stage_id, title, rect) {
+    fn show(&mut self, stage_id: &str, title: &str, wm_class: &str, rect: SavedRect) {
+        let win = match self.ensure_proxy_window(stage_id, title, wm_class, rect) {
             Ok(w) => w,
             Err(e) => {
                 warn!("WslgSink show failed for {}: {}", stage_id, e);
@@ -433,6 +492,63 @@ impl DisplaySink for WslgSink {
             self.apply_title_and_hints(pw.window, title, pw.rect);
             let _ = self.conn.flush();
         }
+    }
+
+    fn begin_move(&mut self, stage_id: &str) {
+        self.send_net_wm_moveresize(stage_id, 8);
+    }
+
+    fn begin_resize(&mut self, stage_id: &str, direction: u32) {
+        self.send_net_wm_moveresize(stage_id, direction);
+    }
+
+    fn minimize(&mut self, stage_id: &str) {
+        let Some(pw) = self.windows.get(stage_id) else {
+            return;
+        };
+        let msg = ClientMessageEvent::new(
+            32,
+            pw.window,
+            self.atoms.WM_CHANGE_STATE,
+            [3 /* IconicState */, 0, 0, 0, 0],
+        );
+        let _ = self.conn.send_event(
+            false,
+            self.root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            msg,
+        );
+        let _ = self.conn.flush();
+    }
+
+    fn set_maximized(&mut self, stage_id: &str, maximized: bool) {
+        let Some(pw) = self.windows.get(stage_id) else {
+            return;
+        };
+        let action = if maximized { 1u32 } else { 0u32 };
+        let msg = ClientMessageEvent::new(
+            32,
+            pw.window,
+            self.atoms._NET_WM_STATE,
+            [
+                action,
+                self.atoms._NET_WM_STATE_MAXIMIZED_VERT,
+                self.atoms._NET_WM_STATE_MAXIMIZED_HORZ,
+                1,
+                0,
+            ],
+        );
+        let _ = self.conn.send_event(
+            false,
+            self.root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            msg,
+        );
+        let _ = self.conn.flush();
+    }
+
+    fn set_host_clipboard(&mut self, text: &str) {
+        WslgSink::set_host_clipboard(self, text);
     }
 
     fn poll_events(&mut self) -> Vec<SinkInputEvent> {

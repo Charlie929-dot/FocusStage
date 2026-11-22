@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use smithay::desktop::PopupManager;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::{Display, ListeningSocket};
@@ -13,7 +14,7 @@ use focusstage_compositor::control::spawn_control_server;
 use focusstage_compositor::offscreen::send_frames_surface_tree;
 use focusstage_compositor::protocol::{default_socket_path, DisplayState};
 use focusstage_compositor::router::InputSource;
-use focusstage_compositor::sink::{DisplaySink, SinkInputEvent};
+use focusstage_compositor::sink::SinkInputEvent;
 use focusstage_compositor::state::{ClientState, FocusStageState};
 
 #[derive(Debug, Parser)]
@@ -63,7 +64,128 @@ fn get_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
     }
 }
 
+fn normalize_process_path() {
+    let mut parts: Vec<String> = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut extras = vec![
+        "/usr/local/bin".to_string(),
+        "/usr/bin".to_string(),
+        "/bin".to_string(),
+        "/snap/bin".to_string(),
+        "/var/lib/flatpak/exports/bin".to_string(),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            extras.push(format!("{home}/.local/bin"));
+        }
+    }
+    for dir in extras {
+        if !parts.iter().any(|p| p == &dir) {
+            parts.push(dir);
+        }
+    }
+    std::env::set_var("PATH", parts.join(":"));
+}
+
+fn ensure_desktop_session_helpers() {
+    use std::process::{Command, Stdio};
+
+    // Export WSLg display variables to systemd --user / D-Bus activation so
+    // xdg-desktop-portal-gtk and session helpers see DISPLAY / WAYLAND_DISPLAY.
+    let _ = Command::new("systemctl")
+        .args([
+            "--user",
+            "import-environment",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "PULSE_SERVER",
+            "XDG_DATA_DIRS",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    let already_running = Command::new("pgrep")
+        .args(["-u", &unsafe { libc::geteuid() }.to_string(), "-f", "polkit-.*authentication-agent|lxpolkit"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if already_running {
+        return;
+    }
+
+    let agent_candidates = [
+        "/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1",
+        "/usr/libexec/polkit-gnome-authentication-agent-1",
+        "/usr/libexec/polkit-mate-authentication-agent-1",
+        "/usr/bin/lxpolkit",
+    ];
+    let Some(agent_bin) = agent_candidates
+        .iter()
+        .find(|p| std::path::Path::new(p).is_file())
+    else {
+        return;
+    };
+
+    let x_display = std::env::var("DISPLAY")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| ":0".to_string());
+    let mut cmd = Command::new("systemd-run");
+    cmd.args([
+        "--user",
+        "--collect",
+        "--unit=focusstage-polkit-agent",
+        "-E",
+        &format!("DISPLAY={x_display}"),
+    ]);
+    if let Ok(xauth) = std::env::var("XAUTHORITY") {
+        if !xauth.is_empty() {
+            cmd.args(["-E", &format!("XAUTHORITY={xauth}")]);
+        }
+    } else if std::path::Path::new("/mnt/wslg/.Xauthority").exists() {
+        cmd.args(["-E", "XAUTHORITY=/mnt/wslg/.Xauthority"]);
+    }
+    // polkit-gnome segfaults under Wayland; force X11 on WSLg so prompts render reliably.
+    cmd.args([
+        "/usr/bin/env",
+        "-u",
+        "WAYLAND_DISPLAY",
+        "GDK_BACKEND=x11",
+        agent_bin,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+
+    match cmd.status() {
+        Ok(s) if s.success() => {
+            info!(
+                "Started Polkit authentication agent ({}) on DISPLAY={}",
+                agent_bin, x_display
+            );
+        }
+        Ok(s) => {
+            warn!("systemd-run focusstage-polkit-agent exited with {}", s);
+        }
+        Err(e) => {
+            warn!(
+                "Failed to start Polkit authentication agent ({}): {}",
+                agent_bin, e
+            );
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    normalize_process_path();
     if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     } else {
@@ -73,6 +195,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     let args = Args::parse();
+    if !args.headless {
+        ensure_desktop_session_helpers();
+    }
     let control_socket = args.socket.unwrap_or_else(default_socket_path);
     let runtime_base = control_socket
         .parent()
@@ -236,6 +361,7 @@ fn main() -> anyhow::Result<()> {
         state.tick_pending_act_jobs();
         state.expire_leases();
         state.reap_exited_stages();
+        state.popups.cleanup();
 
         // 6. Send frame callbacks to ALL surfaces across ALL Stages (keeps hidden stages rendering!)
         let now_ms = state.now_ms();
@@ -246,6 +372,9 @@ fn main() -> anyhow::Result<()> {
             .collect();
         for surf in surfaces {
             send_frames_surface_tree(&surf, now_ms);
+            for (popup, _) in PopupManager::popups_for_surface(&surf) {
+                send_frames_surface_tree(popup.wl_surface(), now_ms);
+            }
         }
 
         // 7. Present dirty Desktop stages to WslgSink

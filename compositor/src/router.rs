@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use smithay::backend::input::{Axis, AxisSource, ButtonState};
-use smithay::desktop::{PopupKind, PopupManager};
-use smithay::input::keyboard::{xkb, KeymapFile, KeyboardTarget};
+use smithay::desktop::PopupManager;
+use smithay::input::keyboard::{xkb, KeyboardTarget, KeymapFile, ModifiersState};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerTarget};
 use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::{
     zwp_text_input_manager_v3::{self, ZwpTextInputManagerV3},
@@ -14,12 +14,12 @@ use smithay::reexports::wayland_server::{
     protocol::{wl_keyboard::KeyState as WlKeyState, wl_surface::WlSurface},
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
-use smithay::utils::{Logical, Point, SERIAL_COUNTER};
+use smithay::utils::{Logical, Point, Serial, SERIAL_COUNTER};
 use tracing::{debug, warn};
 
+use crate::offscreen::wayland_window_geometry_loc;
 use crate::protocol::{ActStatus, Action, DisplayState, InputOwner};
-use crate::sink::DisplaySink;
-use crate::stage::StageToplevel;
+use crate::stage::{StageInputTarget, StageToplevel};
 use crate::state::FocusStageState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,18 +135,178 @@ impl Dispatch<ZwpTextInputV3, ()> for FocusStageState {
     }
 }
 
+pub struct SettleState {
+    pub initial_seq: u64,
+    pub last_seq: u64,
+    pub quiet_since: Instant,
+    pub started_at: Instant,
+    pub deadline: Instant,
+}
+
 pub struct PendingActJob {
     pub stage_id: String,
     pub lease_id: String,
     pub remaining: VecDeque<Action>,
     pub executed_steps: usize,
     pub wait_until: Option<Instant>,
+    pub settling: Option<SettleState>,
     pub reply_tx: std::sync::mpsc::Sender<crate::protocol::ControlResponse>,
 }
 
 impl FocusStageState {
     pub fn now_ms(&self) -> u32 {
         self.start_time.elapsed().as_millis() as u32
+    }
+
+    fn set_keyboard_target(
+        &mut self,
+        stage_id: &str,
+        new_target: StageInputTarget,
+        mods_state: ModifiersState,
+        serial: Serial,
+    ) {
+        let prev = self
+            .stages
+            .get(stage_id)
+            .and_then(|s| s.input.current_keyboard_target.clone());
+        if prev.as_ref().is_some_and(|p| p.same_target(&new_target)) && new_target.alive() {
+            return;
+        }
+
+        let seat = self.seat.clone();
+        if let Some(old) = prev {
+            if old.alive() {
+                match &old {
+                    StageInputTarget::Wayland(old_surf) => {
+                        if let Some(client) = old_surf.client() {
+                            let cid = client.id();
+                            let ti_res: Vec<_> = self
+                                .text_input_state
+                                .instances
+                                .iter()
+                                .filter(|ti| ti.client_id == cid)
+                                .map(|ti| ti.resource.clone())
+                                .collect();
+                            for res in ti_res {
+                                res.leave(old_surf);
+                            }
+                        }
+                        KeyboardTarget::leave(old_surf, &seat, self, serial);
+                    }
+                    StageInputTarget::X11(old_x11) => {
+                        KeyboardTarget::leave(old_x11, &seat, self, serial);
+                    }
+                }
+            }
+        }
+
+        match &new_target {
+            StageInputTarget::Wayland(wl_surf) => {
+                if let Some(client) = wl_surf.client() {
+                    let has_kbd = seat
+                        .get_keyboard()
+                        .map(|k| k.client_keyboards(&client).next().is_some())
+                        .unwrap_or(false);
+                    if !has_kbd {
+                        if let Some(stage) = self.stages.get_mut(stage_id) {
+                            stage.input.current_keyboard_target = None;
+                        }
+                        return;
+                    }
+                    KeyboardTarget::enter(wl_surf, &seat, self, vec![], serial);
+                    KeyboardTarget::modifiers(wl_surf, &seat, self, mods_state, serial);
+
+                    let cid = client.id();
+                    let ti_res: Vec<_> = self
+                        .text_input_state
+                        .instances
+                        .iter()
+                        .filter(|ti| ti.client_id == cid)
+                        .map(|ti| ti.resource.clone())
+                        .collect();
+                    for res in ti_res {
+                        res.enter(wl_surf);
+                    }
+                }
+            }
+            StageInputTarget::X11(x11_tl) => {
+                KeyboardTarget::enter(x11_tl, &seat, self, vec![], serial);
+                KeyboardTarget::modifiers(x11_tl, &seat, self, mods_state, serial);
+            }
+        }
+
+        if let Some(stage) = self.stages.get_mut(stage_id) {
+            stage.input.current_keyboard_target = Some(new_target);
+        }
+    }
+
+    /// Switch `wl_pointer` focus on this Stage, sending `leave` to the previous target first.
+    /// Returns `true` if `PointerTarget::enter` was sent to `new_target`.
+    fn set_pointer_target(
+        &mut self,
+        stage_id: &str,
+        new_target: StageInputTarget,
+        local: Point<f64, Logical>,
+        serial: Serial,
+        time: u32,
+    ) -> bool {
+        let prev = self
+            .stages
+            .get(stage_id)
+            .and_then(|s| s.input.current_pointer_target.clone());
+        if prev.as_ref().is_some_and(|p| p.same_target(&new_target)) && new_target.alive() {
+            return false;
+        }
+
+        let seat = self.seat.clone();
+        if let Some(old) = prev {
+            if old.alive() {
+                match &old {
+                    StageInputTarget::Wayland(old_surf) => {
+                        PointerTarget::leave(old_surf, &seat, self, serial, time);
+                        PointerTarget::frame(old_surf, &seat, self);
+                    }
+                    StageInputTarget::X11(old_x11) => {
+                        PointerTarget::leave(old_x11, &seat, self, serial, time);
+                        PointerTarget::frame(old_x11, &seat, self);
+                    }
+                }
+            }
+        }
+
+        let ev = MotionEvent {
+            location: local,
+            serial,
+            time,
+        };
+        match &new_target {
+            StageInputTarget::Wayland(wl_surf) => {
+                let has_ptr = wl_surf
+                    .client()
+                    .and_then(|client| {
+                        seat.get_pointer()
+                            .map(|p| p.client_pointers(&client).next().is_some())
+                    })
+                    .unwrap_or(false);
+                if !has_ptr {
+                    if let Some(stage) = self.stages.get_mut(stage_id) {
+                        stage.input.current_pointer_target = None;
+                    }
+                    return false;
+                }
+                PointerTarget::enter(wl_surf, &seat, self, &ev);
+                PointerTarget::frame(wl_surf, &seat, self);
+            }
+            StageInputTarget::X11(x11_tl) => {
+                PointerTarget::enter(x11_tl, &seat, self, &ev);
+                PointerTarget::frame(x11_tl, &seat, self);
+            }
+        }
+
+        if let Some(stage) = self.stages.get_mut(stage_id) {
+            stage.input.current_pointer_target = Some(new_target);
+        }
+        true
     }
 
     /// Ensure virtual focus is permanently active for a Stage without sending `leave` to any other Stage.
@@ -160,98 +320,71 @@ impl FocusStageState {
         };
         let mods_state = stage.input.mods_state;
         let pointer_pos = stage.input.pointer_pos;
-        let seat = self.seat.clone();
+        let cur_kbd = stage.input.current_keyboard_target.clone();
+        let cur_ptr = stage.input.current_pointer_target.clone();
         let time = self.now_ms();
-        let mut newly_kbd_entered = Vec::new();
-        let mut newly_ptr_entered = Vec::new();
-        let kbd_already_entered = stage.input.keyboard_entered.clone();
-        let ptr_already_entered = stage.input.pointer_entered.clone();
 
         match toplevel {
             StageToplevel::Wayland(ref wl_tl) => {
                 let wl_surf = wl_tl.wl_surface().clone();
-                let oid = wl_surf.id();
-                if let Some(client) = wl_surf.client() {
-                    let has_kbd = seat
-                        .get_keyboard()
-                        .map(|k| k.client_keyboards(&client).next().is_some())
-                        .unwrap_or(false);
-                    if has_kbd && !kbd_already_entered.contains(&oid) {
-                        let serial = SERIAL_COUNTER.next_serial();
-                        KeyboardTarget::enter(&wl_surf, &seat, self, vec![], serial);
-                        KeyboardTarget::modifiers(&wl_surf, &seat, self, mods_state, serial);
-                        newly_kbd_entered.push(oid.clone());
+                let kbd_valid = cur_kbd.as_ref().is_some_and(|t| {
+                    t.alive()
+                        && matches!(t, StageInputTarget::Wayland(s) if s == &wl_surf || PopupManager::popups_for_surface(&wl_surf).any(|(p, _)| p.wl_surface() == s))
+                });
+                if !kbd_valid {
+                    let serial = SERIAL_COUNTER.next_serial();
+                    self.set_keyboard_target(
+                        stage_id,
+                        StageInputTarget::Wayland(wl_surf.clone()),
+                        mods_state,
+                        serial,
+                    );
+                }
 
-                        // Also enter zwp_text_input_v3 instances of this client
-                        let cid = client.id();
-                        let ti_res: Vec<_> = self
-                            .text_input_state
-                            .instances
-                            .iter()
-                            .filter(|ti| ti.client_id == cid)
-                            .map(|ti| ti.resource.clone())
-                            .collect();
-                        for res in ti_res {
-                            res.enter(&wl_surf);
-                        }
-                    }
-
-                    let has_ptr = seat
-                        .get_pointer()
-                        .map(|p| p.client_pointers(&client).next().is_some())
-                        .unwrap_or(false);
-                    if has_ptr && !ptr_already_entered.contains(&oid) {
-                        let serial = SERIAL_COUNTER.next_serial();
-                        PointerTarget::enter(
-                            &wl_surf,
-                            &seat,
-                            self,
-                            &MotionEvent {
-                                location: pointer_pos,
-                                serial,
-                                time,
-                            },
-                        );
-                        PointerTarget::frame(&wl_surf, &seat, self);
-                        newly_ptr_entered.push(oid);
-                    }
+                let ptr_valid = cur_ptr.as_ref().is_some_and(|t| {
+                    t.alive()
+                        && matches!(t, StageInputTarget::Wayland(s) if s == &wl_surf || PopupManager::popups_for_surface(&wl_surf).any(|(p, _)| p.wl_surface() == s))
+                });
+                if !ptr_valid {
+                    let (target, local) =
+                        self.hit_test_wayland_surface(&wl_surf, pointer_pos.x, pointer_pos.y);
+                    let serial = SERIAL_COUNTER.next_serial();
+                    self.set_pointer_target(
+                        stage_id,
+                        StageInputTarget::Wayland(target),
+                        local,
+                        serial,
+                        time,
+                    );
                 }
             }
             StageToplevel::X11(ref x11_tl) => {
                 let _ = x11_tl.set_activated(true);
-                if let Some(wl_surf) = x11_tl.wl_surface() {
-                    let oid = wl_surf.id();
-                    if !kbd_already_entered.contains(&oid) {
+                if x11_tl.wl_surface().is_some() {
+                    let kbd_valid = cur_kbd.as_ref().is_some_and(|t| {
+                        t.alive() && t.same_target(&StageInputTarget::X11(x11_tl.clone()))
+                    });
+                    if !kbd_valid {
                         let serial = SERIAL_COUNTER.next_serial();
-                        KeyboardTarget::enter(x11_tl, &seat, self, vec![], serial);
-                        KeyboardTarget::modifiers(x11_tl, &seat, self, mods_state, serial);
-                        newly_kbd_entered.push(oid.clone());
-                    }
-                    if !ptr_already_entered.contains(&oid) {
-                        let serial = SERIAL_COUNTER.next_serial();
-                        PointerTarget::enter(
-                            x11_tl,
-                            &seat,
-                            self,
-                            &MotionEvent {
-                                location: pointer_pos,
-                                serial,
-                                time,
-                            },
+                        self.set_keyboard_target(
+                            stage_id,
+                            StageInputTarget::X11(x11_tl.clone()),
+                            mods_state,
+                            serial,
                         );
-                        PointerTarget::frame(x11_tl, &seat, self);
-                        newly_ptr_entered.push(oid);
+                    }
+                    let ptr_valid = cur_ptr.as_ref().is_some_and(|t| t.alive());
+                    if !ptr_valid {
+                        let serial = SERIAL_COUNTER.next_serial();
+                        self.set_pointer_target(
+                            stage_id,
+                            StageInputTarget::X11(x11_tl.clone()),
+                            pointer_pos,
+                            serial,
+                            time,
+                        );
                     }
                 }
-            }
-        }
-
-        if let Some(stage) = self.stages.get_mut(stage_id) {
-            for oid in newly_kbd_entered {
-                stage.input.keyboard_entered.insert(oid);
-            }
-            for oid in newly_ptr_entered {
-                stage.input.pointer_entered.insert(oid);
             }
         }
     }
@@ -290,7 +423,7 @@ impl FocusStageState {
             // Release any held keys/buttons from AI before switching to Human.
             self.release_all_stage_inputs(id);
 
-            let (should_show, title, rect) = if let Some(stage) = self.stages.get_mut(id) {
+            let (should_show, title, wm_class, rect) = if let Some(stage) = self.stages.get_mut(id) {
                 stage.lease = None;
                 stage.input_owner = InputOwner::Human;
                 let was_hidden = stage.display == DisplayState::Hidden;
@@ -301,14 +434,14 @@ impl FocusStageState {
                     width: stage.logical_size.w.max(1) as u32,
                     height: stage.logical_size.h.max(1) as u32,
                 });
-                (was_hidden, stage.title.clone(), rect)
+                (was_hidden, stage.title.clone(), stage.wm_class.clone(), rect)
             } else {
-                (false, String::new(), crate::protocol::SavedRect { x: 100, y: 100, width: 800, height: 600 })
+                (false, String::new(), String::from("FocusStage"), crate::protocol::SavedRect { x: 100, y: 100, width: 800, height: 600 })
             };
 
             if should_show {
                 if let Some(ref mut sink) = self.wslg_sink {
-                    sink.show(id, &title, rect);
+                    sink.show(id, &title, &wm_class, rect);
                 }
                 if let Some(stage) = self.stages.get_mut(id) {
                     stage.dirty_for_sink = true;
@@ -358,13 +491,10 @@ impl FocusStageState {
 
     /// Resolve Stage-relative `(x, y)` to `(WlSurface | X11Surface target, local_point)` checking popups first.
     fn hit_test_wayland_surface(&self, root: &WlSurface, x: f64, y: f64) -> (WlSurface, Point<f64, Logical>) {
-        let popups: Vec<_> = PopupManager::popups_for_surface(root).collect();
-        for (popup, popup_loc) in popups.into_iter().rev() {
+        // PopupManager::popups_for_surface yields topmost child popups before their parents.
+        for (popup, popup_loc) in PopupManager::popups_for_surface(root) {
             let psurf = popup.wl_surface().clone();
-            let geo = match popup {
-                PopupKind::Xdg(ref xdg) => xdg.with_pending_state(|s| s.geometry),
-                PopupKind::InputMethod(_) => Default::default(),
-            };
+            let geo = popup.geometry();
             let px = popup_loc.x as f64;
             let py = popup_loc.y as f64;
             let pw = geo.size.w.max(1) as f64;
@@ -373,7 +503,11 @@ impl FocusStageState {
                 return (psurf, Point::from((x - px + geo.loc.x as f64, y - py + geo.loc.y as f64)));
             }
         }
-        (root.clone(), Point::from((x, y)))
+        let geo_loc = wayland_window_geometry_loc(root);
+        (
+            root.clone(),
+            Point::from((x + geo_loc.x as f64, y + geo_loc.y as f64)),
+        )
     }
 
     pub fn send_stage_pointer_motion(&mut self, stage_id: &str, x: f64, y: f64) {
@@ -391,23 +525,22 @@ impl FocusStageState {
         match toplevel {
             StageToplevel::Wayland(tl) => {
                 let (target, local) = self.hit_test_wayland_surface(tl.wl_surface(), x, y);
-                let mut need_enter = false;
-                if let Some(stage) = self.stages.get_mut(stage_id) {
-                    if stage.input.pointer_entered.insert(target.id()) {
-                        need_enter = true;
-                    }
-                }
-                let ev = MotionEvent {
-                    location: local,
+                let entered = self.set_pointer_target(
+                    stage_id,
+                    StageInputTarget::Wayland(target.clone()),
+                    local,
                     serial,
                     time,
-                };
-                if need_enter {
-                    PointerTarget::enter(&target, &seat, self, &ev);
-                } else {
+                );
+                if !entered {
+                    let ev = MotionEvent {
+                        location: local,
+                        serial,
+                        time,
+                    };
                     PointerTarget::motion(&target, &seat, self, &ev);
+                    PointerTarget::frame(&target, &seat, self);
                 }
-                PointerTarget::frame(&target, &seat, self);
             }
             StageToplevel::X11(x11) => {
                 let geo = x11.geometry();
@@ -428,24 +561,23 @@ impl FocusStageState {
                         }
                     }
                 }
-                let ev = MotionEvent {
-                    location: local,
-                    serial,
-                    time,
-                };
-                if let Some(ws) = hit_x11.wl_surface() {
-                    let mut need_enter = false;
-                    if let Some(stage) = self.stages.get_mut(stage_id) {
-                        if stage.input.pointer_entered.insert(ws.id()) {
-                            need_enter = true;
-                        }
-                    }
-                    if need_enter {
-                        PointerTarget::enter(&hit_x11, &seat, self, &ev);
-                    } else {
+                if hit_x11.wl_surface().is_some() {
+                    let entered = self.set_pointer_target(
+                        stage_id,
+                        StageInputTarget::X11(hit_x11.clone()),
+                        local,
+                        serial,
+                        time,
+                    );
+                    if !entered {
+                        let ev = MotionEvent {
+                            location: local,
+                            serial,
+                            time,
+                        };
                         PointerTarget::motion(&hit_x11, &seat, self, &ev);
+                        PointerTarget::frame(&hit_x11, &seat, self);
                     }
-                    PointerTarget::frame(&hit_x11, &seat, self);
                 }
             }
         }
@@ -565,20 +697,16 @@ impl FocusStageState {
             StageToplevel::Wayland(tl) => {
                 let wl_surf = tl.wl_surface();
                 let kbd_target = PopupManager::popups_for_surface(wl_surf)
-                    .last()
+                    .next()
                     .map(|(p, _)| p.wl_surface().clone())
                     .unwrap_or_else(|| wl_surf.clone());
 
-                // Ensure the target popup also received keyboard enter if needed
-                let mut need_enter = false;
-                if let Some(stage) = self.stages.get_mut(stage_id) {
-                    if stage.input.keyboard_entered.insert(kbd_target.id()) {
-                        need_enter = true;
-                    }
-                }
-                if need_enter {
-                    KeyboardTarget::enter(&kbd_target, &seat, self, vec![], serial);
-                }
+                self.set_keyboard_target(
+                    stage_id,
+                    StageInputTarget::Wayland(kbd_target.clone()),
+                    prev_mods,
+                    serial,
+                );
 
                 if let (Some(client), Some(kbd_handle)) = (kbd_target.client(), seat.get_keyboard()) {
                     for kbd in kbd_handle.client_keyboards(&client) {
@@ -823,14 +951,6 @@ impl FocusStageState {
         let mut still_pending = Vec::new();
 
         for mut job in jobs {
-            if let Some(until) = job.wait_until {
-                if now < until {
-                    still_pending.push(job);
-                    continue;
-                }
-                job.wait_until = None;
-            }
-
             if !self.is_input_allowed(&job.stage_id, InputSource::Agent, Some(&job.lease_id)) {
                 let frame_seq = self.stages.get(&job.stage_id).map(|s| s.frame_seq).unwrap_or(0);
                 let _ = job.reply_tx.send(crate::protocol::ControlResponse::ActResult {
@@ -840,6 +960,38 @@ impl FocusStageState {
                     message: Some("Lease expired or preempted".to_string()),
                 });
                 continue;
+            }
+
+            if let Some(ref mut st) = job.settling {
+                let cur_seq = self.stages.get(&job.stage_id).map(|s| s.frame_seq).unwrap_or(0);
+                if cur_seq != st.last_seq {
+                    st.last_seq = cur_seq;
+                    st.quiet_since = now;
+                }
+                let settled = now >= st.deadline
+                    || (st.last_seq != st.initial_seq
+                        && now.duration_since(st.quiet_since) >= Duration::from_millis(180))
+                    || (st.last_seq == st.initial_seq
+                        && now.duration_since(st.started_at) >= Duration::from_millis(220));
+                if settled {
+                    let _ = job.reply_tx.send(crate::protocol::ControlResponse::ActResult {
+                        act_status: ActStatus::Ok,
+                        executed_steps: job.executed_steps,
+                        frame_seq: cur_seq,
+                        message: None,
+                    });
+                } else {
+                    still_pending.push(job);
+                }
+                continue;
+            }
+
+            if let Some(until) = job.wait_until {
+                if now < until {
+                    still_pending.push(job);
+                    continue;
+                }
+                job.wait_until = None;
             }
 
             let mut paused_for_wait = false;
@@ -864,6 +1016,17 @@ impl FocusStageState {
             }
 
             if paused_for_wait {
+                still_pending.push(job);
+            } else if failed_msg.is_none() && job.executed_steps > 0 {
+                let cur_seq = self.stages.get(&job.stage_id).map(|s| s.frame_seq).unwrap_or(0);
+                let t = Instant::now();
+                job.settling = Some(SettleState {
+                    initial_seq: cur_seq,
+                    last_seq: cur_seq,
+                    quiet_since: t,
+                    started_at: t,
+                    deadline: t + Duration::from_millis(1200),
+                });
                 still_pending.push(job);
             } else {
                 let frame_seq = self.stages.get(&job.stage_id).map(|s| s.frame_seq).unwrap_or(0);

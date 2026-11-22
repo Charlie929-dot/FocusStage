@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.Drawing;
-using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -10,13 +9,72 @@ namespace FocusStageTray;
 
 internal static class Program
 {
+    private const string SingleInstanceMutexName = @"Local\FocusStage_SingleInstance_Mutex";
+    private const string ShowLauncherEventName = @"Local\FocusStage_ShowLauncher_Event";
+
     [STAThread]
-    private static void Main(string[] args)
+    private static int Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
-        var distro = args.Length > 0 ? args[0] : "Ubuntu";
-        using var ctx = new FocusStageTrayContext(distro);
+
+        string distro = "Ubuntu";
+        bool trayOnly = false;
+        bool syncShortcuts = false;
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--tray":
+                    trayOnly = true;
+                    break;
+                case "--sync-shortcuts":
+                    syncShortcuts = true;
+                    break;
+                case "--distro" when i + 1 < args.Length:
+                    distro = args[++i];
+                    break;
+                default:
+                    if (!args[i].StartsWith('-'))
+                    {
+                        distro = args[i];
+                    }
+                    break;
+            }
+        }
+
+        if (syncShortcuts)
+        {
+            var (ok, msg, _) = ShortcutManager
+                .SyncAllAsync(distro, createDesktopForLauncher: true, createStartupTray: true)
+                .GetAwaiter()
+                .GetResult();
+            Console.WriteLine(msg);
+            return ok ? 0 : 1;
+        }
+
+        using var mutex = new Mutex(true, SingleInstanceMutexName, out bool createdNew);
+        if (!createdNew)
+        {
+            if (!trayOnly)
+            {
+                try
+                {
+                    using var ev = EventWaitHandle.OpenExisting(ShowLauncherEventName);
+                    ev.Set();
+                }
+                catch
+                {
+                    // Ignore if existing instance hasn't created event yet.
+                }
+            }
+            return 0;
+        }
+
+        using var showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowLauncherEventName);
+        using var ctx = new FocusStageTrayContext(distro, startMinimized: trayOnly, showEvent);
         Application.Run(ctx);
+        return 0;
     }
 }
 
@@ -109,6 +167,8 @@ internal sealed class FocusStageTrayContext : ApplicationContext
     private readonly HotkeyWindow _hotkeyWindow;
     private readonly System.Windows.Forms.Timer _syncTimer;
     private readonly Icon _trayIcon;
+    private readonly CancellationTokenSource _signalCts = new();
+    private LauncherForm? _launcherForm;
 
     private bool _daemonAlive;
     private bool _clipboardSyncEnabled = true;
@@ -117,7 +177,10 @@ internal sealed class FocusStageTrayContext : ApplicationContext
     private List<StageDto> _stages = new();
     private bool _busy;
 
-    public FocusStageTrayContext(string distro)
+    public bool DaemonAlive => _daemonAlive;
+    public List<StageDto> CurrentStages => _stages;
+
+    public FocusStageTrayContext(string distro, bool startMinimized, EventWaitHandle showEvent)
     {
         _distro = distro;
         _trayIcon = CreateTrayIcon();
@@ -127,11 +190,18 @@ internal sealed class FocusStageTrayContext : ApplicationContext
         _notifyIcon = new NotifyIcon
         {
             Icon = _trayIcon,
-            Text = "FocusStage (Ctrl+Alt+Space: Takeover)",
+            Text = "FocusStage (点击打开启动器 | Ctrl+Alt+Space 接管)",
             Visible = true,
             ContextMenuStrip = _menu
         };
-        _notifyIcon.DoubleClick += (_, _) => _ = TakeoverAllAsync();
+        _notifyIcon.MouseClick += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                ShowLauncher();
+            }
+        };
+        _notifyIcon.DoubleClick += (_, _) => ShowLauncher();
 
         _hotkeyWindow = new HotkeyWindow();
         _hotkeyWindow.TakeoverHotkeyPressed += () => _ = TakeoverAllAsync();
@@ -141,7 +211,7 @@ internal sealed class FocusStageTrayContext : ApplicationContext
             _notifyIcon.ShowBalloonTip(
                 3000,
                 "FocusStage",
-                "Could not register Ctrl+Alt+Space hotkey; use tray menu or double-click icon to take over.",
+                "无法注册 Ctrl+Alt+Space 全局热键，可通过托盘或启动器界面接管。",
                 ToolTipIcon.Warning);
         }
 
@@ -151,30 +221,77 @@ internal sealed class FocusStageTrayContext : ApplicationContext
 
         BuildMenu();
         _ = RefreshAndRebuildMenuAsync();
+        StartShowEventListener(showEvent);
+
+        if (!startMinimized)
+        {
+            ShowLauncher();
+        }
+    }
+
+    private void StartShowEventListener(EventWaitHandle showEvent)
+    {
+        var syncCtx = SynchronizationContext.Current;
+        Task.Run(() =>
+        {
+            var handles = new[] { showEvent, _signalCts.Token.WaitHandle };
+            while (!_signalCts.IsCancellationRequested)
+            {
+                int idx = WaitHandle.WaitAny(handles);
+                if (idx == 0)
+                {
+                    if (syncCtx is not null)
+                    {
+                        syncCtx.Post(_ => ShowLauncher(), null);
+                    }
+                    else
+                    {
+                        ShowLauncher();
+                    }
+                }
+                else
+                {
+                    break;
+                }
+            }
+        });
+    }
+
+    public void ShowLauncher()
+    {
+        if (_launcherForm is null || _launcherForm.IsDisposed)
+        {
+            _launcherForm = new LauncherForm(this, _distro);
+        }
+        if (!_launcherForm.Visible)
+        {
+            _launcherForm.Show();
+        }
+        if (_launcherForm.WindowState == FormWindowState.Minimized)
+        {
+            _launcherForm.WindowState = FormWindowState.Normal;
+        }
+        _launcherForm.Activate();
+        _launcherForm.BringToFront();
+        _launcherForm.UpdateDaemonAndStages(_daemonAlive, _stages);
     }
 
     private static Icon CreateTrayIcon()
     {
-        using var bmp = new Bitmap(32, 32);
-        using var g = Graphics.FromImage(bmp);
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.Clear(Color.Transparent);
-
-        using var bgBrush = new SolidBrush(Color.FromArgb(24, 30, 44));
-        g.FillEllipse(bgBrush, 1, 1, 30, 30);
-
-        using var ringPen = new Pen(Color.FromArgb(90, 178, 255), 2.5f);
-        g.DrawEllipse(ringPen, 3, 3, 26, 26);
-
-        using var dotBrush = new SolidBrush(Color.FromArgb(120, 230, 175));
-        g.FillEllipse(dotBrush, 10, 10, 12, 12);
-
+        using var bmp = ShortcutManager.RenderBrandBitmap(32);
         return Icon.FromHandle(bmp.GetHicon());
     }
 
     private void BuildMenu()
     {
         _menu.Items.Clear();
+
+        var openLauncher = new ToolStripMenuItem("Open App Launcher (打开应用启动器)")
+        {
+            Font = new Font(_menu.Font, FontStyle.Bold)
+        };
+        openLauncher.Click += (_, _) => ShowLauncher();
+        _menu.Items.Add(openLauncher);
 
         var statusItem = new ToolStripMenuItem(
             _daemonAlive
@@ -252,12 +369,16 @@ internal sealed class FocusStageTrayContext : ApplicationContext
 
         _menu.Items.Add(new ToolStripSeparator());
 
-        var launchMenu = new ToolStripMenuItem("Launch Stage");
-        launchMenu.DropDownItems.Add("foot (Wayland Terminal)", null, (_, _) => _ = RunControlAndRefreshAsync("launch", "foot"));
-        launchMenu.DropDownItems.Add("xterm (X11 Terminal)", null, (_, _) => _ = RunControlAndRefreshAsync("launch", "--kind", "x11", "xterm"));
-        launchMenu.DropDownItems.Add("chromium (Wayland Browser)", null, (_, _) => _ = RunControlAndRefreshAsync("launch", "--kind", "chromium", "chromium"));
+        var launchMenu = new ToolStripMenuItem("Quick Launch Stage");
+        launchMenu.DropDownItems.Add("Chromium (Wayland Browser)", null, (_, _) => _ = RunControlAndRefreshAsync("launch", "--ensure-daemon", "--kind", "chromium", "--wm-class", "focusstage-chromium_chromium", "chromium"));
+        launchMenu.DropDownItems.Add("Foot (Wayland Terminal)", null, (_, _) => _ = RunControlAndRefreshAsync("launch", "--ensure-daemon", "--wm-class", "focusstage-foot", "foot"));
+        launchMenu.DropDownItems.Add("XTerm (X11 Terminal)", null, (_, _) => _ = RunControlAndRefreshAsync("launch", "--ensure-daemon", "--kind", "x11", "--wm-class", "focusstage-debian-xterm", "xterm"));
         launchMenu.DropDownItems.Add("Custom command...", null, (_, _) => PromptLaunchCustom());
         _menu.Items.Add(launchMenu);
+
+        var syncAppsItem = new ToolStripMenuItem("Sync Linux Apps to Start Menu");
+        syncAppsItem.Click += (_, _) => _ = SyncLinuxAppsAsync();
+        _menu.Items.Add(syncAppsItem);
 
         var clipToggle = new ToolStripMenuItem("Sync Win11 Clipboard")
         {
@@ -277,32 +398,100 @@ internal sealed class FocusStageTrayContext : ApplicationContext
         _menu.Items.Add("Exit", null, (_, _) => ExitThread());
     }
 
-    private void PromptLaunchCustom()
+    public void PromptLaunchCustom(IWin32Window? owner = null)
     {
         using var form = new Form
         {
             Text = "Launch FocusStage App",
-            Width = 420,
-            Height = 155,
+            AutoScaleMode = AutoScaleMode.Dpi,
             FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterScreen,
+            StartPosition = owner is not null ? FormStartPosition.CenterParent : FormStartPosition.CenterScreen,
             MaximizeBox = false,
-            MinimizeBox = false
+            MinimizeBox = false,
+            Font = new Font("Microsoft YaHei UI", 9.2f)
         };
-        var label = new Label { Left = 12, Top = 12, Width = 380, Text = "Linux command (e.g. code --no-sandbox, gedit, xeyes):" };
-        var box = new TextBox { Left = 12, Top = 36, Width = 380 };
-        var ok = new Button { Text = "Launch", Left = 230, Top = 72, Width = 75, DialogResult = DialogResult.OK };
-        var cancel = new Button { Text = "Cancel", Left = 317, Top = 72, Width = 75, DialogResult = DialogResult.Cancel };
-        form.Controls.AddRange(new Control[] { label, box, ok, cancel });
+
+        var layout = new TableLayoutPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 1,
+            RowCount = 3
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+
+        var label = new Label
+        {
+            AutoSize = true,
+            Text = "Linux command (e.g. chromium, foot, code --no-sandbox, gedit):"
+        };
+        var box = new TextBox
+        {
+            Dock = DockStyle.Fill
+        };
+
+        var buttons = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            FlowDirection = FlowDirection.RightToLeft,
+            Dock = DockStyle.Fill,
+            WrapContents = false,
+            Margin = new Padding(0)
+        };
+        var cancel = new Button
+        {
+            Text = "Cancel",
+            AutoSize = true,
+            DialogResult = DialogResult.Cancel
+        };
+        var ok = new Button
+        {
+            Text = "Launch",
+            AutoSize = true,
+            DialogResult = DialogResult.OK
+        };
+        buttons.Controls.Add(cancel);
+        buttons.Controls.Add(ok);
+
+        layout.Controls.Add(label, 0, 0);
+        layout.Controls.Add(box, 0, 1);
+        layout.Controls.Add(buttons, 0, 2);
+        form.Controls.Add(layout);
         form.AcceptButton = ok;
         form.CancelButton = cancel;
 
-        if (form.ShowDialog() == DialogResult.OK && !string.IsNullOrWhiteSpace(box.Text))
+        void ApplyDpiLayout(int dpi)
+        {
+            int S(int px) => (int)Math.Round(px * (dpi / 96.0));
+            int pad = S(16);
+            label.MaximumSize = new Size(S(460), 0);
+            label.Margin = new Padding(0, 0, 0, S(8));
+            box.MinimumSize = new Size(S(440), 0);
+            box.Margin = new Padding(0, 0, 0, S(12));
+            cancel.MinimumSize = new Size(S(84), S(30));
+            cancel.Padding = new Padding(S(10), S(3), S(10), S(3));
+            cancel.Margin = new Padding(0);
+            ok.MinimumSize = new Size(S(84), S(30));
+            ok.Padding = new Padding(S(10), S(3), S(10), S(3));
+            ok.Margin = new Padding(0, 0, S(8), 0);
+
+            layout.Location = new Point(pad, pad);
+            layout.PerformLayout();
+            var pref = layout.GetPreferredSize(Size.Empty);
+            form.ClientSize = new Size(pref.Width + pad * 2, pref.Height + pad * 2);
+        }
+
+        ApplyDpiLayout((owner as Control)?.DeviceDpi ?? form.DeviceDpi);
+        form.Load += (_, _) => ApplyDpiLayout(form.DeviceDpi);
+
+        var dialogResult = owner is not null ? form.ShowDialog(owner) : form.ShowDialog();
+        if (dialogResult == DialogResult.OK && !string.IsNullOrWhiteSpace(box.Text))
         {
             var parts = box.Text.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length > 0)
             {
-                var args = new List<string> { "launch", parts[0] };
+                var args = new List<string> { "launch", "--ensure-daemon", parts[0] };
                 if (parts.Length > 1)
                 {
                     args.Add("--");
@@ -313,39 +502,94 @@ internal sealed class FocusStageTrayContext : ApplicationContext
         }
     }
 
-    private async Task TakeoverAllAsync()
+    public async Task TakeoverAllAsync()
     {
         await RunControlAndRefreshAsync("takeover");
         _notifyIcon.ShowBalloonTip(1500, "FocusStage", "Human takeover activated.", ToolTipIcon.Info);
     }
 
-    private async Task RunControlAndRefreshAsync(params string[] focusstageArgs)
+    private async Task SyncLinuxAppsAsync()
     {
-        await RunFocusStageAsync(focusstageArgs);
-        await RefreshAndRebuildMenuAsync();
+        var (ok, msg, _) = await ShortcutManager.SyncAllAsync(_distro, createDesktopForLauncher: true, createStartupTray: ShortcutManager.IsStartupEnabled());
+        _notifyIcon.ShowBalloonTip(2500, "FocusStage", msg, ok ? ToolTipIcon.Info : ToolTipIcon.Warning);
+        if (_launcherForm is not null && !_launcherForm.IsDisposed)
+        {
+            await _launcherForm.RefreshAppsAsync();
+        }
     }
 
-    private async Task StartDaemonAsync()
+    public async Task<(bool Ok, string Message)> RunControlWithFeedbackAsync(params string[] focusstageArgs)
+    {
+        var fullArgs = new List<string> { "--json" };
+        fullArgs.AddRange(focusstageArgs);
+        var (code, stdout, stderr) = await RunFocusStageFullAsync(fullArgs.ToArray());
+        await RefreshAndRebuildMenuAsync();
+
+        if (code == 0)
+        {
+            return (true, stdout);
+        }
+
+        string errMsg = "";
+        if (!string.IsNullOrWhiteSpace(stdout))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(stdout);
+                if (doc.RootElement.TryGetProperty("message", out var msgEl))
+                {
+                    errMsg = msgEl.GetString() ?? "";
+                }
+            }
+            catch
+            {
+                errMsg = stdout;
+            }
+        }
+        if (string.IsNullOrWhiteSpace(errMsg))
+        {
+            errMsg = string.IsNullOrWhiteSpace(stderr) ? $"Command failed (exit code {code})" : stderr;
+        }
+        return (false, errMsg);
+    }
+
+    public async Task RunControlAndRefreshAsync(params string[] focusstageArgs)
+    {
+        var (ok, msg) = await RunControlWithFeedbackAsync(focusstageArgs);
+        if (!ok)
+        {
+            _notifyIcon.ShowBalloonTip(3500, "FocusStage Error", msg, ToolTipIcon.Error);
+        }
+    }
+
+    public async Task StartDaemonAsync()
     {
         try
         {
             var psi = new ProcessStartInfo("wsl.exe")
             {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
                 UseShellExecute = false,
-                CreateNoWindow = true
+                CreateNoWindow = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
             };
             psi.ArgumentList.Add("-d");
             psi.ArgumentList.Add(_distro);
             psi.ArgumentList.Add("-e");
             psi.ArgumentList.Add("bash");
             psi.ArgumentList.Add("-lc");
-            psi.ArgumentList.Add("nohup focusstaged >/tmp/focusstaged.log 2>&1 </dev/null &");
-            Process.Start(psi);
-            await Task.Delay(900);
+            psi.ArgumentList.Add("if ! focusstage --json ping >/dev/null 2>&1; then LOG=/run/user/$(id -u)/focusstaged.log; if command -v systemd-run >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then systemd-run --user --collect -E DISPLAY -E WAYLAND_DISPLAY -E PULSE_SERVER -E WSL_INTEROP -E PATH -p \"StandardOutput=append:$LOG\" -p \"StandardError=append:$LOG\" focusstaged >/dev/null 2>&1; else setsid -f focusstaged >\"$LOG\" 2>&1 </dev/null; fi; fi; sleep 0.6; focusstage --json ping");
+            using var proc = Process.Start(psi);
+            if (proc is not null)
+            {
+                await proc.WaitForExitAsync();
+            }
         }
-        catch
+        catch (Exception ex)
         {
-            // Ignore startup error; refresh will reflect daemon status.
+            _notifyIcon.ShowBalloonTip(3000, "FocusStage", $"启动 focusstaged 失败: {ex.Message}", ToolTipIcon.Error);
         }
         await RefreshAndRebuildMenuAsync();
     }
@@ -354,6 +598,10 @@ internal sealed class FocusStageTrayContext : ApplicationContext
     {
         await RefreshStateAsync();
         BuildMenu();
+        if (_launcherForm is not null && !_launcherForm.IsDisposed)
+        {
+            _launcherForm.UpdateDaemonAndStages(_daemonAlive, _stages);
+        }
     }
 
     private async Task RefreshStateAsync()
@@ -388,9 +636,12 @@ internal sealed class FocusStageTrayContext : ApplicationContext
         try
         {
             await RefreshStateAsync();
+            if (_launcherForm is not null && !_launcherForm.IsDisposed && _launcherForm.Visible)
+            {
+                _launcherForm.UpdateDaemonAndStages(_daemonAlive, _stages);
+            }
             if (_daemonAlive && _clipboardSyncEnabled)
             {
-                // 1. Windows -> Human-owned WSL stages
                 if (Clipboard.ContainsText())
                 {
                     var currentWin = Clipboard.GetText();
@@ -401,7 +652,6 @@ internal sealed class FocusStageTrayContext : ApplicationContext
                     }
                 }
 
-                // 2. Human-owned WSL stages -> Windows
                 var (code, stdout) = await RunFocusStageAsync("--json", "host-clipboard-get");
                 if (code == 0 && !string.IsNullOrWhiteSpace(stdout))
                 {
@@ -431,6 +681,12 @@ internal sealed class FocusStageTrayContext : ApplicationContext
 
     private async Task<(int ExitCode, string Stdout)> RunFocusStageAsync(params string[] args)
     {
+        var (code, stdout, _) = await RunFocusStageFullAsync(args);
+        return (code, stdout);
+    }
+
+    private async Task<(int ExitCode, string Stdout, string Stderr)> RunFocusStageFullAsync(params string[] args)
+    {
         try
         {
             var psi = new ProcessStartInfo("wsl.exe")
@@ -452,17 +708,19 @@ internal sealed class FocusStageTrayContext : ApplicationContext
             }
 
             using var proc = Process.Start(psi);
-            if (proc is null) return (-1, "");
+            if (proc is null) return (-1, "", "Failed to start wsl.exe");
 
             var outTask = proc.StandardOutput.ReadToEndAsync();
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+            var errTask = proc.StandardError.ReadToEndAsync();
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
             await proc.WaitForExitAsync(cts.Token);
             var stdout = await outTask;
-            return (proc.ExitCode, stdout.Trim());
+            var stderr = await errTask;
+            return (proc.ExitCode, stdout.Trim(), stderr.Trim());
         }
-        catch
+        catch (Exception ex)
         {
-            return (-1, "");
+            return (-1, "", ex.Message);
         }
     }
 
@@ -470,8 +728,11 @@ internal sealed class FocusStageTrayContext : ApplicationContext
     {
         if (disposing)
         {
+            _signalCts.Cancel();
+            _signalCts.Dispose();
             _syncTimer.Stop();
             _syncTimer.Dispose();
+            _launcherForm?.Dispose();
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
             _hotkeyWindow.Dispose();

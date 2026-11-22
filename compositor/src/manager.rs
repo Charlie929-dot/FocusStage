@@ -5,7 +5,6 @@ use std::process::{Command, Stdio};
 use tracing::{info, warn};
 
 use crate::protocol::{infer_stage_kind, DisplayState, StageKind};
-use crate::sink::DisplaySink;
 use crate::stage::{PendingX11Launch, Stage};
 use crate::state::FocusStageState;
 
@@ -20,6 +19,7 @@ impl FocusStageState {
         width: Option<u32>,
         height: Option<u32>,
         show_on_desktop: Option<bool>,
+        wm_class: Option<String>,
     ) -> Result<(String, Option<u32>), String> {
         self.next_stage_seq += 1;
         let stage_id = format!("stage-{}", self.next_stage_seq);
@@ -43,6 +43,12 @@ impl FocusStageState {
             default_display,
             self.default_scale,
         );
+        if let Some(cls) = wm_class {
+            let trimmed = cls.trim();
+            if !trimmed.is_empty() {
+                stage.wm_class = trimmed.to_string();
+            }
+        }
 
         let profile_dir = self.runtime_base_dir.join("profiles").join(&stage_id);
         let _ = std::fs::create_dir_all(&profile_dir);
@@ -94,7 +100,11 @@ impl FocusStageState {
             return;
         };
 
-        let mut cmd = Command::new(&p.app);
+        let resolved = resolve_launch_executable(&p.app);
+        let mut cmd = Command::new(&resolved);
+        if p.app.to_ascii_lowercase().ends_with(".appimage") {
+            cmd.env("APPIMAGE_EXTRACT_AND_RUN", "1");
+        }
         cmd.args(&p.args);
         apply_common_stage_env(&mut cmd, &self.wayland_socket_name, Some(display_number));
         cmd.env("GDK_BACKEND", "x11");
@@ -138,7 +148,8 @@ impl FocusStageState {
             self.loop_handle.remove(token);
         }
         if let Some(xwm_id) = stage.xwm_id {
-            self.xwms.remove(&xwm_id);
+            // Keep self.xwms entry alive until XwmHandler::disconnected fires so any
+            // in-flight X11Source events draining during teardown never panic.
             self.xwm_to_stage.remove(&xwm_id);
             self.x11_override_windows.remove(&xwm_id);
         }
@@ -227,6 +238,38 @@ impl FocusStageState {
     }
 }
 
+fn resolve_launch_executable(app: &str) -> String {
+    if app.to_ascii_lowercase().ends_with(".appimage") {
+        let src = Path::new(app);
+        if src.is_file() {
+            if let Ok(home) = std::env::var("HOME") {
+                if !home.is_empty() {
+                    if let Some(fname) = src.file_name() {
+                        let cache_dir = PathBuf::from(home).join(".cache/focusstage/appimages");
+                        if std::fs::create_dir_all(&cache_dir).is_ok() {
+                            let dst = cache_dir.join(fname);
+                            let need_copy = match (std::fs::metadata(src), std::fs::metadata(&dst)) {
+                                (Ok(sm), Ok(dm)) => sm.len() != dm.len(),
+                                (Ok(_), Err(_)) => true,
+                                _ => false,
+                            };
+                            if !need_copy || std::fs::copy(src, &dst).is_ok() {
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755));
+                                }
+                                return dst.display().to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    app.to_string()
+}
+
 fn spawn_wayland_stage_process(
     wayland_socket: &str,
     stage_id: &str,
@@ -237,7 +280,11 @@ fn spawn_wayland_stage_process(
     extra_env: &HashMap<String, String>,
     cwd: Option<&str>,
 ) -> Result<std::process::Child, String> {
-    let mut cmd = Command::new(app);
+    let resolved_app = resolve_launch_executable(app);
+    let mut cmd = Command::new(&resolved_app);
+    if app.to_ascii_lowercase().ends_with(".appimage") {
+        cmd.env("APPIMAGE_EXTRACT_AND_RUN", "1");
+    }
 
     match kind {
         StageKind::Chromium | StageKind::Electron => {
