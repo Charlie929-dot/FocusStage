@@ -61,11 +61,34 @@ internal sealed class LinuxSettingsPanel : TransparentPanel
 
     internal Task RefreshAsync() => RefreshAsync(["get"], null);
 
-    private static ComboBox ChoiceBox(string label) => new()
+    private static ComboBox ChoiceBox(string label) => new ScrollSafeChoiceBox
     {
         Dock = DockStyle.Top, Enabled = false, AccessibleName = label, DropDownStyle = ComboBoxStyle.DropDownList,
         DisplayMember = nameof(LinuxAppChoice.Name), Margin = new Padding(0, 2, 0, 0)
     };
+
+    private sealed class ScrollSafeChoiceBox : ComboBox
+    {
+        private const int WmMouseWheel = 0x020A;
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WmMouseWheel && !DroppedDown)
+            {
+                // The native combo box commits a new value even when scrolled without focus.
+                for (Control? parent = Parent; parent is not null; parent = parent.Parent)
+                {
+                    if (parent is ScrollableControl { AutoScroll: true })
+                    {
+                        m.Result = NativeHostInterop.SendMessage(parent.Handle, m.Msg, m.WParam, m.LParam);
+                        break;
+                    }
+                }
+                return;
+            }
+            base.WndProc(ref m);
+        }
+    }
 
     private static Label ChoiceLabel(string label) => new()
     {

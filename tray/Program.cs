@@ -382,8 +382,6 @@ internal sealed class FocusStageTrayContext : ApplicationContext
 
         var launchMenu = new ToolStripMenuItem("Quick Launch Stage");
         launchMenu.DropDownItems.Add("Chromium (Wayland Browser)", null, (_, _) => _ = RunControlAndRefreshAsync("launch", "--ensure-daemon", "--kind", "chromium", "--wm-class", "focusstage-chromium_chromium", "chromium"));
-        launchMenu.DropDownItems.Add("Foot (Wayland Terminal)", null, (_, _) => _ = RunControlAndRefreshAsync("launch", "--ensure-daemon", "--wm-class", "focusstage-foot", "foot"));
-        launchMenu.DropDownItems.Add("XTerm (X11 Terminal)", null, (_, _) => _ = RunControlAndRefreshAsync("launch", "--ensure-daemon", "--kind", "x11", "--wm-class", "focusstage-debian-xterm", "xterm"));
         launchMenu.DropDownItems.Add("Custom command...", null, (_, _) => PromptLaunchCustom());
         _menu.Items.Add(launchMenu);
 
@@ -434,7 +432,7 @@ internal sealed class FocusStageTrayContext : ApplicationContext
         var label = new Label
         {
             AutoSize = true,
-            Text = "Linux command (e.g. chromium, foot, code --no-sandbox, gedit):"
+            Text = "Linux command (e.g. chromium, code --no-sandbox, nautilus):"
         };
         var box = new TextBox
         {
