@@ -111,8 +111,9 @@ FocusStage 要实现的体验：
  │  FocusStage.exe (.NET 8, UI 壳 + 原生宿主)   │                  │
  │   · 图形化启动器：应用网格 / 文件夹 / 快捷方式同步 / 应用中心入口 │
  │   · 内置系统软件（由设置面板演进）：Stage 状态监视 / AI 租约查看  │
- │     / 一键隐藏、显示、接管、关闭 / 守护进程与热键配置            │
- │   · 托盘后台常驻：全局接管热键                                  │
+ │     / 一键隐藏、显示、接管、关闭 / Linux 默认应用与协议关联 / 守护 │
+ │     进程与开机自启配置                                          │
+ │   · 托盘后台常驻：全局接管热键 / 动态浏览器快速启动 / 剪贴板同步  │
  │   · --window-host：原生 Win32 宿主，每顶层窗口对应一个 HWND     │
  └───────────────────────▲────────────────────┼──────────────────┘
                          │ BGRA 帧 / 键鼠、窗口状态与 DPI（stdio）
@@ -125,13 +126,14 @@ FocusStage 要实现的体验：
  │   Offscreen Core  虚拟 wl_output · frame 节拍 · 按需截图       │
  │   Clipboard       每个 Stage 一份选区，按策略与 Windows 互通    │
  │   A11y            AT-SPI 无障碍树（按 PID 归属到 Stage）        │
+ │   XDG & Icons     .desktop 发现 · 图标主题解析 · URI/协议路由  │
  │   Control API     Unix socket，供 MCP / 启动器 / CLI 使用     │
  │                                                              │
  │   DisplaySink 接口 ─── NativeSink  原生 Win32 窗口             │
  │                                                              │
  │        WAYLAND_DISPLAY=focusstage-0  /  每 Stage 一个 Xwayland │
  │              ▼                ▼                ▼              │
- │         [Chromium]      [Electron 应用]    [X11 应用]          │
+ │      [Wayland / Gecko]   [Chromium/Electron]  [X11 应用]       │
  │                                                              │
  │   文件直通：/mnt/c/Users/<user>/...（与 Win11 同一份文件）       │
  └──────────────────────────────────────────────────────────────┘
@@ -145,12 +147,13 @@ FocusStage 要实现的体验：
 
 ### 4.1 Stage Manager
 
-- 根据应用描述（命令、参数、类型 Wayland/X11/Chromium/Electron）启动进程，注入 `WAYLAND_DISPLAY`、`DISPLAY`、`FOCUSSTAGE_STAGE_ID` 等运行环境；
-- X11 Stage：先拉起专属的 rootless `Xwayland`（合成器内置 XWM），再在该 `DISPLAY` 上启动应用；
-- **通用进程归属与生命周期（收敛重点）**：
+- 根据应用描述（命令、参数、类型 `Wayland` / `Chromium` / `Electron` / `Gecko` / `X11`）启动进程，注入 `WAYLAND_DISPLAY`、`DISPLAY`、`FOCUSSTAGE_STAGE_ID`、`FOCUSSTAGE_LAUNCH_TOKEN` 等运行环境（WSL 环境下同时设置 `DONT_PROMPT_WSL_INSTALL=1`）；
+- X11 Stage 以及 Snap 包装的 Chromium/Electron 应用：先拉起专属的 rootless `Xwayland`（合成器内置 XWM），再在对应 `DISPLAY` 上启动应用；`.AppImage` 文件会自动缓存到 `~/.cache/focusstage/appimages` 并以 `APPIMAGE_EXTRACT_AND_RUN=1` 运行；
+- **通用进程归属与生命周期（已落地）**：
   - 不假设“初始启动命令就是常驻 GUI 主进程”——Snap、Electron、IDE 包装脚本常在拉起后台 GUI 后自行退出；
-  - 进程归属结合 Stage 标识环境（如 `FOCUSSTAGE_STAGE_ID`）、独立隔离边界与进程树信息，而不仅依赖初始 PID 的单层父子链；
-  - 初始壳进程正常退出时不立即误杀 Stage，结合宽限期与窗口/存活进程状态统一回收；异常退出时记录 `stderr` 摘要至守护进程日志，避免静默失败。
+  - 进程归属结合唯一启动令牌（`FOCUSSTAGE_LAUNCH_TOKEN`，经 `/proc/<pid>/environ` 匹配）、Stage 标识环境与进程树信息，而不仅依赖初始 PID 的单层父子链；
+  - 初始壳进程脱离退出时不误杀 Stage，结合存活窗口与持有同一令牌的进程统一回收；子进程 `stderr` 透出到守护进程日志（含 URI 回调的拉起单独静默 `stderr` 以防泄露凭据），并将已知的启动进程退出状态回传给 `stage_launch`；
+- **单实例复用**：Chromium / Electron / Gecko 等单实例应用重复启动或收到协议回调时，由 `focusstaged` 校验启动环境与 profile 参数后转交给已有的 `Human` Stage（若目标被 Agent 租用、已冻结或匹配歧义则返回错误）。
 
 ### 4.2 Router（虚拟焦点与输入归属）
 
@@ -176,7 +179,8 @@ FocusStage 要实现的体验：
 **NativeSink（唯一桌面显示后端）**
 
 - `focusstaged` 通过 WSL 互操作启动 Windows 侧 `FocusStage.exe --window-host`，以 stdio 二进制协议传输 BGRA 像素帧与键鼠/窗口/DPI 事件；
-- 每个 Desktop 态顶层窗口对应一个独立的无边框 Win32 `HWND`：保留 Linux 应用自身的 CSD 标题栏控件，不叠加 Windows 标题栏，支持 Win11 原生圆角、任务栏按 Stage 分组（`AppUserModelID`）及同 Stage 多窗口；
+- 每个 Desktop 态顶层窗口对应一个独立的无边框 Win32 `HWND`：保留 Linux 应用自身的 CSD 标题栏控件（支持 Wayland 客户端标题栏拖动与缩放，新窗口默认居中），不叠加 Windows 标题栏，支持 Win11 原生圆角、任务栏按 Stage 分组（`AppUserModelID`）及同 Stage 多窗口；
+- 宿主层统一处理 Windows 切窗修饰键同步，防止 `Alt+Tab` 等切窗操作向托管应用漏发 `Alt`；
 - 关闭单个宿主窗口仅向对应 Linux 窗口发送关闭请求；收入后台即隐藏宿主窗口并保留 `SavedRect`，恢复时原位呈现；
 - 跨显示器移动时，向支持 `wp_fractional_scale_v1` 的 Wayland 客户端同步该窗口的 DPI 更新；X11 客户端走 XWayland 缩放路径。
 
@@ -209,22 +213,25 @@ FocusStage 要实现的体验：
 
 ### 4.8 文件与外部集成
 
-- 引导应用的默认目录（XDG User Dirs）指向 `/mnt/c/Users/<user>/` 下的桌面、下载等目录；
+- 引导应用的默认目录（XDG User Dirs）指向 `/mnt/c/Users/<user>/` 下的桌面、下载、文档与图片目录；
 - 已知限制：`/mnt/c` 走 9P 文件系统，大量小文件读写（如大仓库构建）明显变慢，对性能敏感的项目建议放在 WSL 原生文件系统中；
-- 从资源管理器拖文件到宿主窗口：路径 `C:\...` 转为 `/mnt/c/...`，经 `wl_data_device` 投递拖放；
-- 链接打开 / "在文件夹中显示"：按策略交给托管浏览器或 Win11 原生程序。
+- 从资源管理器拖文件到宿主窗口（或 AI 调用 `stage_drop_files`）：路径 `C:\...` 转为 `/mnt/c/...`，经 `wl_data_device` 投递拖放；
+- **默认应用与协议关联（XDG / URI 路由）**：通过 `focusstage settings`（及启动器中的「Linux 系统设置」）维护 `~/.config/focusstage/settings.json` 与用户级 `mimeapps.list` / handler `.desktop` 条目，把 `xdg-open` / `gio open` / `focusstage-open` 收到的 `http(s)`、自定义协议（如 `vscode://`）和本地文件交由 `focusstage open --ensure-daemon` 路由到对应 Stage；默认浏览器支持托管 Linux 浏览器或仅限 HTTP(S) 的 Windows 默认浏览器（`windows-host`）；
+- **桌面会话与图标主题**：`focusstaged` 启动时向 `systemd --user` 导入桌面环境变量并拉起 Polkit 认证代理（供 `xdg-desktop-portal-gtk`、`gnome-keyring` 与提权提示使用）；`focusstage list-apps` / `sync-apps` 通过 Linux GTK 图标主题解析并缓存应用图标供启动器和 Windows 开始菜单复用。
 
 ### 4.9 Windows 启动器与内置系统软件
 
 `FocusStage.exe`（`tray/`）是面向用户的 Windows 交互入口，但严格保持为**展示与入口壳**，不承载合成器核心业务逻辑：
 
 - **图形化应用启动与管理（原生存在方式）**：
-  - 提供无边框桌面风格的应用网格、文件夹整理、自定义命令启动与搜索；
-  - 通过 `focusstage sync-apps` 同步标准 `.desktop` 条目到 Windows 开始菜单（`Programs\FocusStage\`）和桌面快捷方式，支持固定到开始屏幕和任务栏；
-  - 应用发现**只依赖标准 `.desktop` 与自定义命令**；软件安装继续外包给 Ubuntu 应用中心（Dock 快捷入口）或 `apt` 等系统工具，不在启动器内自研包格式安装器。
+  - 提供无边框桌面风格的应用网格、文件夹整理、自定义命令启动（保留带引号参数）与搜索；
+  - 通过 `focusstage sync-apps` 同步标准 `.desktop` 条目到 Windows 开始菜单（`Programs\FocusStage\`）和桌面快捷方式，按 Linux 图标主题生成图标，支持固定到开始屏幕和任务栏；
+  - 应用发现**只依赖标准 `.desktop` 与自定义命令**；软件安装继续外包给 Ubuntu 应用中心（Dock 快捷入口）或 `apt` 等系统工具，不在启动器内自研包格式安装器；
+  - 托盘右键菜单提供全局接管、按 Stage 切换显隐/冻结/接管/关闭、按已安装 Linux 浏览器动态生成的快速启动项，以及 Win11 剪贴板同步开关。
 - **内置系统软件：FocusStage 控制与状态中心（独特价值承载面）**：
-  - 作为启动器内建的一个系统级软件（由当前「设置」覆盖层中的守护进程状态与「运行中的 Stages」列表雏形演进为独立清晰的内置应用视图），专门用于查看和掌控 FocusStage 自身信息：
-    - 守护进程健康状态、启动/重启与全局接管热键配置；
+  - 作为启动器内建的一个系统级软件（由当前「设置」覆盖层中的开机自启、守护进程状态、「Linux 系统设置」与「运行中的 Stages」列表雏形演进为独立清晰的内置应用视图），专门用于查看和掌控 FocusStage 自身信息：
+    - 守护进程健康状态、启动/停止与全局接管热键配置；
+    - Linux 默认浏览器、默认终端与协议关联状态；
     - 所有运行中 Stage 的实时信息（前后台状态、人类控制/AI 租约持有者、窗口列表，后续可扩展实时缩略图与最近 AI 动作摘要）；
     - 对单个 Stage 一键「收入后台 / 恢复桌面 / 立即接管 / 关闭」，以及一键全部接管。
 - **前端演进边界**：
@@ -239,34 +246,46 @@ Windows 上的 Agent 以 **stdio** 方式连接：MCP 配置中把命令设为 `
 
 ### 5.1 工具集
 
+MCP 暴露 12 个下划线命名的工具（服务端同时兼容将 `.` 归一化为 `_`）：
+
 ```text
-stage.list()
-    → [{ stage_id, app, title, display, input_owner, size }]
+stage_list()
+    → { stages: [{ stage_id, app, title, kind, pid, display, input_owner, size, rect, frame_seq, has_surface, scale, wm_class? }] }
 
-stage.list_apps(query?)
-    → [{ id, name, name_zh_cn? }]
+stage_list_apps(query?)
+    → { count, apps: [{ id, name, name_zh_cn? }] }
 
-stage.launch(app_id | app_name | app, args?, wait_ready_ms?=8000, observe?=true)
-    → { stage_id, pid, status, ready?, launcher_exit?, observe_message? } + PNG when captured
+stage_launch(app_id | app_name | app, args?, kind?, cwd?, width?, height?, show_on_desktop?, wm_class?, wait_ready_ms?=8000, observe?=true)
+    → { stage_id, pid, status: ready | timeout | readiness_unavailable, ready?, launcher_exit?, observe_message?, ... } + PNG (when ready & observe)
+    # 异步并行等待首帧就绪，不阻塞其他 Stage 的 MCP 请求
 
-stage.acquire(stage_id, ttl_s, hide?=true)
-    → lease                         # 同一 Stage 同时只有一个租约
+stage_acquire(stage_id, ttl_s?=60, hide?=true, agent_name?)
+    → { lease, stage_id, expires_in_s }   # 同一 Stage 同时只有一个租约
 
-stage.observe(lease, { image?: bool, a11y?: bool })
-    → { frame_seq, png?, a11y_tree? }
+stage_renew(lease, ttl_s?=60)
+    → 续期当前租约
 
-stage.act(lease, actions[], based_on?: frame_seq)
-    → ok | stale | preempted | expired
+stage_observe(lease | stage_id, { image?=true, som?=false, a11y?=false, include_marks?=false })
+    → { stage_id, frame_seq, width, height, logical_width, logical_height, scale, som, mark_count?, marks?, a11y_tree? } + PNG
+    # 仅传 stage_id 时为只读观察，不获取租约也不改变窗口显隐
 
-stage.clipboard_get(lease) / stage.clipboard_set(lease, text)
+stage_act(lease, actions[], { based_on?, observe?=true, settle?, settle_ms?=600, som?=false })
+    → { result: ok | stale | preempted | expired | error, executed_steps, frame_seq, message? } (+ follow-up observation & PNG when observe=true)
 
-stage.drop_files(lease, paths, x?, y?)
+stage_clipboard_get(lease) / stage_clipboard_set(lease, text)
+    → 读写该 Stage 隔离剪贴板
+
+stage_drop_files(lease, paths[], x?, y?)
     → ok | preempted | expired | drop_failed
 
-stage.release(lease, show_on_desktop?=true)
+stage_release(lease, show_on_desktop?=true)
+    → 释放租约并按需恢复桌面窗口
+
+stage_close(stage_id)
+    → 关闭并清理指定 Stage
 ```
 
-`actions[]` 支持：`move`、`click`、`double_click`、`drag`、`scroll`、`key`（含组合键）、`type_text`、`wait(ms)`。MCP 默认返回原图并支持坐标操作；`stage_observe` 和 `stage_act` 可通过 `som: true` 启用 Set-of-Mark 打标，租约下生成的标号可作为后续操作的目标。
+`actions[]` 支持：`move`/`hover`、`click`（支持 `clicks` / `button`）、`double_click`、`drag`（`from`/`to` 或相对位移 `by`）、`scroll`（`direction` 或 `dx`/`dy`）、`key`（单键、组合键如 `Ctrl+A` 或按键数组）、`type_text`/`type`（可选点击目标、`mode: "cover"`、`send: true`）、`wait`/`sleep`。MCP 默认返回原图并支持逻辑坐标操作；`stage_observe` 和 `stage_act` 可通过 `som: true` 启用 Set-of-Mark 打标，同一租约下生成的标号（如 `"AE"`）可作为后续 `stage_act` 的目标。
 
 ### 5.2 语义约定
 
@@ -298,11 +317,15 @@ stage.release(lease, show_on_desktop?=true)
 
 ### M4：原生 Win32 宿主与架构收敛（当前阶段）
 
-- **已完成**：`NativeSink` + `FocusStage.exe --window-host` 原生无标题栏宿主、显示后端单轨化、同 Stage 多窗口与任务栏分组、启动器基础形态与设置/运行中 Stages 雏形。
-- **当前收敛与加固重点**：
-  1. **通用启动与进程生命周期**：解决包装脚本/Snap/Electron 壳进程脱离后台导致的误回收与窗口失联，并向日志透出启动失败错误，替代按单软件打补丁；
-  2. **内置系统软件成形**：将启动器中现有的「设置 + 运行中的 Stages」整理为清晰的内置系统软件（用于集中查看守护进程、Stage 状态、AI 租约与执行切换/接管），启动器其余外围功能封板；
-  3. **浏览器与 CDP 互补（按需）**：为托管浏览器预留远程调试端口能力，让纯网页任务可直接衔接 Playwright / Chrome DevTools MCP，FocusStage 聚焦桌面客户端与人机共享会话。
+- **已完成**：
+  - `NativeSink` + `FocusStage.exe --window-host` 原生无标题栏宿主与显示后端单轨化（移除 WSLg 嵌套后端），支持同 Stage 多窗口、任务栏分组、动态 DPI、新窗口居中、Wayland 标题栏拖动/缩放输入与切窗防漏 `Alt`；
+  - 通用进程归属与生命周期（`FOCUSSTAGE_LAUNCH_TOKEN` 匹配、壳进程脱离保留、`stderr` 透出、Snap/AppImage 兼容）与单实例应用复用、原生 WSL 配置持久化；
+  - Linux 桌面集成与互启：默认浏览器/终端与 XDG 协议关联（`focusstage open` / `focusstage settings` / 设置面板）、Polkit 代理与 Keyring 环境协同、按 Linux 图标主题解析应用图标；
+  - 完整 MCP 应用工作流（`stage_list_apps`、`stage_launch` 就绪等待与首帧截图、`stage_observe` 无租约只读观察、`stage_act` 稳定等待控制、`stage_drop_files` 文件拖放、默认原图 + 按需 `som: true`）以及多客户端输入法注册崩溃修复；
+  - 启动器基础形态、开机自启开关、设置遮罩中的「守护进程 + Linux 系统设置 + 运行中 Stages」雏形，以及按已安装浏览器动态生成的托盘快速启动项。
+- **当前收敛与剩余重点**：
+  1. **内置 Stage 控制中心独立成形**：将启动器设置遮罩中现有的「守护进程 + 运行中的 Stages」提升为独立清晰的内置系统视图（集中展示前后台状态、AI 租约、窗口与一键隐藏/恢复/接管闭环），并封板启动器其余外围功能；
+  2. **按需增强项**：为托管浏览器预留远程调试端口（CDP）以衔接 Playwright / Chrome DevTools MCP；当 WSL 内 Fcitx5 配置成为主要障碍时，推进 Win32 IME 直通 `zwp_text_input_v3`。
 
 ### M5：独立开机形态（远期）
 
@@ -314,7 +337,7 @@ stage.release(lease, show_on_desktop?=true)
 
 | 风险 | 影响 | 应对 |
 | :--- | :--- | :--- |
-| 包装脚本/Snap/Electron 壳进程脱离父进程后退出 | Stage 被提前销毁或窗口无法归属，应用点开无反应 | 通过通用进程归属（环境变量/隔离边界）+ 宽限期/窗口存活回收 + 启动 stderr 日志彻底解决 |
+| 包装脚本/Snap/Electron 壳进程脱离父进程后退出 | Stage 被提前销毁或窗口无法归属，应用点开无反应 | 已通过 `FOCUSSTAGE_LAUNCH_TOKEN` 进程归属 + 脱离父进程保留 + 启动 `stderr` 透出与 `launcher_exit` 回传解决，持续关注特殊包装器兼容 |
 | 自研 Win32 宿主陷入无止境细节坑 | IME、鼠标捕获、光标、缩放等边界问题拖慢迭代 | 聚焦“存在方式自然”，优先修共性机制问题；IME 后续评估 Win32 直通 `text-input-v3` |
 | 启动器膨胀成自研 Linux 应用商店 | 陷入 `.deb`/Snap/AppImage 碎片兼容无底洞 | 应用安装外包给应用中心/`apt`，启动器只认标准 `.desktop` 与自定义命令，UI 封板 |
 | 同款单实例应用由多个 Stage 启动 | 新 Stage 收不到窗口，或打断现有租约 | 将启动和回调统一交给现有 Human Stage，拒绝 Agent、Frozen 与歧义目标 |
