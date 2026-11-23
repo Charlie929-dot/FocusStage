@@ -347,31 +347,34 @@ impl FocusStageState {
         let sid_for_cb = stage_id.clone();
         let token = self
             .loop_handle
-            .insert_source(xwayland, move |event, _, state| match event {
-                XWaylandEvent::Ready {
-                    x11_socket,
-                    display_number,
-                } => {
-                    info!("XWayland ready for {} on DISPLAY=:{}", sid_for_cb, display_number);
-                    match X11Wm::start_wm(handle.clone(), x11_socket, client.clone()) {
-                        Ok(wm) => {
-                            let xwm_id = wm.id();
-                            state.xwms.insert(xwm_id, wm);
-                            state.xwm_to_stage.insert(xwm_id, sid_for_cb.clone());
-                            if let Some(stage) = state.stages.get_mut(&sid_for_cb) {
-                                stage.x11_display_number = Some(display_number);
-                                stage.xwm_id = Some(xwm_id);
+            .insert_source(xwayland, move |event, _, state| {
+                let message = match event {
+                    XWaylandEvent::Ready { x11_socket, display_number } => {
+                        info!("XWayland ready for {} on DISPLAY=:{}", sid_for_cb, display_number);
+                        match X11Wm::start_wm(handle.clone(), x11_socket, client.clone()) {
+                            Ok(wm) => {
+                                let xwm_id = wm.id();
+                                state.xwms.insert(xwm_id, wm);
+                                state.xwm_to_stage.insert(xwm_id, sid_for_cb.clone());
+                                if let Some(stage) = state.stages.get_mut(&sid_for_cb) {
+                                    stage.x11_display_number = Some(display_number);
+                                    stage.xwm_id = Some(xwm_id);
+                                }
+                                state.launch_pending_x11_client(&sid_for_cb, display_number);
+                                return;
                             }
-                            state.launch_pending_x11_client(&sid_for_cb, display_number);
-                        }
-                        Err(err) => {
-                            warn!("Failed to start X11Wm for {}: {}", sid_for_cb, err);
+                            Err(err) => format!("Failed to start X11 window manager: {err}"),
                         }
                     }
-                }
-                XWaylandEvent::Error => {
-                    warn!("XWayland failed for Stage {}", sid_for_cb);
-                }
+                    XWaylandEvent::Error => "XWayland failed to start".into(),
+                };
+                warn!(stage = sid_for_cb, "{message}");
+                let stage_id = sid_for_cb.clone();
+                // Remove the XWayland source after its callback has returned.
+                handle.insert_idle(move |state| {
+                    let _ = state.close_stage(&stage_id);
+                    state.fail_pending_launch(&stage_id, &message);
+                });
             })
             .map_err(|e| format!("insert XWayland source: {e}"))?;
 

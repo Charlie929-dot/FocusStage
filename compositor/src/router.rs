@@ -85,12 +85,14 @@ impl Dispatch<ZwpTextInputManagerV3, ()> for FocusStageState {
                 enabled: false,
                 client_id: cid.clone(),
             });
-            // If this client's Stage already has a live surface, send enter immediately.
-            if let Some(sid) = state.stage_id_for_client(&cid) {
-                if let Some(stage) = state.stages.get(&sid) {
-                    if let Some(surf) = stage.active_toplevel().and_then(|t| t.wl_surface()) {
-                        res.enter(&surf);
-                    }
+            // Clients may share a Stage, but text input can only enter the requesting client's focus.
+            let target = state
+                .stage_id_for_client(&cid)
+                .and_then(|sid| state.stages.get(&sid))
+                .and_then(|stage| stage.input.current_keyboard_target.as_ref());
+            if let Some(StageInputTarget::Wayland(surface)) = target {
+                if surface.is_alive() && surface.id().same_client_as(&res.id()) {
+                    res.enter(surface);
                 }
             }
         }
@@ -587,7 +589,7 @@ impl FocusStageState {
     }
 
     /// Return the surface and its origin in the same coordinates used for rendering.
-    fn hit_test_wayland_surface(&self, root: &WlSurface, point: Point<f64, Logical>) -> (WlSurface, Point<f64, Logical>) {
+    pub(crate) fn hit_test_wayland_surface(&self, root: &WlSurface, point: Point<f64, Logical>) -> (WlSurface, Point<f64, Logical>) {
         // PopupManager yields topmost child popups before their parents.
         for (popup, popup_loc) in PopupManager::popups_for_surface(root) {
             let origin = popup_loc - popup.geometry().loc;

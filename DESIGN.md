@@ -243,8 +243,11 @@ Windows 上的 Agent 以 **stdio** 方式连接：MCP 配置中把命令设为 `
 stage.list()
     → [{ stage_id, app, title, display, input_owner, size }]
 
-stage.launch(app, args?)
-    → stage_id
+stage.list_apps(query?)
+    → [{ id, name, name_zh_cn? }]
+
+stage.launch(app_id | app_name | app, args?, wait_ready_ms?=8000, observe?=true)
+    → { stage_id, pid, status, ready?, launcher_exit?, observe_message? } + PNG when captured
 
 stage.acquire(stage_id, ttl_s, hide?=true)
     → lease                         # 同一 Stage 同时只有一个租约
@@ -256,6 +259,9 @@ stage.act(lease, actions[], based_on?: frame_seq)
     → ok | stale | preempted | expired
 
 stage.clipboard_get(lease) / stage.clipboard_set(lease, text)
+
+stage.drop_files(lease, paths, x?, y?)
+    → ok | preempted | expired | drop_failed
 
 stage.release(lease, show_on_desktop?=true)
 ```

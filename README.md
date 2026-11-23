@@ -122,7 +122,13 @@ wsl.exe -d Ubuntu -e /usr/local/bin/focusstage mcp
 }
 ```
 
-`stage_observe` 可只传 `stage_id`，不会获取租约或更改窗口显隐。`stage_act` 仍需租约；只想发送输入时可用 `observe: false` 跳过截图和默认等待。需要等待时可显式传 `settle: true`，并用 `settle_ms` 覆盖默认的 600 ms 上限。
+打开已安装的 GUI 应用时，先用 `stage_list_apps` 查目录（可传 `query`），再把返回的 `id` 作为 `stage_launch` 的 `app_id`。也可以传唯一的 `app_name`。目录启动复用启动器登记的命令和参数；`app` 仍可用于显式运行命令。
+
+- `stage_launch` 默认等待窗口出图，最多 8 秒（可用 `wait_ready_ms` 指定 1–20000 毫秒），就绪时附上同一窗口帧的原图。`observe: false` 只跳过截图。向已有 Stage 发送打开参数时，等待新窗口或活动窗口的画面更新。显式要求新窗口时，只接受新映射的窗口。
+- `ready` 表示窗口已有可绘制的帧，不代表应用内容已加载完成。如果首张截图仍是空白内容区，可以用 `stage_observe` 获取新一帧。
+- 等待超时返回 `timeout` 并保留 Stage，已知的启动进程退出状态会放在 `launcher_exit`。确认启动失败时返回 `launch_failed`。如果窗口已就绪但截图发生渲染错误，结果保留 `ready` 和 Stage ID，并在 `observe_message` 中说明错误。
+- `stage_observe` 可只传 `stage_id`，不会获取租约或更改窗口显隐。`stage_act` 仍需租约；只想发送输入时可用 `observe: false` 跳过截图和默认等待。需要等待时可显式传 `settle: true`，并用 `settle_ms` 覆盖默认的 600 ms 上限。
+- `stage_drop_files` 需要有效租约和 `paths`（Windows 盘符路径或 WSL 绝对路径）。可同时传 `x`、`y` 指定窗口内逻辑坐标，否则使用当前 Stage 指针位置。成功表示已发送拖放，不保证应用接受文件。
 
 ### 3. 运行 Windows 11 启动器与托盘（`FocusStage.exe`）
 

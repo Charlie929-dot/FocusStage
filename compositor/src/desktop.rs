@@ -104,6 +104,9 @@ pub fn parse(text: &str) -> Option<DesktopEntry> {
             .filter(|value| !value.is_empty())
             .map(|value| (*value).to_owned())
     };
+    if fields.get("TryExec").is_some_and(|value| !value.is_empty() && !try_exec_available(value)) {
+        return None;
+    }
     let mut exec = split_exec(fields.get("Exec")?).into_iter();
     let cmd = exec.next()?;
     let mime_types = fields
@@ -124,6 +127,25 @@ pub fn parse(text: &str) -> Option<DesktopEntry> {
         mime_types,
         wm_class: get("StartupWMClass"),
         no_display: flag("NoDisplay"),
+    })
+}
+
+fn try_exec_available(executable: &str) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let is_executable = |path: &Path| {
+        path.is_file() && CString::new(path.as_os_str().as_bytes()).is_ok_and(|path| {
+            // SAFETY: the CString is NUL-terminated and remains alive for the call.
+            unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+        })
+    };
+    let path = Path::new(executable);
+    if path.is_absolute() {
+        return is_executable(path);
+    }
+    path.file_name() == Some(path.as_os_str()) && std::env::var_os("PATH").is_some_and(|search| {
+        std::env::split_paths(&search).any(|dir| is_executable(&dir.join(path)))
     })
 }
 
@@ -248,6 +270,17 @@ pub fn discover(dirs: &[PathBuf]) -> BTreeMap<String, (PathBuf, DesktopEntry)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_desktop_entries_with_unavailable_try_exec() {
+        let entry = "[Desktop Entry]\nType=Application\nName=Example\nExec=example\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-executable");
+        assert!(parse(&format!("{entry}TryExec={}\n", path.display())).is_none());
+        std::fs::write(&path, b"example").unwrap();
+        assert!(parse(&format!("{entry}TryExec={}\n", path.display())).is_none());
+        assert!(parse(&format!("{entry}TryExec=/bin/sh\n")).is_some());
+    }
 
     #[test]
     fn keeps_hidden_url_handlers_and_expands_uri_as_one_argument() {

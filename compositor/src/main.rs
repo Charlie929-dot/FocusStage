@@ -344,10 +344,11 @@ fn main() -> anyhow::Result<()> {
 
         dispatch_sink_events(&mut state);
 
-        // Tick pending AI action sequences, expire leases, and reap exited processes.
+        // Advance pending control requests without blocking the compositor loop.
         state.tick_pending_act_jobs();
         state.expire_leases();
         state.reap_exited_stages();
+        state.tick_pending_launches();
         state.popups.cleanup();
         state.virtual_outputs.cleanup();
 

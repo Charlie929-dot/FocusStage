@@ -704,7 +704,7 @@ fn linux_route(id: &str, app: &DesktopEntry, target: &OpenTarget) -> OpenRoute {
     }
 }
 
-fn file_uri(path: &str) -> String {
+pub(crate) fn file_uri(path: &str) -> String {
     let mut out = String::from("file://");
     for byte in path.bytes() {
         if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {

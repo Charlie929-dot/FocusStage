@@ -14,8 +14,20 @@ use crate::xdg::{self, OpenRoute, OpenTarget};
 use crate::stage::Stage;
 use crate::state::FocusStageState;
 
+pub(crate) struct StageLaunch {
+    pub stage_id: String,
+    pub pid: Option<u32>,
+    pub handoff: Option<HandoffWindows>,
+}
+
+pub(crate) struct HandoffWindows {
+    pub previous: HashMap<String, u64>,
+    pub new_window: bool,
+    pub show: bool,
+}
+
 impl FocusStageState {
-    pub fn launch_stage(
+    pub(crate) fn launch_stage(
         &mut self,
         app: String,
         args: Vec<String>,
@@ -26,7 +38,8 @@ impl FocusStageState {
         height: Option<u32>,
         show_on_desktop: Option<bool>,
         wm_class: Option<String>,
-    ) -> Result<(String, Option<u32>), String> {
+        wait_for_handoff: Option<bool>,
+    ) -> Result<StageLaunch, String> {
         let inferred_kind = infer_stage_kind(&app);
         let kind = kind_opt.unwrap_or(inferred_kind);
         let show = show_on_desktop.unwrap_or(self.display_sink.is_some());
@@ -38,9 +51,23 @@ impl FocusStageState {
                 if extra_env.iter().any(|(key, value)| stage.launch_env.get(key) != Some(value)) {
                     return Err("The running Stage uses a different launch environment; close it before changing the environment".into());
                 }
-                let result = self.handoff_to_stage(stage_id, &app, args, cwd.as_deref(), show, false)
+                let new_window = args.iter().take_while(|arg| arg.as_str() != "--")
+                    .any(|arg| matches!(arg.as_str(), "--new-window" | "-new-window"));
+                let handoff = wait_for_handoff.filter(|&wait_for_update| new_window || wait_for_update)
+                    .map(|_| HandoffWindows {
+                        previous: stage.windows.iter().filter(|window| window.mapped)
+                            .map(|window| (window.id.clone(), window.content_seq)).collect(),
+                        new_window,
+                        show,
+                    });
+                if handoff.is_some() && self.pending_launches.iter().any(|pending| {
+                    pending.stage_id == stage_id && pending.handoff.is_some()
+                }) {
+                    return Err("A window launch is already pending for this Stage".into());
+                }
+                let (stage_id, pid) = self.handoff_to_stage(stage_id, &app, args, cwd.as_deref(), show, false)
                     .map_err(|err| err.to_string())?;
-                return Ok(result);
+                return Ok(StageLaunch { stage_id, pid, handoff });
             }
         }
 
@@ -82,7 +109,7 @@ impl FocusStageState {
                 self.stages.remove(&stage_id);
                 return Err(err);
             }
-            return Ok((stage_id, None));
+            return Ok(StageLaunch { stage_id, pid: None, handoff: None });
         }
 
         let child = spawn_stage_process(&self.wayland_socket_name, &stage, None)
@@ -92,7 +119,7 @@ impl FocusStageState {
         stage.child = Some(child);
         self.stages.insert(stage_id.clone(), stage);
         info!("Launched {} Stage {} (pid={})", format!("{:?}", kind), stage_id, pid);
-        Ok((stage_id, Some(pid)))
+        Ok(StageLaunch { stage_id, pid: Some(pid), handoff: None })
     }
 
     pub fn open_uri(&mut self, uri: &str, handler: Option<&str>, peer_pid: Option<u32>) -> anyhow::Result<ControlResponse> {
@@ -111,9 +138,9 @@ impl FocusStageState {
             return Ok(ControlResponse::Opened { stage_id: Some(stage_id), reused: true });
         }
         let wm_class = Some(format!("{}{}", crate::desktop::WRAPPER_PREFIX, id));
-        let (stage_id, _) = self.launch_stage(app, args, None, HashMap::new(), None, None, None, None, wm_class)
+        let launch = self.launch_stage(app, args, None, HashMap::new(), None, None, None, None, wm_class, None)
             .map_err(anyhow::Error::msg)?;
-        Ok(ControlResponse::Opened { stage_id: Some(stage_id), reused: false })
+        Ok(ControlResponse::Opened { stage_id: Some(launch.stage_id), reused: false })
     }
 
     fn find_handoff_stage(&self, app: &str, id: Option<&str>, wm_class: Option<&str>) -> anyhow::Result<Option<String>> {
@@ -171,7 +198,9 @@ impl FocusStageState {
                 info!(stage = stage_id, kind = ?stage.kind, display_number, pid, "Launched Stage with XWayland");
             }
             Err(err) => {
-                warn!("Failed to launch '{}' for {}: {}", stage.app, stage_id, err);
+                let message = format!("Failed to launch '{}': {err}", stage.app);
+                warn!(stage = stage_id, "{message}");
+                self.fail_pending_launch(stage_id, &message);
                 let _ = self.close_stage(stage_id);
             }
         }
@@ -223,6 +252,9 @@ impl FocusStageState {
                         info!(stage = %id, app = %stage.app, %status, "Stage launcher exited");
                     } else {
                         warn!(stage = %id, app = %stage.app, %status, "Stage launcher failed");
+                    }
+                    for pending in self.pending_launches.iter_mut().filter(|pending| pending.stage_id == *id) {
+                        pending.launcher_exit = Some(status);
                     }
                     stage.child = None;
                     stage.pid = None;
@@ -751,11 +783,11 @@ mod tests {
             SavedRect { x: 0, y: 0, width: 640, height: 480 }, None,
         );
         let pid_file = runtime.path().join("worker.pid");
-        let (id, launcher_pid) = state.launch_stage(
+        let StageLaunch { stage_id: id, pid: launcher_pid, .. } = state.launch_stage(
             "/bin/sh".into(),
             vec!["-c".into(), "sleep 10 & printf '%s\\n' \"$!\" > \"$1\"".into(),
                  "sh".into(), pid_file.to_string_lossy().into_owned()],
-            Some(StageKind::Wayland), HashMap::new(), None, None, None, None, None,
+            Some(StageKind::Wayland), HashMap::new(), None, None, None, None, None, None,
         ).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while state.stages[&id].child.is_some() && Instant::now() < deadline {

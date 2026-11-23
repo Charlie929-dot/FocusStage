@@ -192,6 +192,7 @@ pub struct StageWindow {
     pub host_close_requested: bool,
     pub mapped: bool,
     pub dirty: bool,
+    pub(crate) content_seq: u64,
 }
 
 impl StageWindow {
@@ -374,6 +375,7 @@ impl Stage {
             host_close_requested: false,
             mapped: false,
             dirty: true,
+            content_seq: 0,
         });
         id
     }

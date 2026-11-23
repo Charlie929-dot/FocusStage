@@ -104,6 +104,7 @@ pub struct FocusStageState {
     pub x11_override_windows: HashMap<XwmId, Vec<(X11Surface, Option<u32>)>>,
 
     pub pending_act_jobs: Vec<PendingActJob>,
+    pub(crate) pending_launches: Vec<crate::control::PendingLaunch>,
     pub a11y: A11yCollector,
     pub display_sink: Option<Box<dyn DisplaySink>>,
     pub should_quit: bool,
@@ -175,6 +176,7 @@ impl FocusStageState {
             xwm_to_stage: HashMap::new(),
             x11_override_windows: HashMap::new(),
             pending_act_jobs: Vec::new(),
+            pending_launches: Vec::new(),
             a11y,
             display_sink,
             should_quit: false,
@@ -371,7 +373,11 @@ impl CompositorHandler for FocusStageState {
                 }
             }
             if significant || damage_area > 0 {
-                self.stages.get_mut(stage_id).unwrap().mark_visual_update(Some(&id), significant);
+                let stage = self.stages.get_mut(stage_id).unwrap();
+                if significant {
+                    stage.window_mut(&id).unwrap().content_seq += 1;
+                }
+                stage.mark_visual_update(Some(&id), significant);
             }
         } else if let Some(client) = surface.client().filter(|_| significant || damage_area > 0) {
             if let Some(stage_id) = self.stage_id_for_client(&client.id()) {
@@ -592,12 +598,16 @@ mod tests {
     use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner;
     use smithay::reexports::wayland_server::Display;
     use wayland_client::protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm,
-        wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
+        wl_data_offer, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_subcompositor,
+        wl_subsurface, wl_surface,
     };
     use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
     use wayland_protocols::wp::fractional_scale::v1::client::{
         wp_fractional_scale_manager_v1 as c_scale_manager, wp_fractional_scale_v1 as c_scale,
+    };
+    use wayland_protocols::wp::text_input::zv3::client::{
+        zwp_text_input_manager_v3 as c_text_manager, zwp_text_input_v3 as c_text,
     };
     use wayland_protocols::xdg::shell::client::{
         xdg_positioner as c_pos, xdg_popup as c_popup, xdg_surface as c_surface,
@@ -654,7 +664,11 @@ mod tests {
         wm_base: Option<c_wm::XdgWmBase>,
         shm: Option<wl_shm::WlShm>,
         seat: Option<wl_seat::WlSeat>,
+        data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
         pointer_enters: Vec<(u32, f64, f64)>,
+        text_input_manager: Option<c_text_manager::ZwpTextInputManagerV3>,
+        text_input_enters: Vec<wl_surface::WlSurface>,
+        drop_enters: Vec<(u32, f64, f64)>,
         fractional_scale: Option<c_scale_manager::WpFractionalScaleManagerV1>,
         preferred_scales: HashMap<u32, u32>,
         window_configures: HashMap<u32, (i32, i32, Vec<u32>)>,
@@ -698,6 +712,12 @@ mod tests {
                     "wp_fractional_scale_manager_v1" => {
                         state.fractional_scale = Some(reg.bind(name, 1, qh, ()));
                     }
+                    "zwp_text_input_manager_v3" => {
+                        state.text_input_manager = Some(reg.bind(name, 1, qh, ()));
+                    }
+                    "wl_data_device_manager" => {
+                        state.data_device_manager = Some(reg.bind(name, version.min(3), qh, ()));
+                    }
                     "wl_seat" => {
                         let seat: wl_seat::WlSeat = reg.bind(name, version.min(7), qh, ());
                         let _ = seat.get_pointer(qh, ());
@@ -733,9 +753,44 @@ mod tests {
     impl Dispatch<wl_buffer::WlBuffer, ()> for TestClient {
         fn event(_: &mut Self, _: &wl_buffer::WlBuffer, _: wl_buffer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
     }
+    impl Dispatch<wl_data_device_manager::WlDataDeviceManager, ()> for TestClient {
+        fn event(_: &mut Self, _: &wl_data_device_manager::WlDataDeviceManager, _: wl_data_device_manager::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<wl_data_offer::WlDataOffer, ()> for TestClient {
+        fn event(_: &mut Self, _: &wl_data_offer::WlDataOffer, _: wl_data_offer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<wl_data_device::WlDataDevice, ()> for TestClient {
+        wayland_client::event_created_child!(TestClient, wl_data_device::WlDataDevice, [
+            wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
+        ]);
+
+        fn event(state: &mut Self, _: &wl_data_device::WlDataDevice, event: wl_data_device::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+            if let wl_data_device::Event::Enter { surface, x, y, .. } = event {
+                state.drop_enters.push((surface.id().protocol_id(), x, y));
+            }
+        }
+    }
     impl Dispatch<wl_seat::WlSeat, ()> for TestClient {
         fn event(_: &mut Self, _: &wl_seat::WlSeat, _: wl_seat::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
     }
+    wayland_client::delegate_noop!(TestClient: ignore wl_keyboard::WlKeyboard);
+    wayland_client::delegate_noop!(TestClient: ignore c_text_manager::ZwpTextInputManagerV3);
+
+    impl Dispatch<c_text::ZwpTextInputV3, ()> for TestClient {
+        fn event(
+            state: &mut Self,
+            _: &c_text::ZwpTextInputV3,
+            event: c_text::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let c_text::Event::Enter { surface } = event {
+                state.text_input_enters.push(surface);
+            }
+        }
+    }
+
     impl Dispatch<wl_pointer::WlPointer, ()> for TestClient {
         fn event(state: &mut Self, _: &wl_pointer::WlPointer, event: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
             if let wl_pointer::Event::Enter { surface, surface_x, surface_y, .. } = event {
@@ -872,6 +927,64 @@ mod tests {
         fn set_title(&mut self, _: &str, _: &str) {}
         fn present_owned(&mut self, _: &str, _: u32, _: u32, _: Vec<u8>) {}
         fn poll_events(&mut self) -> Vec<crate::sink::SinkInputEvent> { Vec::new() }
+    }
+
+    #[test]
+    fn text_input_registration_only_enters_the_clients_keyboard_focus() {
+        let event_loop: EventLoop<'static, FocusStageState> = EventLoop::try_new().unwrap();
+        let mut display = Display::new().unwrap();
+        let mut dh = display.handle();
+        let mut state = FocusStageState::new(
+            &dh,
+            event_loop.handle(),
+            "focusstage-text-input-test".into(),
+            1.0,
+            60,
+            SavedRect { x: 0, y: 0, width: 1920, height: 1080 },
+            None,
+        );
+        let mut connect = || {
+            let (server_sock, client_sock) = UnixStream::pair().unwrap();
+            let peer = dh.insert_client(server_sock, Arc::new(ClientState::default())).unwrap();
+            let conn = Connection::from_socket(client_sock).unwrap();
+            let queue = conn.new_event_queue();
+            conn.display().get_registry(&queue.handle(), ());
+            (peer, conn, queue, TestClient::default())
+        };
+        let (first_peer, first_conn, mut first_queue, mut first) = connect();
+        let (second_peer, second_conn, mut second_queue, mut second) = connect();
+        let sid = state.ensure_stage_for_client(&first_peer);
+        state.stages.get_mut(&sid).unwrap().wayland_clients.insert(second_peer.id(), second_peer);
+
+        pump(&mut display, &mut state, &first_conn, &mut first_queue, &mut first);
+        let first_qh = first_queue.handle();
+        let first_seat = first.seat.as_ref().unwrap();
+        first_seat.get_keyboard(&first_qh, ());
+        let first_surface = first.compositor.as_ref().unwrap().create_surface(&first_qh, ());
+        let first_xdg = first.wm_base.as_ref().unwrap().get_xdg_surface(&first_surface, &first_qh, ());
+        let _first_window = first_xdg.get_toplevel(&first_qh, ());
+        first_surface.commit();
+        pump(&mut display, &mut state, &first_conn, &mut first_queue, &mut first);
+        assert!(state.stages[&sid].input.current_keyboard_target.is_some());
+
+        pump(&mut display, &mut state, &second_conn, &mut second_queue, &mut second);
+        let second_qh = second_queue.handle();
+        let second_seat = second.seat.as_ref().unwrap();
+        second_seat.get_keyboard(&second_qh, ());
+        let _second_input = second.text_input_manager.as_ref().unwrap().get_text_input(second_seat, &second_qh, ());
+        pump(&mut display, &mut state, &second_conn, &mut second_queue, &mut second);
+        assert!(second.text_input_enters.is_empty());
+
+        let _first_input = first.text_input_manager.as_ref().unwrap().get_text_input(first.seat.as_ref().unwrap(), &first_qh, ());
+        pump(&mut display, &mut state, &first_conn, &mut first_queue, &mut first);
+        assert_eq!(first.text_input_enters, [first_surface]);
+
+        let second_surface = second.compositor.as_ref().unwrap().create_surface(&second_qh, ());
+        let second_xdg = second.wm_base.as_ref().unwrap().get_xdg_surface(&second_surface, &second_qh, ());
+        let _second_window = second_xdg.get_toplevel(&second_qh, ());
+        second_surface.commit();
+        pump(&mut display, &mut state, &second_conn, &mut second_queue, &mut second);
+        assert_eq!(second.text_input_enters, [second_surface]);
     }
 
     #[test]
@@ -1033,7 +1146,26 @@ mod tests {
             reply_tx,
             peer_pid: None,
         });
-        assert!(matches!(reply_rx.try_recv().unwrap(), crate::protocol::ControlResponse::Acquired { .. }));
+        let crate::protocol::ControlResponse::Acquired { lease, .. } = reply_rx.try_recv().unwrap() else {
+            panic!("expected a lease");
+        };
+        let _data_device = client.data_device_manager.as_ref().unwrap()
+            .get_data_device(client.seat.as_ref().unwrap(), &qh, ());
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        state.activate_sink_window(&sid, &first_id);
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        state.handle_control_message(crate::control::ControlServerMessage {
+            request: crate::protocol::ControlRequest::DropFilesLeased {
+                lease, paths: vec!["/tmp/drop-point.txt".into()], position: Some([20.0, 30.0]),
+            },
+            reply_tx,
+            peer_pid: None,
+        });
+        assert!(matches!(reply_rx.try_recv().unwrap(), crate::protocol::ControlResponse::Ok));
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(client.drop_enters, [(first_surface.id().protocol_id(), 22.0, 33.0)]);
+
+        state.activate_sink_window(&sid, &second_id);
         state.update_window_from_sink(&second_id, inactive.clone());
         pump(&mut display, &mut state, &conn, &mut queue, &mut client);
         assert!(client.window_configures[&second.id().protocol_id()].2.contains(&activated));
@@ -1042,7 +1174,9 @@ mod tests {
         second_surface.attach(None, 0, 0);
         second_surface.commit();
         pump(&mut display, &mut state, &conn, &mut queue, &mut client);
-        assert!(!state.stages[&sid].window(&second_id).unwrap().mapped);
+        let unmapped = state.stages[&sid].window(&second_id).unwrap();
+        assert!(!unmapped.mapped);
+        assert!(state.offscreen.render_launch_png(unmapped, &[]).unwrap().is_none());
         let (_pool, new_buffer) = create_shm_buffer(&shm, &qh, 768, 576);
         second_surface.attach(Some(&new_buffer), 0, 0);
         second_surface.commit();

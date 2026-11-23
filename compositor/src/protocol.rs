@@ -177,6 +177,12 @@ pub enum ControlRequest {
         show_on_desktop: Option<bool>,
         #[serde(default)]
         wm_class: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_ready_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_image: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_wait_for_update: Option<bool>,
     },
     OpenUri {
         uri: String,
@@ -262,6 +268,12 @@ pub enum ControlRequest {
         #[serde(default)]
         y: Option<f64>,
     },
+    DropFilesLeased {
+        lease: String,
+        paths: Vec<String>,
+        #[serde(default)]
+        position: Option<[f64; 2]>,
+    },
     Shutdown,
 }
 
@@ -275,6 +287,15 @@ fn default_true() -> bool {
 
 fn default_scale() -> f64 {
     1.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchFrame {
+    pub frame_seq: u64,
+    pub width: u32,
+    pub height: u32,
+    pub scale: f64,
+    pub png_base64: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +318,17 @@ pub enum ControlResponse {
     Launched {
         stage_id: String,
         pid: Option<u32>,
+    },
+    LaunchReady {
+        stage_id: String,
+        pid: Option<u32>,
+        ready: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<LaunchFrame>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launcher_exit: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observe_message: Option<String>,
     },
     Opened {
         stage_id: Option<String>,

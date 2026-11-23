@@ -1,3 +1,4 @@
+pub mod apps;
 pub mod som;
 
 use std::collections::HashMap;
@@ -92,47 +93,60 @@ pub fn run_mcp_stdio(socket_path: PathBuf) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = BufReader::new(stdin.lock());
-    let mut out = stdout.lock();
-
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let req: JsonRpcRequest = match serde_json::from_str(trimmed) {
-            Ok(r) => r,
-            Err(e) => {
-                let err_resp = JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id: Value::Null,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32700,
-                        message: format!("Parse error: {e}"),
-                    }),
-                };
-                writeln!(out, "{}", serde_json::to_string(&err_resp)?)?;
-                out.flush()?;
+    std::thread::scope(|scope| {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                return Ok(());
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-        };
 
-        // Notifications have no id and expect no response.
-        let Some(id) = req.id else {
-            continue;
-        };
+            let req: JsonRpcRequest = match serde_json::from_str(trimmed) {
+                Ok(req) => req,
+                Err(error) => {
+                    write_rpc_response(&stdout, JsonRpcResponse {
+                        jsonrpc: "2.0",
+                        id: Value::Null,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32700,
+                            message: format!("Parse error: {error}"),
+                        }),
+                    })?;
+                    continue;
+                }
+            };
 
-        let resp = handle_rpc(&client, &state, id, &req.method, req.params);
-        writeln!(out, "{}", serde_json::to_string(&resp)?)?;
-        out.flush()?;
-    }
+            // Notifications have no id and expect no response.
+            let Some(id) = req.id else { continue; };
+            let launch = req.method == "tools/call" && matches!(
+                req.params.get("name").and_then(Value::as_str), Some("stage_launch" | "stage.launch"),
+            );
+            let (client, state, stdout) = (&client, &state, &stdout);
+            let respond = move || write_rpc_response(stdout, handle_rpc(client, state, id, &req.method, req.params));
+            if launch {
+                // Keep reading requests for other Stages while this launch waits for a window.
+                scope.spawn(move || {
+                    if let Err(error) = respond() {
+                        eprintln!("Could not write launch response: {error}");
+                    }
+                });
+            } else {
+                respond()?;
+            }
+        }
+    })
+}
+
+fn write_rpc_response(stdout: &std::io::Stdout, response: JsonRpcResponse) -> anyhow::Result<()> {
+    let line = serde_json::to_string(&response)?;
+    let mut out = stdout.lock();
+    writeln!(out, "{line}")?;
+    out.flush()?;
     Ok(())
 }
 
@@ -205,15 +219,53 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
             Ok(other) => text_ok(json!(other)),
             Err(e) => text_err(e.to_string()),
         },
+        "stage_list_apps" => {
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
+            let apps: Vec<_> = apps::discover_desktop_apps().into_iter()
+                .filter(|app| app.is_launchable() && (app.wrapper_id.to_lowercase().contains(&query)
+                    || app.matches_name(|name| name.to_lowercase().contains(&query))))
+                .map(|app| json!({
+                    "id": app.wrapper_id,
+                    "name": app.parsed.name,
+                    "name_zh_cn": app.parsed.name_zh_cn,
+                }))
+                .collect();
+            text_ok(json!({ "count": apps.len(), "apps": apps }))
+        }
         "stage_launch" => {
-            let app = match args.get("app").and_then(|v| v.as_str()) {
-                Some(a) => a.to_string(),
-                None => return text_err("Missing required parameter 'app'"),
+            let observe = args.get("observe").and_then(Value::as_bool).unwrap_or(true);
+            let wait_ready_ms = match args.get("wait_ready_ms") {
+                Some(value) => match value.as_u64() {
+                    Some(ms @ 1..=20_000) => ms,
+                    _ => return text_err("wait_ready_ms must be between 1 and 20000"),
+                },
+                None => 8_000,
             };
-            let launch_args: Vec<String> = args
-                .get("args")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
+            let app = args.get("app").and_then(Value::as_str);
+            let app_id = args.get("app_id").and_then(Value::as_str);
+            let app_name = args.get("app_name").and_then(Value::as_str);
+            let wm_class = args.get("wm_class").and_then(Value::as_str).map(str::to_owned);
+            let (app, mut launch_args, wm_class) = match (app, app_id, app_name) {
+                (Some(app), None, None) if !app.trim().is_empty() => (app.to_owned(), Vec::new(), wm_class),
+                (None, Some(_), None) | (None, None, Some(_)) => {
+                    let catalog = apps::discover_desktop_apps();
+                    match apps::resolve_app(&catalog, app_id.map(str::trim), app_name.map(str::trim)) {
+                        Ok(entry) => (entry.parsed.cmd.clone(), entry.parsed.launch_args(), Some(entry.wrapper_id.clone())),
+                        Err(error) => return text_err(error),
+                    }
+                }
+                _ => return text_err("Pass exactly one of 'app_id', 'app_name' or 'app'"),
+            };
+            let wait_for_update = if let Some(extra_args) = args.get("args") {
+                let Ok(extra_args) = serde_json::from_value::<Vec<String>>(extra_args.clone()) else {
+                    return text_err("args must be an array of strings");
+                };
+                let has_extra_args = !extra_args.is_empty();
+                launch_args.extend(extra_args);
+                has_extra_args
+            } else {
+                false
+            };
             let kind: Option<StageKind> = args
                 .get("kind")
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -221,7 +273,6 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
             let height = args.get("height").and_then(|v| v.as_u64()).map(|n| n as u32);
             let show_on_desktop = args.get("show_on_desktop").and_then(|v| v.as_bool());
             let cwd = args.get("cwd").and_then(|v| v.as_str()).map(String::from);
-            let wm_class = args.get("wm_class").and_then(|v| v.as_str()).map(String::from);
 
             let req = ControlRequest::Launch {
                 app,
@@ -233,10 +284,28 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
                 height,
                 show_on_desktop,
                 wm_class,
+                wait_ready_ms: Some(wait_ready_ms),
+                launch_image: Some(observe),
+                launch_wait_for_update: Some(wait_for_update),
             };
             match client.call(&req) {
                 Ok(ControlResponse::Launched { stage_id, pid }) => {
-                    text_ok(json!({ "stage_id": stage_id, "pid": pid }))
+                    text_ok(json!({ "stage_id": stage_id, "pid": pid, "status": "readiness_unavailable" }))
+                }
+                Ok(ControlResponse::LaunchReady { stage_id, pid, ready, frame, launcher_exit, observe_message }) => {
+                    let status = if ready { "ready" } else { "timeout" };
+                    let mut meta = json!({ "stage_id": stage_id, "pid": pid, "status": status, "ready": ready });
+                    if let Some(status) = launcher_exit {
+                        meta["launcher_exit"] = json!(status);
+                    }
+                    if let Some(message) = observe_message {
+                        meta["observe_message"] = json!(message);
+                    }
+                    let image = frame.map(|frame| {
+                        add_frame_metadata(&mut meta, frame.frame_seq, frame.width, frame.height, frame.scale, false);
+                        frame.png_base64
+                    });
+                    image_result(meta, image)
                 }
                 Ok(ControlResponse::Error { code, message }) => {
                     text_err(format!("{code}: {message}"))
@@ -359,7 +428,7 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
                             false,
                             false,
                         );
-                        merge_act_and_observe(act_meta, obs)
+                        merge_with_observation(act_meta, obs)
                     } else {
                         text_ok(act_meta)
                     }
@@ -402,6 +471,30 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
                     text_err(format!("{code}: {message}"))
                 }
                 Ok(other) => text_ok(json!(other)),
+                Err(e) => text_err(e.to_string()),
+            }
+        }
+        "stage_drop_files" => {
+            let Some(lease) = args.get("lease").and_then(Value::as_str) else {
+                return text_err("Missing 'lease'");
+            };
+            let Some(paths) = args.get("paths").and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok()) else {
+                return text_err("paths must be a non-empty array of absolute Windows or WSL paths");
+            };
+            if paths.is_empty() {
+                return text_err("paths must not be empty");
+            }
+            let position = match (args.get("x"), args.get("y")) {
+                (None, None) => None,
+                (Some(x), Some(y)) => match (x.as_f64(), y.as_f64()) {
+                    (Some(x), Some(y)) => Some([x, y]),
+                    _ => return text_err("x and y must be numbers"),
+                },
+                _ => return text_err("Pass both x and y in Stage logical coordinates, or omit both"),
+            };
+            match client.call(&ControlRequest::DropFilesLeased { lease: lease.into(), paths, position }) {
+                Ok(ControlResponse::Error { code, message }) => text_err(format!("{code}: {message}")),
+                Ok(response) => text_ok(json!(response)),
                 Err(e) => text_err(e.to_string()),
             }
         }
@@ -530,16 +623,8 @@ fn observe_with_som(
                 }
             }
 
-            let mut meta = json!({
-                "stage_id": stage_id,
-                "frame_seq": frame_seq,
-                "width": width,
-                "height": height,
-                "logical_width": logical_w.round() as u32,
-                "logical_height": logical_h.round() as u32,
-                "scale": eff_scale,
-                "som": image && som_enabled,
-            });
+            let mut meta = json!({ "stage_id": stage_id });
+            add_frame_metadata(&mut meta, frame_seq, width, height, eff_scale, image && som_enabled);
             if let Some(mc) = mark_count {
                 meta["mark_count"] = json!(mc);
             }
@@ -550,18 +635,7 @@ fn observe_with_som(
                 meta["a11y_tree"] = json!(tree);
             }
 
-            let mut content = vec![json!({
-                "type": "text",
-                "text": serde_json::to_string(&meta).unwrap()
-            })];
-            if let Some(b64) = out_b64 {
-                content.push(json!({
-                    "type": "image",
-                    "data": b64,
-                    "mimeType": "image/png"
-                }));
-            }
-            json!({ "content": content, "isError": false })
+            image_result(meta, out_b64)
         }
         Ok(ControlResponse::Error { code, message }) => text_err(format!("{code}: {message}")),
         Ok(other) => text_ok(json!(other)),
@@ -569,7 +643,26 @@ fn observe_with_som(
     }
 }
 
-fn merge_act_and_observe(mut act_meta: Value, obs: Value) -> Value {
+fn add_frame_metadata(meta: &mut Value, seq: u64, width: u32, height: u32, scale: f64, som: bool) {
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    meta["frame_seq"] = json!(seq);
+    meta["width"] = json!(width);
+    meta["height"] = json!(height);
+    meta["logical_width"] = json!((f64::from(width) / scale).round() as u32);
+    meta["logical_height"] = json!((f64::from(height) / scale).round() as u32);
+    meta["scale"] = json!(scale);
+    meta["som"] = json!(som);
+}
+
+fn image_result(meta: Value, png_base64: Option<String>) -> Value {
+    let mut content = vec![json!({ "type": "text", "text": meta.to_string() })];
+    if let Some(data) = png_base64 {
+        content.push(json!({ "type": "image", "data": data, "mimeType": "image/png" }));
+    }
+    json!({ "content": content, "isError": false })
+}
+
+fn merge_with_observation(mut act_meta: Value, obs: Value) -> Value {
     let is_err = obs.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
     let mut content = Vec::new();
     let mut image_item: Option<Value> = None;
@@ -958,21 +1051,34 @@ fn mcp_tools_schema() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
-            "name": "stage_launch",
-            "description": "Launch an application inside an isolated FocusStage (independent process/profile/Xwayland).",
+            "name": "stage_list_apps",
+            "description": "Find launchable Linux apps from the FocusStage launcher catalog. Use a returned ID with stage_launch instead of guessing an executable name.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "app": { "type": "string", "description": "Executable name or path (e.g. chromium, foot, xterm)" },
-                    "args": { "type": "array", "items": { "type": "string" } },
+                    "query": { "type": "string", "description": "Optional case-insensitive substring of an application name or ID" }
+                }
+            }
+        }),
+        json!({
+            "name": "stage_launch",
+            "description": "Open a FocusStage app. Prefer app_id from stage_list_apps or an exact app_name; provide exactly one of app_id, app_name, and app. Wait for a window with a committed frame and return a screenshot by default. On timeout or startup failure, return the status without a blank image.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "app_id": { "type": "string", "description": "Application ID from stage_list_apps" },
+                    "app_name": { "type": "string", "description": "Exact application name from stage_list_apps; use app_id if ambiguous" },
+                    "app": { "type": "string", "description": "Raw executable name or path. Prefer app_id for installed GUI apps." },
+                    "args": { "type": "array", "items": { "type": "string" }, "description": "Extra arguments appended to the application's registered arguments" },
                     "kind": { "type": "string", "enum": ["wayland", "chromium", "electron", "x11"] },
                     "cwd": { "type": "string" },
                     "width": { "type": "integer" },
                     "height": { "type": "integer" },
                     "show_on_desktop": { "type": "boolean" },
-                    "wm_class": { "type": "string", "description": "Optional application identity override for window grouping and icon lookup" }
-                },
-                "required": ["app"]
+                    "wm_class": { "type": "string", "description": "Application identity override for a raw executable launch; catalog launches use the registered identity" },
+                    "wait_ready_ms": { "type": "integer", "minimum": 1, "maximum": 20000, "default": 8000, "description": "Maximum time to wait for the first window frame. On timeout the Stage is kept running." },
+                    "observe": { "type": "boolean", "default": true, "description": "Return an unmarked screenshot once ready. Set false to omit the screenshot without skipping the readiness wait." }
+                }
             }
         }),
         json!({
@@ -1062,6 +1168,20 @@ fn mcp_tools_schema() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "stage_drop_files",
+            "description": "Send a drag-and-drop of local files to the active window of a leased Stage. Use absolute WSL paths or Windows drive paths. Pass both x and y in Stage logical coordinates, or omit both to use the Stage pointer position. Success means the drop was sent, not that the app accepted it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "lease": { "type": "string" },
+                    "paths": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                    "x": { "type": "number" },
+                    "y": { "type": "number" }
+                },
+                "required": ["lease", "paths"]
+            }
+        }),
+        json!({
             "name": "stage_release",
             "description": "Release the Stage lease and optionally restore the window to its saved desktop position.",
             "inputSchema": {
@@ -1126,9 +1246,11 @@ mod tests {
             .iter()
             .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
             .collect();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 12);
         assert!(names.contains(&"stage_list"));
+        assert!(names.contains(&"stage_list_apps"));
         assert!(names.contains(&"stage_launch"));
+        assert!(names.contains(&"stage_drop_files"));
         assert!(names.contains(&"stage_acquire"));
         assert!(names.contains(&"stage_observe"));
         assert!(names.contains(&"stage_act"));
@@ -1138,6 +1260,72 @@ mod tests {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
             assert_eq!(tool["inputSchema"]["properties"]["som"]["default"], false);
         }
+    }
+
+    #[test]
+    fn launch_and_drop_reject_invalid_arguments_before_connecting() {
+        let client = ControlClient::new("/tmp/nonexistent-focusstage.sock");
+        let state = McpState::default();
+        for (tool, args, expected) in [
+            ("stage_launch", json!({ "app_id": "code", "app_name": "Code" }), "Pass exactly one"),
+            ("stage_launch", json!({ "app": "foot", "wait_ready_ms": 0 }), "wait_ready_ms"),
+            ("stage_drop_files", json!({ "paths": ["/tmp/example"] }), "Missing 'lease'"),
+            ("stage_drop_files", json!({ "lease": "test", "paths": [] }), "paths must not be empty"),
+            ("stage_drop_files", json!({ "lease": "test", "paths": ["/tmp/example"], "x": 10 }), "Pass both x and y"),
+        ] {
+            let result = call_tool(&client, &state, tool, args);
+            assert_eq!(result["isError"], true);
+            assert!(result["content"][0]["text"].as_str().unwrap().contains(expected), "{result}");
+        }
+    }
+
+    #[test]
+    fn launch_waits_even_when_screenshot_is_disabled() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            for (timeout, ready, image) in [(8000, true, true), (8000, true, false), (100, false, true)] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                assert!(matches!(serde_json::from_str(&request).unwrap(),
+                    ControlRequest::Launch { wait_ready_ms: Some(ms), launch_image: Some(capture), .. }
+                        if ms == timeout && capture == image));
+                let response = ControlResponse::LaunchReady {
+                    stage_id: "stage-1".into(),
+                    pid: Some(42),
+                    ready,
+                    frame: (ready && image).then(|| focusstage_compositor::protocol::LaunchFrame {
+                        frame_seq: 1, width: 1, height: 1, scale: 1.0, png_base64: "cG5n".into(),
+                    }),
+                    launcher_exit: (!ready).then(|| "exit status: 23".into()),
+                    observe_message: None,
+                };
+                writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            }
+        });
+
+        let client = ControlClient::new(socket);
+        let state = McpState::default();
+        for (args, status, image) in [
+            (json!({ "app": "foot" }), "ready", true),
+            (json!({ "app": "foot", "observe": false }), "ready", false),
+            (json!({ "app": "foot", "wait_ready_ms": 100 }), "timeout", false),
+        ] {
+            let result = call_tool(&client, &state, "stage_launch", args);
+            assert_eq!(result["isError"], false, "{result}");
+            let meta: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(meta["status"], status);
+            let content = result["content"].as_array().unwrap();
+            assert_eq!(content.len(), if image { 2 } else { 1 });
+            if image {
+                assert_eq!(content[1]["type"], "image");
+            }
+        }
+        server.join().unwrap();
     }
 
     #[test]

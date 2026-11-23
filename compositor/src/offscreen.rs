@@ -4,7 +4,7 @@ use drm_fourcc::DrmFourcc;
 use smithay::backend::renderer::element::surface::{
     render_elements_from_surface_tree, WaylandSurfaceRenderElement,
 };
-use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::{Element, Kind};
 use smithay::backend::renderer::pixman::PixmanRenderer;
 use smithay::backend::renderer::utils::draw_render_elements;
 use smithay::backend::renderer::{
@@ -58,6 +58,19 @@ impl OffscreenCore {
         x11_override_windows: &[smithay::xwayland::X11Surface],
         out: &mut Vec<u8>,
     ) -> Result<(u32, u32), String> {
+        self.render_window(window, size, scale, x11_override_windows, out, false)
+            .map(|dimensions| dimensions.expect("background frames are allowed"))
+    }
+
+    fn render_window(
+        &mut self,
+        window: Option<&StageWindow>,
+        size: smithay::utils::Size<i32, smithay::utils::Logical>,
+        scale: f64,
+        x11_override_windows: &[smithay::xwayland::X11Surface],
+        out: &mut Vec<u8>,
+        require_content: bool,
+    ) -> Result<Option<(u32, u32)>, String> {
         let logical_w = size.w.max(1);
         let logical_h = size.h.max(1);
         let [phys_w, phys_h] = window.and_then(|w| w.pixel_size).map(|size| size.map(|v| v as i32))
@@ -147,6 +160,12 @@ impl OffscreenCore {
             }
         }
 
+        if require_content && !elements.iter().any(|element| {
+            element.alpha() > 0.0 && element.geometry(Scale::from(scale)).overlaps(damage)
+        }) {
+            return Ok(None);
+        }
+
         let mut img = match self.cached_image.take() {
             Some((cw, ch, img)) if cw == phys_w && ch == phys_h => img,
             _ => self
@@ -204,7 +223,7 @@ impl OffscreenCore {
 
         self.cached_image = Some((phys_w, phys_h, img));
         render_res?;
-        Ok((phys_w as u32, phys_h as u32))
+        Ok(Some((phys_w as u32, phys_h as u32)))
     }
 
     pub fn render_stage_bgra(
@@ -227,22 +246,32 @@ impl OffscreenCore {
         x11_override_windows: &[smithay::xwayland::X11Surface],
     ) -> Result<(u32, u32, Vec<u8>), String> {
         let (w, h, bgra) = self.render_stage_bgra(stage, x11_override_windows)?;
-        let rgba = bgra_premul_to_rgba(&bgra);
-
-        let mut png_bytes = Vec::new();
-        {
-            let mut encoder = png::Encoder::new(&mut png_bytes, w, h);
-            encoder.set_color(png::ColorType::Rgba);
-            encoder.set_depth(png::BitDepth::Eight);
-            let mut writer = encoder
-                .write_header()
-                .map_err(|e| format!("png header: {e}"))?;
-            writer
-                .write_image_data(&rgba)
-                .map_err(|e| format!("png encode: {e}"))?;
-        }
-        Ok((w, h, png_bytes))
+        Ok((w, h, encode_png(w, h, &bgra)?))
     }
+
+    pub(crate) fn render_launch_png(
+        &mut self,
+        window: &StageWindow,
+        x11_override_windows: &[smithay::xwayland::X11Surface],
+    ) -> Result<Option<(u32, u32, Vec<u8>)>, String> {
+        let mut bgra = Vec::new();
+        let dimensions = self.render_window(
+            Some(window), window.logical_size, window.scale, x11_override_windows, &mut bgra, true,
+        )?;
+        dimensions.map(|(w, h)| Ok((w, h, encode_png(w, h, &bgra)?))).transpose()
+    }
+}
+
+fn encode_png(width: u32, height: u32, bgra: &[u8]) -> Result<Vec<u8>, String> {
+    let rgba = bgra_premul_to_rgba(bgra);
+    let mut png_bytes = Vec::new();
+    let mut encoder = png::Encoder::new(&mut png_bytes, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|e| format!("png header: {e}"))?;
+    writer.write_image_data(&rgba).map_err(|e| format!("png encode: {e}"))?;
+    writer.finish().map_err(|e| format!("png finish: {e}"))?;
+    Ok(png_bytes)
 }
 
 pub fn bgra_premul_to_rgba(bgra: &[u8]) -> Vec<u8> {
