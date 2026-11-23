@@ -102,6 +102,8 @@ pub struct StageInputState {
     pub pressed_keys: HashSet<u32>,
     /// Pointer coordinates in Stage-logical pixels (origin = main window top-left)
     pub pointer_pos: Point<f64, Logical>,
+    /// Position of the focused Wayland surface relative to the window.
+    pub pointer_surface_origin: Point<f64, Logical>,
     pub pointer_window_id: Option<String>,
     /// Evdev mouse button codes currently pressed on this Stage
     pub pressed_buttons: HashSet<u32>,
@@ -137,6 +139,7 @@ impl StageInputState {
             mods_state,
             pressed_keys: HashSet::new(),
             pointer_pos: Point::from((10.0, 10.0)),
+            pointer_surface_origin: Point::default(),
             pointer_window_id: None,
             pressed_buttons: HashSet::new(),
             current_keyboard_target: None,

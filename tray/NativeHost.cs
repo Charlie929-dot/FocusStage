@@ -195,7 +195,7 @@ internal static class NativeHost
                         window.ParentId = command.ParentWindowId;
                         UpdateOwners();
                     }
-                    window.Show(command.Title, command.Rect, command.Maximized);
+                    window.Show(command.Title, command.Rect, command.Maximized, added);
                     break;
                 case "frame":
                     if (window is null)

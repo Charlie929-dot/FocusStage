@@ -593,7 +593,7 @@ mod tests {
     use smithay::reexports::wayland_server::Display;
     use wayland_client::protocol::{
         wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm,
-        wl_shm_pool, wl_surface,
+        wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
     };
     use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
     use wayland_protocols::wp::fractional_scale::v1::client::{
@@ -650,6 +650,7 @@ mod tests {
     #[derive(Default)]
     struct TestClient {
         compositor: Option<wl_compositor::WlCompositor>,
+        subcompositor: Option<wl_subcompositor::WlSubcompositor>,
         wm_base: Option<c_wm::XdgWmBase>,
         shm: Option<wl_shm::WlShm>,
         seat: Option<wl_seat::WlSeat>,
@@ -685,6 +686,9 @@ mod tests {
                     "wl_compositor" => {
                         state.compositor = Some(reg.bind(name, version.min(6), qh, ()));
                     }
+                    "wl_subcompositor" => {
+                        state.subcompositor = Some(reg.bind(name, 1, qh, ()));
+                    }
                     "xdg_wm_base" => {
                         state.wm_base = Some(reg.bind(name, version.min(6), qh, ()));
                     }
@@ -710,6 +714,12 @@ mod tests {
     }
     impl Dispatch<wl_surface::WlSurface, ()> for TestClient {
         fn event(_: &mut Self, _: &wl_surface::WlSurface, _: wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<wl_subcompositor::WlSubcompositor, ()> for TestClient {
+        fn event(_: &mut Self, _: &wl_subcompositor::WlSubcompositor, _: wl_subcompositor::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    impl Dispatch<wl_subsurface::WlSubsurface, ()> for TestClient {
+        fn event(_: &mut Self, _: &wl_subsurface::WlSubsurface, _: wl_subsurface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
     }
     impl Dispatch<wl_callback::WlCallback, ()> for TestClient {
         fn event(_: &mut Self, _: &wl_callback::WlCallback, _: wl_callback::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
@@ -966,6 +976,28 @@ mod tests {
         pump(&mut display, &mut state, &conn, &mut queue, &mut client);
         assert_eq!(state.stages[&sid].active_window().unwrap().id, second_id);
         assert_eq!(client.pointer_enters.last().unwrap().0, first_surface.id().protocol_id());
+
+        // Client-side title bars may be separate surfaces above the toplevel buffer.
+        let title = compositor.create_surface(&qh, ());
+        let decoration = client.subcompositor.as_ref().unwrap().get_subsurface(&title, &first_surface, &qh, ());
+        decoration.set_position(2, 3);
+        let (_pool, title_buffer) = create_shm_buffer(&shm, &qh, 638, 24);
+        title.attach(Some(&title_buffer), 0, 0);
+        title.commit();
+        first_surface.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        state.send_window_pointer_motion_at(&sid, Some(&first_id), 20.0, 10.0, 0);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let title_enter = (title.id().protocol_id(), 20.0, 10.0);
+        assert_eq!(client.pointer_enters.last(), Some(&title_enter));
+        state.send_window_button_at(&sid, Some(&first_id), 20.0, 10.0, 0x110, true, 1);
+        state.send_window_pointer_motion_at(&sid, Some(&first_id), 28.0, 40.0, 2);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(client.pointer_enters.last(), Some(&title_enter));
+        state.send_window_button_at(&sid, Some(&first_id), 28.0, 40.0, 0x110, false, 3);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(client.pointer_enters.last().unwrap().0, first_surface.id().protocol_id());
+
         assert_eq!(client.preferred_scales[&first.id().protocol_id()], 150);
         assert_eq!(client.preferred_scales[&second.id().protocol_id()], 180);
         let (width, height, flags) = &client.window_configures[&second.id().protocol_id()];

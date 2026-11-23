@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use smithay::backend::input::{Axis, AxisSource, ButtonState};
-use smithay::desktop::PopupManager;
+use smithay::desktop::{utils::under_from_surface_tree, PopupManager, WindowSurfaceType};
 use smithay::input::keyboard::{xkb, KeyboardTarget, KeymapFile, ModifiersState};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerTarget};
 use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::{
@@ -458,21 +458,15 @@ impl FocusStageState {
                     );
                 }
 
-                let ptr_valid = cur_ptr.as_ref().is_some_and(|t| {
-                    t.alive()
-                        && matches!(t, StageInputTarget::Wayland(s) if s == &wl_surf || PopupManager::popups_for_surface(&wl_surf).any(|(p, _)| p.wl_surface() == s))
-                });
-                if virtual_focus && !ptr_valid {
-                    let (target, local) =
-                        self.hit_test_wayland_surface(&wl_surf, pointer_pos.x, pointer_pos.y);
-                    let serial = SERIAL_COUNTER.next_serial();
-                    self.set_pointer_target(
-                        stage_id,
-                        StageInputTarget::Wayland(target),
-                        local,
-                        serial,
-                        time,
-                    );
+                if virtual_focus {
+                    let ptr_valid = cur_ptr.as_ref().is_some_and(|t| {
+                        t.alive() && matches!(t, StageInputTarget::Wayland(s)
+                            if self.window_for_surface(s).is_some_and(|w| w.toplevel.wl_surface().as_ref() == Some(&wl_surf)))
+                    });
+                    if !ptr_valid {
+                        let (target, origin) = self.hit_test_wayland_surface(&wl_surf, pointer_pos);
+                        self.set_wayland_pointer_target(stage_id, target, origin, pointer_pos, SERIAL_COUNTER.next_serial(), time);
+                    }
                 }
             }
             StageToplevel::X11(ref x11_tl) => {
@@ -592,25 +586,30 @@ impl FocusStageState {
         self.stages.get_mut(stage_id).unwrap().input.pressed_buttons.clear();
     }
 
-    /// Resolve Stage-relative `(x, y)` to `(WlSurface | X11Surface target, local_point)` checking popups first.
-    fn hit_test_wayland_surface(&self, root: &WlSurface, x: f64, y: f64) -> (WlSurface, Point<f64, Logical>) {
-        // PopupManager::popups_for_surface yields topmost child popups before their parents.
+    /// Return the surface and its origin in the same coordinates used for rendering.
+    fn hit_test_wayland_surface(&self, root: &WlSurface, point: Point<f64, Logical>) -> (WlSurface, Point<f64, Logical>) {
+        // PopupManager yields topmost child popups before their parents.
         for (popup, popup_loc) in PopupManager::popups_for_surface(root) {
-            let psurf = popup.wl_surface().clone();
-            let geo = popup.geometry();
-            let px = popup_loc.x as f64;
-            let py = popup_loc.y as f64;
-            let pw = geo.size.w.max(1) as f64;
-            let ph = geo.size.h.max(1) as f64;
-            if x >= px && x < px + pw && y >= py && y < py + ph {
-                return (psurf, Point::from((x - px + geo.loc.x as f64, y - py + geo.loc.y as f64)));
+            let origin = popup_loc - popup.geometry().loc;
+            if let Some((surface, origin)) = under_from_surface_tree(popup.wl_surface(), point, origin, WindowSurfaceType::ALL) {
+                return (surface, origin.to_f64());
             }
         }
         let geo_loc = wayland_window_geometry_loc(root);
-        (
-            root.clone(),
-            Point::from((x + geo_loc.x as f64, y + geo_loc.y as f64)),
-        )
+        let origin = Point::from((-geo_loc.x, -geo_loc.y));
+        under_from_surface_tree(root, point, origin, WindowSurfaceType::ALL)
+            .map(|(surface, origin)| (surface, origin.to_f64()))
+            .unwrap_or_else(|| (root.clone(), origin.to_f64()))
+    }
+
+    fn set_wayland_pointer_target(
+        &mut self, stage_id: &str, target: WlSurface, origin: Point<f64, Logical>,
+        point: Point<f64, Logical>, serial: Serial, time: u32,
+    ) -> bool {
+        if let Some(stage) = self.stages.get_mut(stage_id) {
+            stage.input.pointer_surface_origin = origin;
+        }
+        self.set_pointer_target(stage_id, StageInputTarget::Wayland(target), point - origin, serial, time)
     }
 
     pub fn send_stage_pointer_motion(&mut self, stage_id: &str, x: f64, y: f64) {
@@ -629,26 +628,28 @@ impl FocusStageState {
         let Some(toplevel) = self.stages.get(stage_id).and_then(|s| s.input_toplevel(window_id)).cloned() else {
             return;
         };
-        if let Some(stage) = self.stages.get_mut(stage_id) {
-            stage.input.pointer_pos = Point::from((x, y));
-            stage.input.pointer_window_id = window_id.map(str::to_owned);
-        }
+        let point = Point::from((x, y));
+        let input = &mut self.stages.get_mut(stage_id).unwrap().input;
+        let grab = match &input.current_pointer_target {
+            Some(target @ StageInputTarget::Wayland(surface)) if target.alive()
+                && !input.pressed_buttons.is_empty() && input.pointer_window_id.as_deref() == window_id =>
+            {
+                Some((surface.clone(), input.pointer_surface_origin))
+            }
+            _ => None,
+        };
+        input.pointer_pos = point;
+        input.pointer_window_id = window_id.map(str::to_owned);
         let seat = self.seat.clone();
         let serial = SERIAL_COUNTER.next_serial();
 
         match toplevel {
             StageToplevel::Wayland(tl) => {
-                let (target, local) = self.hit_test_wayland_surface(tl.wl_surface(), x, y);
-                let entered = self.set_pointer_target(
-                    stage_id,
-                    StageInputTarget::Wayland(target.clone()),
-                    local,
-                    serial,
-                    time,
-                );
+                let (target, origin) = grab.unwrap_or_else(|| self.hit_test_wayland_surface(tl.wl_surface(), point));
+                let entered = self.set_wayland_pointer_target(stage_id, target.clone(), origin, point, serial, time);
                 if !entered {
                     let ev = MotionEvent {
-                        location: local,
+                        location: point - origin,
                         serial,
                         time,
                     };
@@ -744,9 +745,16 @@ impl FocusStageState {
 
         match toplevel {
             StageToplevel::Wayland(tl) => {
-                let (target, _) = self.hit_test_wayland_surface(tl.wl_surface(), x, y);
+                let input = &self.stages[stage_id].input;
+                let Some(StageInputTarget::Wayland(target)) = input.current_pointer_target.clone() else { return; };
+                let grab_ended = !pressed && input.pressed_buttons.is_empty();
                 PointerTarget::button(&target, &seat, self, &ev);
                 PointerTarget::frame(&target, &seat, self);
+                if grab_ended {
+                    let point = Point::from((x, y));
+                    let (target, origin) = self.hit_test_wayland_surface(tl.wl_surface(), point);
+                    self.set_wayland_pointer_target(stage_id, target, origin, point, SERIAL_COUNTER.next_serial(), time);
+                }
             }
             StageToplevel::X11(x11) => {
                 let geo = x11.geometry();
@@ -889,24 +897,11 @@ impl FocusStageState {
         }
 
         match toplevel {
-            StageToplevel::Wayland(tl) => {
-                let (target, local) = self.hit_test_wayland_surface(tl.wl_surface(), x, y);
-                let same = self
-                    .stages
-                    .get(stage_id)
-                    .and_then(|s| s.input.current_pointer_target.as_ref())
-                    .is_some_and(|cur| cur.same_target(&StageInputTarget::Wayland(target.clone())));
-                if !same {
-                    self.set_pointer_target(
-                        stage_id,
-                        StageInputTarget::Wayland(target.clone()),
-                        local,
-                        SERIAL_COUNTER.next_serial(),
-                        time,
-                    );
+            StageToplevel::Wayland(_) => {
+                if let Some(StageInputTarget::Wayland(target)) = self.stages[stage_id].input.current_pointer_target.clone() {
+                    PointerTarget::axis(&target, &seat, self, frame);
+                    PointerTarget::frame(&target, &seat, self);
                 }
-                PointerTarget::axis(&target, &seat, self, frame);
-                PointerTarget::frame(&target, &seat, self);
             }
             StageToplevel::X11(x11) => {
                 let geo = x11.geometry();

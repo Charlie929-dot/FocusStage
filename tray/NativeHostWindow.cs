@@ -109,7 +109,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
             Console.Error.WriteLine($"FocusStage window host: unable to update window owner ({error}).");
     }
 
-    internal void Show(string title, NativeHost.WindowRect rect, bool maximized)
+    internal void Show(string title, NativeHost.WindowRect rect, bool maximized, bool firstShow)
     {
         _placing = true;
         try
@@ -118,12 +118,13 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
             if (IsIconic(Handle) || (!maximized && IsZoomed(Handle)))
                 ShowWindow(Handle, SwRestore);
             // Preserve the exact HWND placement (including a Snap zone) across Stage hide/show.
-            if (!IsZoomed(Handle) && _lastState?.Rect != rect)
+            if (!IsZoomed(Handle) && (firstShow || _lastState?.Rect != rect))
             {
+                NativeRect? work = firstShow ? InitialWorkArea() : null;
                 double scale = Scale;
-                Place(rect, scale);
+                Place(rect, scale, work);
                 if (Scale != scale)
-                    Place(rect, Scale);
+                    Place(rect, Scale, work);
             }
             if (maximized && !IsZoomed(Handle))
                 ShowWindow(Handle, SwMaximize);
@@ -343,10 +344,26 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         return left ? HtLeft : right ? HtRight : HtClient;
     }
 
-    private void Place(NativeHost.WindowRect rect, double scale)
+    private NativeRect InitialWorkArea()
     {
-        if (!SetWindowPos(Handle, 0, rect.X, rect.Y, ToPixels(rect.Width, scale), ToPixels(rect.Height, scale),
-            SwpNoZOrder | SwpNoActivate | SwpNoOwnerZOrder))
+        nint reference = Owner;
+        if (reference == 0)
+            reference = GetForegroundWindow();
+        return WorkAreaForMonitor(MonitorFromWindow(reference != 0 ? reference : Handle, MonitorDefaultToNearest)).Work;
+    }
+
+    private void Place(NativeHost.WindowRect rect, double scale, NativeRect? workArea)
+    {
+        int x = rect.X, y = rect.Y;
+        int width = ToPixels(rect.Width, scale), height = ToPixels(rect.Height, scale);
+        if (workArea is { } work)
+        {
+            width = Math.Min(width, work.Width);
+            height = Math.Min(height, work.Height);
+            x = work.Left + (work.Width - width) / 2;
+            y = work.Top + (work.Height - height) / 2;
+        }
+        if (!SetWindowPos(Handle, 0, x, y, width, height, SwpNoZOrder | SwpNoActivate | SwpNoOwnerZOrder))
             throw new Win32Exception(Marshal.GetLastWin32Error());
     }
 
