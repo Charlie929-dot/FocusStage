@@ -1,13 +1,13 @@
 use smithay::desktop::{find_popup_root_surface, PopupManager};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::Rectangle;
 use smithay::wayland::compositor::get_parent;
 
 use crate::protocol::{DisplayState, SavedRect};
 use crate::sink::{DisplaySink, WindowInfo, WindowState};
 use crate::stage::{Stage, StageToplevel, StageWindow};
 use crate::state::FocusStageState;
+use crate::xwayland::hosted_x11_geometry;
 
 fn show(sink: &mut dyn DisplaySink, stage: &Stage, window: &StageWindow) {
     sink.show(WindowInfo {
@@ -15,6 +15,7 @@ fn show(sink: &mut dyn DisplaySink, stage: &Stage, window: &StageWindow) {
         stage_id: &stage.id,
         title: &window.title,
         wm_class: &stage.wm_class,
+        icon_png: stage.desktop_icon_png(),
         rect: window.saved_rect,
         scale: window.scale,
         parent_window_id: window.parent_window_id.as_deref(),
@@ -180,10 +181,8 @@ impl FocusStageState {
         };
         match stage.display {
             DisplayState::Hidden => {
-                for window in &mut stage.windows {
-                    if let Some(rect) = sink.hide(&window.id) {
-                        window.saved_rect = rect;
-                    }
+                for window in &stage.windows {
+                    sink.hide(&window.id);
                 }
             }
             DisplayState::Desktop => {
@@ -208,7 +207,7 @@ impl FocusStageState {
         self.ensure_virtual_focus(stage_id);
     }
 
-    pub fn send_sink_key(&mut self, stage_id: &str, window_id: &str, key: u32, pressed: bool, time: u32) {
+    pub fn send_sink_key(&mut self, stage_id: &str, window_id: &str, key: u32, pressed: bool) {
         if pressed {
             self.activate_sink_window(stage_id, window_id);
         } else {
@@ -218,8 +217,7 @@ impl FocusStageState {
                 return;
             }
         }
-        let time = self.resolve_input_time(time);
-        self.send_stage_evdev_key_at(stage_id, key, pressed, time);
+        self.send_stage_evdev_key(stage_id, key, pressed);
     }
 
     pub fn close_window_from_sink(&mut self, window_id: &str) {
@@ -236,10 +234,6 @@ impl FocusStageState {
                 let _ = w.close();
             }
         }
-    }
-
-    pub fn resize_window_from_sink(&mut self, window_id: &str, rect: SavedRect) {
-        self.configure_sink_window(window_id, rect, None);
     }
 
     pub fn update_window_from_sink(&mut self, window_id: &str, mut state: WindowState) {
@@ -321,8 +315,9 @@ impl FocusStageState {
                 w.send_pending_configure();
             }
             StageToplevel::X11(w) => {
-                if size_changed {
-                    let _ = w.configure(Rectangle::new(w.geometry().loc, size));
+                let geometry = hosted_x11_geometry(size);
+                if w.geometry() != geometry {
+                    let _ = w.configure(geometry);
                 }
                 if let Some(status) = &status {
                     let _ = w.set_activated(status.activated);

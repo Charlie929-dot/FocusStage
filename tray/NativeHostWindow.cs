@@ -39,7 +39,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         int PixelWidth, int PixelHeight, double Scale, bool Activated, bool Maximized, bool Resizing, int Tiled);
 
     internal NativeHostWindow(string id, NativeHostRenderer.Factory renderer, Action<object> emit,
-        NativeHost.WindowRect initialRect, double initialScale, string wmClass)
+        NativeHost.WindowRect initialRect, double initialScale, string wmClass, string? iconPng)
     {
         _id = id;
         _emit = emit;
@@ -55,7 +55,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         });
         // The Linux client handles input composition for this window.
         ImmAssociateContext(Handle, 0);
-        _appIcon = LoadAppIcon(wmClass);
+        _appIcon = LoadAppIcon(wmClass, iconPng);
         nint icon = (_appIcon ?? SystemIcons.Application).Handle;
         SendMessage(Handle, WmSetIcon, 0, icon); // ICON_SMALL
         SendMessage(Handle, WmSetIcon, 1, icon); // ICON_BIG
@@ -63,8 +63,17 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         DragAcceptFiles(Handle, true);
     }
 
-    private static Icon? LoadAppIcon(string wmClass)
+    private static Icon? LoadAppIcon(string wmClass, string? iconPng)
     {
+        if (!string.IsNullOrEmpty(iconPng))
+        {
+            try { return ShortcutManager.IconFromPng(iconPng); }
+            catch (Exception ex) when (ex is FormatException or ArgumentException or IOException)
+            {
+                Console.Error.WriteLine($"FocusStage window host: unable to decode desktop icon: {ex.Message}");
+            }
+        }
+
         string path = ShortcutManager.AppIconPath(wmClass);
         try
         {
@@ -100,7 +109,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
             Console.Error.WriteLine($"FocusStage window host: unable to update window owner ({error}).");
     }
 
-    internal void Show(string title, NativeHost.WindowRect rect, bool maximized)
+    internal void Show(string title, NativeHost.WindowRect rect, bool maximized, bool firstShow)
     {
         _placing = true;
         try
@@ -109,12 +118,13 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
             if (IsIconic(Handle) || (!maximized && IsZoomed(Handle)))
                 ShowWindow(Handle, SwRestore);
             // Preserve the exact HWND placement (including a Snap zone) across Stage hide/show.
-            if (!IsZoomed(Handle) && _lastState?.Rect != rect)
+            if (!IsZoomed(Handle) && (firstShow || _lastState?.Rect != rect))
             {
+                NativeRect? work = firstShow ? InitialWorkArea() : null;
                 double scale = Scale;
-                Place(rect, scale);
+                Place(rect, scale, work);
                 if (Scale != scale)
-                    Place(rect, Scale);
+                    Place(rect, Scale, work);
             }
             if (maximized && !IsZoomed(Handle))
                 ShowWindow(Handle, SwMaximize);
@@ -135,6 +145,13 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         CancelInteraction();
         ShowWindow(Handle, SwHide);
         ReportState();
+    }
+
+    internal void Activate()
+    {
+        if (IsIconic(Handle))
+            ShowWindow(Handle, SwRestore);
+        SetForegroundWindow(Handle);
     }
 
     internal void Minimize()
@@ -327,10 +344,26 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         return left ? HtLeft : right ? HtRight : HtClient;
     }
 
-    private void Place(NativeHost.WindowRect rect, double scale)
+    private NativeRect InitialWorkArea()
     {
-        if (!SetWindowPos(Handle, 0, rect.X, rect.Y, ToPixels(rect.Width, scale), ToPixels(rect.Height, scale),
-            SwpNoZOrder | SwpNoActivate | SwpNoOwnerZOrder))
+        nint reference = Owner;
+        if (reference == 0)
+            reference = GetForegroundWindow();
+        return WorkAreaForMonitor(MonitorFromWindow(reference != 0 ? reference : Handle, MonitorDefaultToNearest)).Work;
+    }
+
+    private void Place(NativeHost.WindowRect rect, double scale, NativeRect? workArea)
+    {
+        int x = rect.X, y = rect.Y;
+        int width = ToPixels(rect.Width, scale), height = ToPixels(rect.Height, scale);
+        if (workArea is { } work)
+        {
+            width = Math.Min(width, work.Width);
+            height = Math.Min(height, work.Height);
+            x = work.Left + (work.Width - width) / 2;
+            y = work.Top + (work.Height - height) / 2;
+        }
+        if (!SetWindowPos(Handle, 0, x, y, width, height, SwpNoZOrder | SwpNoActivate | SwpNoOwnerZOrder))
             throw new Win32Exception(Marshal.GetLastWin32Error());
     }
 

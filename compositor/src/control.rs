@@ -11,16 +11,51 @@ use smithay::reexports::calloop::channel::{self, Channel, Sender as CalloopSende
 use smithay::utils::{Logical, Point};
 use tracing::{info, warn};
 
+use crate::manager::HandoffWindows;
 use crate::protocol::{
-    ActStatus, ControlRequest, ControlResponse, DisplayState, InputOwner,
+    ActStatus, ControlRequest, ControlResponse, DisplayState, InputOwner, LaunchFrame,
 };
 use crate::router::{InputSource, PendingActJob, SettleState};
-use crate::stage::Lease;
+use crate::stage::{Lease, Stage, StageWindow};
 use crate::state::FocusStageState;
 
 pub struct ControlServerMessage {
     pub request: ControlRequest,
     pub reply_tx: mpsc::Sender<ControlResponse>,
+    pub peer_pid: Option<u32>,
+}
+
+pub(crate) struct PendingLaunch {
+    pub stage_id: String,
+    pub launcher_exit: Option<std::process::ExitStatus>,
+    deadline: Instant,
+    image: bool,
+    pub(crate) handoff: Option<HandoffWindows>,
+    reply_tx: mpsc::Sender<ControlResponse>,
+}
+
+fn launch_window<'a>(stage: &'a Stage, handoff: Option<&HandoffWindows>) -> Option<&'a StageWindow> {
+    let active = stage.active_window().filter(|window| window.mapped);
+    let Some(handoff) = handoff else { return active; };
+    if stage.input_owner != InputOwner::Human {
+        return None;
+    }
+    stage.windows.iter().rev().find(|window| {
+        window.mapped && window.toplevel.alive() && !handoff.previous.contains_key(&window.id)
+    }).or_else(|| active.filter(|window| {
+        !handoff.new_window && handoff.previous.get(&window.id).is_some_and(|&seq| window.content_seq > seq)
+    }))
+}
+
+pub fn local_peer_pid(stream: &UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(), &mut len)
+    };
+    (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
 }
 
 pub fn spawn_control_server(
@@ -58,6 +93,7 @@ pub fn spawn_control_server(
 }
 
 fn handle_client(stream: UnixStream, tx: CalloopSender<ControlServerMessage>) {
+    let peer_pid = local_peer_pid(&stream);
     let Ok(write_stream) = stream.try_clone() else {
         return;
     };
@@ -75,7 +111,7 @@ fn handle_client(stream: UnixStream, tx: CalloopSender<ControlServerMessage>) {
         let resp = match serde_json::from_str::<ControlRequest>(trimmed) {
             Ok(req) => {
                 let (reply_tx, reply_rx) = mpsc::channel();
-                if tx.send(ControlServerMessage { request: req, reply_tx }).is_err() {
+                if tx.send(ControlServerMessage { request: req, reply_tx, peer_pid }).is_err() {
                     ControlResponse::Error {
                         code: "daemon_down".to_string(),
                         message: "Compositor loop shut down".to_string(),
@@ -141,6 +177,90 @@ impl ControlClient {
 }
 
 impl FocusStageState {
+    pub fn tick_pending_launches(&mut self) {
+        let now = Instant::now();
+        let mut launches = std::mem::take(&mut self.pending_launches);
+        launches.retain(|pending| {
+            let Some(response) = self.poll_pending_launch(pending, now) else { return true; };
+            let _ = pending.reply_tx.send(response);
+            false
+        });
+        self.pending_launches = launches;
+    }
+
+    fn poll_pending_launch(&mut self, pending: &PendingLaunch, now: Instant) -> Option<ControlResponse> {
+        let stage_id = &pending.stage_id;
+        let Some(stage) = self.stages.get(stage_id) else {
+            let message = match pending.launcher_exit {
+                Some(status) => format!("Launcher exited ({status}) before a window was ready"),
+                None => "Stage closed before a window was ready".into(),
+            };
+            return Some(ControlResponse::Error { code: "launch_failed".into(), message });
+        };
+        let window = launch_window(stage, pending.handoff.as_ref()).filter(|window| {
+            window.toplevel.wl_surface().is_some_and(|surface| {
+                smithay::backend::renderer::utils::with_renderer_surface_state(
+                    &surface, |state| state.buffer().is_some(),
+                ).unwrap_or(false)
+            })
+        });
+        let mut ready = window.is_some();
+        let mut frame = None;
+        let mut observe_message = None;
+        if let Some(window) = window.filter(|_| pending.image) {
+            let overrides = self.x11_override_windows_for(&window.toplevel);
+            match self.offscreen.render_launch_png(window, &overrides) {
+                Ok(Some((width, height, png))) => {
+                    frame = Some(LaunchFrame {
+                        frame_seq: stage.frame_seq,
+                        width,
+                        height,
+                        scale: window.scale,
+                        png_base64: base64::engine::general_purpose::STANDARD.encode(png),
+                    });
+                }
+                Ok(None) => {
+                    ready = false;
+                    observe_message = Some("Window has no drawable content".into());
+                }
+                Err(error) => observe_message = Some(format!("render_failed: {error}")),
+            }
+        }
+        if !ready && now < pending.deadline {
+            return None;
+        }
+        let pid = window.and_then(|window| window.toplevel.peer_pid()).or(stage.pid);
+        if let (Some(window), Some(handoff)) = (window.filter(|_| ready), &pending.handoff) {
+            let window_id = window.id.clone();
+            let activate_host = handoff.show && stage.display == DisplayState::Desktop;
+            self.activate_sink_window(stage_id, &window_id);
+            if let Some(sink) = self.display_sink.as_mut().filter(|_| activate_host) {
+                sink.activate(&window_id);
+            }
+        }
+        Some(ControlResponse::LaunchReady {
+            stage_id: stage_id.clone(),
+            pid,
+            ready,
+            frame,
+            launcher_exit: pending.launcher_exit.filter(|_| !ready).map(|status| status.to_string()),
+            observe_message,
+        })
+    }
+
+    pub(crate) fn fail_pending_launch(&mut self, stage_id: &str, message: &str) {
+        self.pending_launches.retain(|pending| {
+            if pending.stage_id != stage_id {
+                return true;
+            }
+            let _ = pending.reply_tx.send(ControlResponse::Error {
+                code: "launch_failed".into(),
+                message: message.into(),
+            });
+            false
+        });
+    }
+
     pub fn expire_leases(&mut self) {
         let expired: Vec<String> = self
             .stages
@@ -171,7 +291,7 @@ impl FocusStageState {
                 let _ = reply_tx.send(ControlResponse::Pong {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     wayland_display: self.wayland_socket_name.clone(),
-                    wslg_active: self.display_sink.is_some(),
+                    desktop_active: self.display_sink.is_some(),
                 });
             }
             ControlRequest::List => {
@@ -189,25 +309,43 @@ impl FocusStageState {
                 height,
                 show_on_desktop,
                 wm_class,
+                wait_ready_ms,
+                launch_image,
+                launch_wait_for_update,
             } => {
-                let resp = match self.launch_stage(
-                    app,
-                    args,
-                    kind,
-                    env,
-                    cwd,
-                    width,
-                    height,
-                    show_on_desktop,
-                    wm_class,
-                ) {
-                    Ok((stage_id, pid)) => ControlResponse::Launched { stage_id, pid },
-                    Err(e) => ControlResponse::Error {
-                        code: "launch_failed".to_string(),
-                        message: e,
-                    },
-                };
-                let _ = reply_tx.send(resp);
+                let wait_ready_ms = wait_ready_ms.filter(|&ms| ms > 0);
+                let wait_for_handoff = wait_ready_ms.map(|_| launch_wait_for_update.unwrap_or(!args.is_empty()));
+                let result = self.launch_stage(
+                    app, args, kind, env, cwd, width, height, show_on_desktop, wm_class, wait_for_handoff,
+                );
+                match (result, wait_ready_ms) {
+                    (Ok(launch), Some(ms)) => {
+                        self.pending_launches.push(PendingLaunch {
+                            stage_id: launch.stage_id,
+                            launcher_exit: None,
+                            deadline: Instant::now() + Duration::from_millis(ms.min(20_000)),
+                            image: launch_image.unwrap_or(false),
+                            handoff: launch.handoff,
+                            reply_tx,
+                        });
+                    }
+                    (Ok(launch), None) => {
+                        let _ = reply_tx.send(ControlResponse::Launched { stage_id: launch.stage_id, pid: launch.pid });
+                    }
+                    (Err(message), _) => {
+                        let _ = reply_tx.send(ControlResponse::Error {
+                            code: "launch_failed".into(),
+                            message,
+                        });
+                    }
+                }
+            }
+            ControlRequest::OpenUri { uri, handler } => {
+                let response = self.open_uri(&uri, handler.as_deref(), msg.peer_pid).unwrap_or_else(|e| ControlResponse::Error {
+                    code: "open_failed".into(),
+                    message: e.to_string(),
+                });
+                let _ = reply_tx.send(response);
             }
             ControlRequest::Close { stage_id } => {
                 let resp = match self.close_stage(&stage_id) {
@@ -245,8 +383,11 @@ impl FocusStageState {
                 lease,
                 actions,
                 based_on,
+                settle,
+                settle_ms,
             } => {
-                self.handle_act(lease, actions, based_on, reply_tx);
+                let settle_timeout = SettleState::timeout(settle, settle_ms);
+                self.handle_act(lease, actions, based_on, settle_timeout, reply_tx);
             }
             ControlRequest::Release {
                 lease,
@@ -299,19 +440,39 @@ impl FocusStageState {
                     (Some(px), Some(py)) => Some(Point::<f64, Logical>::from((px, py))),
                     _ => None,
                 };
-                let resp = match self.drop_files_to_stage(&stage_id, &paths, pos) {
-                    Ok(()) => ControlResponse::Ok,
-                    Err(e) => ControlResponse::Error {
-                        code: "drop_failed".to_string(),
-                        message: e,
-                    },
-                };
-                let _ = reply_tx.send(resp);
+                let _ = reply_tx.send(self.handle_drop_files(&stage_id, &paths, pos));
+            }
+            ControlRequest::DropFilesLeased { lease, paths, position } => {
+                let response = self.handle_leased_drop(&lease, &paths, position);
+                let _ = reply_tx.send(response);
             }
             ControlRequest::Shutdown => {
                 self.should_quit = true;
                 let _ = reply_tx.send(ControlResponse::Ok);
             }
+        }
+    }
+
+    fn handle_leased_drop(&mut self, lease: &str, paths: &[String], position: Option<[f64; 2]>) -> ControlResponse {
+        let Some(stage_id) = self.find_stage_by_lease(lease) else {
+            return ControlResponse::Error { code: "preempted".into(), message: "Lease not found or preempted".into() };
+        };
+        if !self.is_input_allowed(&stage_id, InputSource::Agent, Some(lease)) {
+            return ControlResponse::Error { code: "expired".into(), message: "Lease expired or input owner changed".into() };
+        }
+        if paths.is_empty() || paths.iter().any(|path| {
+            path.contains('\0') || !Path::new(&crate::protocol::windows_path_to_wsl(path)).is_absolute()
+        }) {
+            return ControlResponse::Error { code: "bad_request".into(), message: "Expected one or more absolute Windows or WSL paths".into() };
+        }
+        let point = position.map(|[x, y]| Point::from((x, y)));
+        self.handle_drop_files(&stage_id, paths, point)
+    }
+
+    fn handle_drop_files(&mut self, stage_id: &str, paths: &[String], pos: Option<Point<f64, Logical>>) -> ControlResponse {
+        match self.drop_files_to_stage(stage_id, paths, pos) {
+            Ok(()) => ControlResponse::Ok,
+            Err(message) => ControlResponse::Error { code: "drop_failed".into(), message },
         }
     }
 
@@ -488,6 +649,7 @@ impl FocusStageState {
         lease_id: String,
         actions: Vec<crate::protocol::Action>,
         based_on: Option<u64>,
+        settle_timeout: Option<Duration>,
         reply_tx: mpsc::Sender<ControlResponse>,
     ) {
         let Some(stage_id) = self.find_stage_by_lease(&lease_id) else {
@@ -540,6 +702,7 @@ impl FocusStageState {
                         remaining,
                         executed_steps,
                         wait_until: Some(Instant::now() + dur),
+                        settle_timeout,
                         settling: None,
                         reply_tx,
                     });
@@ -561,28 +724,23 @@ impl FocusStageState {
             }
         }
 
-        if executed_steps > 0 {
-            let cur_seq = self.stages.get(&stage_id).map(|s| s.frame_seq).unwrap_or(0);
-            let now = Instant::now();
+        let stage = self.stages.get(&stage_id);
+        let frame_seq = stage.map_or(0, |s| s.frame_seq);
+        if let Some(timeout) = settle_timeout.filter(|_| executed_steps > 0) {
+            let settle_seq = stage.map_or(0, |s| s.settle_seq);
             self.pending_act_jobs.push(PendingActJob {
                 stage_id,
                 lease_id,
                 remaining,
                 executed_steps,
                 wait_until: None,
-                settling: Some(SettleState {
-                    initial_seq: cur_seq,
-                    last_seq: cur_seq,
-                    quiet_since: now,
-                    started_at: now,
-                    deadline: now + Duration::from_millis(1200),
-                }),
+                settle_timeout,
+                settling: Some(SettleState::new(settle_seq, Instant::now(), timeout)),
                 reply_tx,
             });
             return;
         }
 
-        let frame_seq = self.stages.get(&stage_id).map(|s| s.frame_seq).unwrap_or(0);
         let _ = reply_tx.send(ControlResponse::ActResult {
             act_status: ActStatus::Ok,
             executed_steps,

@@ -349,7 +349,12 @@ impl Instance {
             trace!(?res, "read from XWayland displayfd");
 
             match res {
-                Ok(0) => return Ok(None),
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "XWayland closed displayfd before announcing readiness",
+                    ));
+                }
                 Ok(len) if (buf[..len]).contains(&b'\n') => return Ok(self.x11_socket.take()),
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
                 Err(err) => return Err(err.into()),

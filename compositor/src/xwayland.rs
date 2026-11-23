@@ -3,7 +3,7 @@ use std::os::fd::OwnedFd;
 use std::process::Stdio;
 
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Rectangle};
+use smithay::utils::{Logical, Point, Rectangle, Size};
 use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{Reorder, ResizeEdge, WmWindowProperty, X11Surface, X11Wm, XwmId, XwmHandler};
@@ -13,6 +13,35 @@ use tracing::{debug, info, warn};
 use crate::clipboard::pick_text_mime;
 use crate::stage::StageToplevel;
 use crate::state::FocusStageState;
+
+pub(crate) fn hosted_x11_geometry(size: Size<i32, Logical>) -> Rectangle<i32, Logical> {
+    // Each toplevel has its own host window. An X11 root offset steals pointer range.
+    Rectangle::new(Point::from((0, 0)), size)
+}
+
+fn x11_requested_geometry(
+    current: Rectangle<i32, Logical>,
+    (x, y): (Option<i32>, Option<i32>),
+    (width, height): (Option<u32>, Option<u32>),
+    hosted: bool,
+    mapped: bool,
+) -> Rectangle<i32, Logical> {
+    // Once mapped, the host owns the size. Before mapping, honor the application's hints.
+    let size = if mapped {
+        current.size
+    } else {
+        (
+            width.map_or(current.size.w, |w| w as i32).max(1),
+            height.map_or(current.size.h, |h| h as i32).max(1),
+        )
+            .into()
+    };
+    if hosted {
+        hosted_x11_geometry(size)
+    } else {
+        Rectangle::new((x.unwrap_or(current.loc.x), y.unwrap_or(current.loc.y)).into(), size)
+    }
+}
 
 impl XWaylandShellHandler for FocusStageState {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
@@ -65,7 +94,7 @@ impl XwmHandler for FocusStageState {
             stage.add_window(toplevel, size)
         };
         let size = stage.window(&id).unwrap().logical_size;
-        let _ = window.configure(Rectangle::new(window.geometry().loc, size));
+        let _ = window.configure(hosted_x11_geometry(size));
         let _ = window.set_mapped(true);
         let _ = window.set_activated(true);
         self.update_x11_parent(&id, &window);
@@ -115,7 +144,7 @@ impl XwmHandler for FocusStageState {
 
     fn configure_request(
         &mut self,
-        _xwm: XwmId,
+        xwm: XwmId,
         window: X11Surface,
         x: Option<i32>,
         y: Option<i32>,
@@ -123,19 +152,12 @@ impl XwmHandler for FocusStageState {
         height: Option<u32>,
         _reorder: Option<Reorder>,
     ) {
-        let current = window.geometry();
+        let hosted = self.xwm_to_stage.contains_key(&xwm);
         let id = self.window_id_for_toplevel(&StageToplevel::X11(window.clone()));
-        // Once mapped, the host owns the size. Before mapping, honor the application's hints.
         let mapped = id.as_deref().and_then(|id| self.stage_for_window(id)?.window(id))
             .is_some_and(|w| w.mapped);
-        let size = if mapped {
-            current.size
-        } else {
-            (width.map_or(current.size.w, |w| w as i32).max(1),
-             height.map_or(current.size.h, |h| h as i32).max(1)).into()
-        };
-        let loc = (x.unwrap_or(current.loc.x), y.unwrap_or(current.loc.y)).into();
-        let _ = window.configure(Rectangle::new(loc, size));
+        let geometry = x11_requested_geometry(window.geometry(), (x, y), (width, height), hosted, mapped);
+        let _ = window.configure(geometry);
     }
 
     fn configure_notify(
@@ -272,6 +294,27 @@ impl XwmHandler for FocusStageState {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosted_x11_configure_anchors_windows_without_discarding_size_hints() {
+        let current = Rectangle::new((168, 32).into(), (1200, 800).into());
+        let position = (Some(200), Some(100));
+        let dimensions = (Some(1536), None);
+        let mapped = x11_requested_geometry(current, position, dimensions, true, true);
+        assert_eq!(mapped.loc, (0, 0).into());
+        assert_eq!(mapped.size, current.size);
+        assert_ne!(mapped, current); // A position-only correction still needs a configure.
+
+        let unmapped = x11_requested_geometry(current, position, dimensions, true, false);
+        assert_eq!(unmapped, Rectangle::new((0, 0).into(), (1536, 800).into()));
+        let unmanaged = x11_requested_geometry(current, position, dimensions, false, false);
+        assert_eq!(unmanaged, Rectangle::new((200, 100).into(), (1536, 800).into()));
+    }
+}
+
 fn create_x11_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     use std::os::fd::FromRawFd;
     let mut fds = [0i32; 2];
@@ -304,31 +347,34 @@ impl FocusStageState {
         let sid_for_cb = stage_id.clone();
         let token = self
             .loop_handle
-            .insert_source(xwayland, move |event, _, state| match event {
-                XWaylandEvent::Ready {
-                    x11_socket,
-                    display_number,
-                } => {
-                    info!("XWayland ready for {} on DISPLAY=:{}", sid_for_cb, display_number);
-                    match X11Wm::start_wm(handle.clone(), x11_socket, client.clone()) {
-                        Ok(wm) => {
-                            let xwm_id = wm.id();
-                            state.xwms.insert(xwm_id, wm);
-                            state.xwm_to_stage.insert(xwm_id, sid_for_cb.clone());
-                            if let Some(stage) = state.stages.get_mut(&sid_for_cb) {
-                                stage.x11_display_number = Some(display_number);
-                                stage.xwm_id = Some(xwm_id);
+            .insert_source(xwayland, move |event, _, state| {
+                let message = match event {
+                    XWaylandEvent::Ready { x11_socket, display_number } => {
+                        info!("XWayland ready for {} on DISPLAY=:{}", sid_for_cb, display_number);
+                        match X11Wm::start_wm(handle.clone(), x11_socket, client.clone()) {
+                            Ok(wm) => {
+                                let xwm_id = wm.id();
+                                state.xwms.insert(xwm_id, wm);
+                                state.xwm_to_stage.insert(xwm_id, sid_for_cb.clone());
+                                if let Some(stage) = state.stages.get_mut(&sid_for_cb) {
+                                    stage.x11_display_number = Some(display_number);
+                                    stage.xwm_id = Some(xwm_id);
+                                }
+                                state.launch_pending_x11_client(&sid_for_cb, display_number);
+                                return;
                             }
-                            state.launch_pending_x11_client(&sid_for_cb, display_number);
-                        }
-                        Err(err) => {
-                            warn!("Failed to start X11Wm for {}: {}", sid_for_cb, err);
+                            Err(err) => format!("Failed to start X11 window manager: {err}"),
                         }
                     }
-                }
-                XWaylandEvent::Error => {
-                    warn!("XWayland failed for Stage {}", sid_for_cb);
-                }
+                    XWaylandEvent::Error => "XWayland failed to start".into(),
+                };
+                warn!(stage = sid_for_cb, "{message}");
+                let stage_id = sid_for_cb.clone();
+                // Remove the XWayland source after its callback has returned.
+                handle.insert_idle(move |state| {
+                    let _ = state.close_stage(&stage_id);
+                    state.fail_pending_launch(&stage_id, &message);
+                });
             })
             .map_err(|e| format!("insert XWayland source: {e}"))?;
 

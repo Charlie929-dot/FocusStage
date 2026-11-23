@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use smithay::backend::input::{Axis, AxisSource, ButtonState};
-use smithay::desktop::PopupManager;
+use smithay::desktop::{utils::under_from_surface_tree, PopupManager, WindowSurfaceType};
 use smithay::input::keyboard::{xkb, KeyboardTarget, KeymapFile, ModifiersState};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerTarget};
 use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::{
@@ -85,12 +85,14 @@ impl Dispatch<ZwpTextInputManagerV3, ()> for FocusStageState {
                 enabled: false,
                 client_id: cid.clone(),
             });
-            // If this client's Stage already has a live surface, send enter immediately.
-            if let Some(sid) = state.stage_id_for_client(&cid) {
-                if let Some(stage) = state.stages.get(&sid) {
-                    if let Some(surf) = stage.active_toplevel().and_then(|t| t.wl_surface()) {
-                        res.enter(&surf);
-                    }
+            // Clients may share a Stage, but text input can only enter the requesting client's focus.
+            let target = state
+                .stage_id_for_client(&cid)
+                .and_then(|sid| state.stages.get(&sid))
+                .and_then(|stage| stage.input.current_keyboard_target.as_ref());
+            if let Some(StageInputTarget::Wayland(surface)) = target {
+                if surface.is_alive() && surface.id().same_client_as(&res.id()) {
+                    res.enter(surface);
                 }
             }
         }
@@ -137,11 +139,79 @@ impl Dispatch<ZwpTextInputV3, ()> for FocusStageState {
 }
 
 pub struct SettleState {
-    pub initial_seq: u64,
-    pub last_seq: u64,
-    pub quiet_since: Instant,
-    pub started_at: Instant,
-    pub deadline: Instant,
+    initial_seq: u64,
+    last_seq: u64,
+    quiet_since: Instant,
+    started_at: Instant,
+    deadline: Instant,
+}
+
+impl SettleState {
+    pub fn timeout(settle: Option<bool>, settle_ms: Option<u64>) -> Option<Duration> {
+        const DEFAULT_MS: u64 = 600;
+        // The control connection has its own deadline. Leave time for dispatch and reply.
+        const MAX_MS: u64 = 10_000;
+        let ms = settle_ms.unwrap_or(DEFAULT_MS).min(MAX_MS);
+        (settle.unwrap_or(true) && ms > 0).then(|| Duration::from_millis(ms))
+    }
+
+    pub fn new(settle_seq: u64, now: Instant, timeout: Duration) -> Self {
+        Self {
+            initial_seq: settle_seq,
+            last_seq: settle_seq,
+            quiet_since: now,
+            started_at: now,
+            deadline: now + timeout,
+        }
+    }
+
+    fn is_settled(&mut self, settle_seq: u64, now: Instant) -> bool {
+        if settle_seq != self.last_seq {
+            self.last_seq = settle_seq;
+            self.quiet_since = now;
+        }
+        now >= self.deadline
+            || (self.last_seq != self.initial_seq
+                && now.duration_since(self.quiet_since) >= Duration::from_millis(180))
+            || (self.last_seq == self.initial_seq
+                && now.duration_since(self.started_at) >= Duration::from_millis(220))
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::*;
+
+    #[test]
+    fn settled_when_no_frames_arrive() {
+        let start = Instant::now();
+        let mut settle = SettleState::new(5, start, SettleState::timeout(None, None).unwrap());
+        assert!(!settle.is_settled(5, start + Duration::from_millis(219)));
+        assert!(settle.is_settled(5, start + Duration::from_millis(220)));
+    }
+
+    #[test]
+    fn a_new_frame_restarts_the_quiet_period() {
+        let start = Instant::now();
+        let mut settle = SettleState::new(5, start, Duration::from_secs(1));
+        assert!(!settle.is_settled(6, start + Duration::from_millis(50)));
+        assert!(!settle.is_settled(7, start + Duration::from_millis(229)));
+        assert!(!settle.is_settled(7, start + Duration::from_millis(408)));
+        assert!(settle.is_settled(7, start + Duration::from_millis(409)));
+    }
+
+    #[test]
+    fn timeout_bounds_continuous_updates_and_can_be_skipped() {
+        assert_eq!(SettleState::timeout(Some(false), Some(350)), None);
+        assert_eq!(SettleState::timeout(None, Some(0)), None);
+        let timeout = SettleState::timeout(Some(true), Some(350)).unwrap();
+        let start = Instant::now();
+        let mut settle = SettleState::new(5, start, timeout);
+        for elapsed in (50..350).step_by(50) {
+            assert!(!settle.is_settled(5 + elapsed, start + Duration::from_millis(elapsed)));
+        }
+        assert!(settle.is_settled(12, start + Duration::from_millis(350)));
+    }
 }
 
 pub struct PendingActJob {
@@ -150,6 +220,7 @@ pub struct PendingActJob {
     pub remaining: VecDeque<Action>,
     pub executed_steps: usize,
     pub wait_until: Option<Instant>,
+    pub settle_timeout: Option<Duration>,
     pub settling: Option<SettleState>,
     pub reply_tx: std::sync::mpsc::Sender<crate::protocol::ControlResponse>,
 }
@@ -157,31 +228,6 @@ pub struct PendingActJob {
 impl FocusStageState {
     pub fn now_ms(&self) -> u32 {
         self.start_time.elapsed().as_millis() as u32
-    }
-
-    pub fn resolve_input_time(&mut self, sink_time: u32) -> u32 {
-        let now = self.now_ms();
-        if sink_time == 0 {
-            return now;
-        }
-        match self.wslg_time_anchor {
-            Some((base_sink, base_local)) => {
-                let delta = sink_time.wrapping_sub(base_sink) as i32;
-                let mapped_i64 = (base_local as i64).wrapping_add(delta as i64);
-                let mapped = if mapped_i64 >= 0 { mapped_i64 as u32 } else { 0 };
-                let drift = (mapped.wrapping_sub(now) as i32).abs();
-                if drift > 5000 {
-                    self.wslg_time_anchor = Some((sink_time, now));
-                    now
-                } else {
-                    mapped
-                }
-            }
-            None => {
-                self.wslg_time_anchor = Some((sink_time, now));
-                now
-            }
-        }
     }
 
     fn set_keyboard_target(
@@ -414,21 +460,15 @@ impl FocusStageState {
                     );
                 }
 
-                let ptr_valid = cur_ptr.as_ref().is_some_and(|t| {
-                    t.alive()
-                        && matches!(t, StageInputTarget::Wayland(s) if s == &wl_surf || PopupManager::popups_for_surface(&wl_surf).any(|(p, _)| p.wl_surface() == s))
-                });
-                if virtual_focus && !ptr_valid {
-                    let (target, local) =
-                        self.hit_test_wayland_surface(&wl_surf, pointer_pos.x, pointer_pos.y);
-                    let serial = SERIAL_COUNTER.next_serial();
-                    self.set_pointer_target(
-                        stage_id,
-                        StageInputTarget::Wayland(target),
-                        local,
-                        serial,
-                        time,
-                    );
+                if virtual_focus {
+                    let ptr_valid = cur_ptr.as_ref().is_some_and(|t| {
+                        t.alive() && matches!(t, StageInputTarget::Wayland(s)
+                            if self.window_for_surface(s).is_some_and(|w| w.toplevel.wl_surface().as_ref() == Some(&wl_surf)))
+                    });
+                    if !ptr_valid {
+                        let (target, origin) = self.hit_test_wayland_surface(&wl_surf, pointer_pos);
+                        self.set_wayland_pointer_target(stage_id, target, origin, pointer_pos, SERIAL_COUNTER.next_serial(), time);
+                    }
                 }
             }
             StageToplevel::X11(ref x11_tl) => {
@@ -548,25 +588,30 @@ impl FocusStageState {
         self.stages.get_mut(stage_id).unwrap().input.pressed_buttons.clear();
     }
 
-    /// Resolve Stage-relative `(x, y)` to `(WlSurface | X11Surface target, local_point)` checking popups first.
-    fn hit_test_wayland_surface(&self, root: &WlSurface, x: f64, y: f64) -> (WlSurface, Point<f64, Logical>) {
-        // PopupManager::popups_for_surface yields topmost child popups before their parents.
+    /// Return the surface and its origin in the same coordinates used for rendering.
+    pub(crate) fn hit_test_wayland_surface(&self, root: &WlSurface, point: Point<f64, Logical>) -> (WlSurface, Point<f64, Logical>) {
+        // PopupManager yields topmost child popups before their parents.
         for (popup, popup_loc) in PopupManager::popups_for_surface(root) {
-            let psurf = popup.wl_surface().clone();
-            let geo = popup.geometry();
-            let px = popup_loc.x as f64;
-            let py = popup_loc.y as f64;
-            let pw = geo.size.w.max(1) as f64;
-            let ph = geo.size.h.max(1) as f64;
-            if x >= px && x < px + pw && y >= py && y < py + ph {
-                return (psurf, Point::from((x - px + geo.loc.x as f64, y - py + geo.loc.y as f64)));
+            let origin = popup_loc - popup.geometry().loc;
+            if let Some((surface, origin)) = under_from_surface_tree(popup.wl_surface(), point, origin, WindowSurfaceType::ALL) {
+                return (surface, origin.to_f64());
             }
         }
         let geo_loc = wayland_window_geometry_loc(root);
-        (
-            root.clone(),
-            Point::from((x + geo_loc.x as f64, y + geo_loc.y as f64)),
-        )
+        let origin = Point::from((-geo_loc.x, -geo_loc.y));
+        under_from_surface_tree(root, point, origin, WindowSurfaceType::ALL)
+            .map(|(surface, origin)| (surface, origin.to_f64()))
+            .unwrap_or_else(|| (root.clone(), origin.to_f64()))
+    }
+
+    fn set_wayland_pointer_target(
+        &mut self, stage_id: &str, target: WlSurface, origin: Point<f64, Logical>,
+        point: Point<f64, Logical>, serial: Serial, time: u32,
+    ) -> bool {
+        if let Some(stage) = self.stages.get_mut(stage_id) {
+            stage.input.pointer_surface_origin = origin;
+        }
+        self.set_pointer_target(stage_id, StageInputTarget::Wayland(target), point - origin, serial, time)
     }
 
     pub fn send_stage_pointer_motion(&mut self, stage_id: &str, x: f64, y: f64) {
@@ -585,26 +630,28 @@ impl FocusStageState {
         let Some(toplevel) = self.stages.get(stage_id).and_then(|s| s.input_toplevel(window_id)).cloned() else {
             return;
         };
-        if let Some(stage) = self.stages.get_mut(stage_id) {
-            stage.input.pointer_pos = Point::from((x, y));
-            stage.input.pointer_window_id = window_id.map(str::to_owned);
-        }
+        let point = Point::from((x, y));
+        let input = &mut self.stages.get_mut(stage_id).unwrap().input;
+        let grab = match &input.current_pointer_target {
+            Some(target @ StageInputTarget::Wayland(surface)) if target.alive()
+                && !input.pressed_buttons.is_empty() && input.pointer_window_id.as_deref() == window_id =>
+            {
+                Some((surface.clone(), input.pointer_surface_origin))
+            }
+            _ => None,
+        };
+        input.pointer_pos = point;
+        input.pointer_window_id = window_id.map(str::to_owned);
         let seat = self.seat.clone();
         let serial = SERIAL_COUNTER.next_serial();
 
         match toplevel {
             StageToplevel::Wayland(tl) => {
-                let (target, local) = self.hit_test_wayland_surface(tl.wl_surface(), x, y);
-                let entered = self.set_pointer_target(
-                    stage_id,
-                    StageInputTarget::Wayland(target.clone()),
-                    local,
-                    serial,
-                    time,
-                );
+                let (target, origin) = grab.unwrap_or_else(|| self.hit_test_wayland_surface(tl.wl_surface(), point));
+                let entered = self.set_wayland_pointer_target(stage_id, target.clone(), origin, point, serial, time);
                 if !entered {
                     let ev = MotionEvent {
-                        location: local,
+                        location: point - origin,
                         serial,
                         time,
                     };
@@ -700,9 +747,16 @@ impl FocusStageState {
 
         match toplevel {
             StageToplevel::Wayland(tl) => {
-                let (target, _) = self.hit_test_wayland_surface(tl.wl_surface(), x, y);
+                let input = &self.stages[stage_id].input;
+                let Some(StageInputTarget::Wayland(target)) = input.current_pointer_target.clone() else { return; };
+                let grab_ended = !pressed && input.pressed_buttons.is_empty();
                 PointerTarget::button(&target, &seat, self, &ev);
                 PointerTarget::frame(&target, &seat, self);
+                if grab_ended {
+                    let point = Point::from((x, y));
+                    let (target, origin) = self.hit_test_wayland_surface(tl.wl_surface(), point);
+                    self.set_wayland_pointer_target(stage_id, target, origin, point, SERIAL_COUNTER.next_serial(), time);
+                }
             }
             StageToplevel::X11(x11) => {
                 let geo = x11.geometry();
@@ -845,24 +899,11 @@ impl FocusStageState {
         }
 
         match toplevel {
-            StageToplevel::Wayland(tl) => {
-                let (target, local) = self.hit_test_wayland_surface(tl.wl_surface(), x, y);
-                let same = self
-                    .stages
-                    .get(stage_id)
-                    .and_then(|s| s.input.current_pointer_target.as_ref())
-                    .is_some_and(|cur| cur.same_target(&StageInputTarget::Wayland(target.clone())));
-                if !same {
-                    self.set_pointer_target(
-                        stage_id,
-                        StageInputTarget::Wayland(target.clone()),
-                        local,
-                        SERIAL_COUNTER.next_serial(),
-                        time,
-                    );
+            StageToplevel::Wayland(_) => {
+                if let Some(StageInputTarget::Wayland(target)) = self.stages[stage_id].input.current_pointer_target.clone() {
+                    PointerTarget::axis(&target, &seat, self, frame);
+                    PointerTarget::frame(&target, &seat, self);
                 }
-                PointerTarget::axis(&target, &seat, self, frame);
-                PointerTarget::frame(&target, &seat, self);
             }
             StageToplevel::X11(x11) => {
                 let geo = x11.geometry();
@@ -1198,21 +1239,12 @@ impl FocusStageState {
             }
 
             if let Some(ref mut st) = job.settling {
-                let cur_seq = self.stages.get(&job.stage_id).map(|s| s.frame_seq).unwrap_or(0);
-                if cur_seq != st.last_seq {
-                    st.last_seq = cur_seq;
-                    st.quiet_since = now;
-                }
-                let settled = now >= st.deadline
-                    || (st.last_seq != st.initial_seq
-                        && now.duration_since(st.quiet_since) >= Duration::from_millis(180))
-                    || (st.last_seq == st.initial_seq
-                        && now.duration_since(st.started_at) >= Duration::from_millis(220));
-                if settled {
+                let stage = self.stages.get(&job.stage_id);
+                if st.is_settled(stage.map_or(0, |s| s.settle_seq), now) {
                     let _ = job.reply_tx.send(crate::protocol::ControlResponse::ActResult {
                         act_status: ActStatus::Ok,
                         executed_steps: job.executed_steps,
-                        frame_seq: cur_seq,
+                        frame_seq: stage.map_or(0, |s| s.frame_seq),
                         message: None,
                     });
                 } else {
@@ -1252,16 +1284,12 @@ impl FocusStageState {
 
             if paused_for_wait {
                 still_pending.push(job);
-            } else if failed_msg.is_none() && job.executed_steps > 0 {
-                let cur_seq = self.stages.get(&job.stage_id).map(|s| s.frame_seq).unwrap_or(0);
-                let t = Instant::now();
-                job.settling = Some(SettleState {
-                    initial_seq: cur_seq,
-                    last_seq: cur_seq,
-                    quiet_since: t,
-                    started_at: t,
-                    deadline: t + Duration::from_millis(1200),
-                });
+                continue;
+            }
+
+            if let Some(timeout) = job.settle_timeout.filter(|_| failed_msg.is_none()) {
+                let settle_seq = self.stages.get(&job.stage_id).map_or(0, |s| s.settle_seq);
+                job.settling = Some(SettleState::new(settle_seq, Instant::now(), timeout));
                 still_pending.push(job);
             } else {
                 let frame_seq = self.stages.get(&job.stage_id).map(|s| s.frame_seq).unwrap_or(0);

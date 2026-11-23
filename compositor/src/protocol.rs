@@ -37,6 +37,7 @@ pub enum StageKind {
     Wayland,
     Chromium,
     Electron,
+    Gecko,
     X11,
 }
 
@@ -176,6 +177,17 @@ pub enum ControlRequest {
         show_on_desktop: Option<bool>,
         #[serde(default)]
         wm_class: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_ready_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_image: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_wait_for_update: Option<bool>,
+    },
+    OpenUri {
+        uri: String,
+        #[serde(default)]
+        handler: Option<String>,
     },
     Close {
         stage_id: String,
@@ -209,6 +221,10 @@ pub enum ControlRequest {
         actions: Vec<Action>,
         #[serde(default)]
         based_on: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settle: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settle_ms: Option<u64>,
     },
     Release {
         lease: String,
@@ -252,6 +268,12 @@ pub enum ControlRequest {
         #[serde(default)]
         y: Option<f64>,
     },
+    DropFilesLeased {
+        lease: String,
+        paths: Vec<String>,
+        #[serde(default)]
+        position: Option<[f64; 2]>,
+    },
     Shutdown,
 }
 
@@ -268,6 +290,15 @@ fn default_scale() -> f64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchFrame {
+    pub frame_seq: u64,
+    pub width: u32,
+    pub height: u32,
+    pub scale: f64,
+    pub png_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ControlResponse {
     Ok,
@@ -278,7 +309,8 @@ pub enum ControlResponse {
     Pong {
         version: String,
         wayland_display: String,
-        wslg_active: bool,
+        #[serde(alias = "wslg_active")]
+        desktop_active: bool,
     },
     Stages {
         stages: Vec<StageInfo>,
@@ -286,6 +318,21 @@ pub enum ControlResponse {
     Launched {
         stage_id: String,
         pid: Option<u32>,
+    },
+    LaunchReady {
+        stage_id: String,
+        pid: Option<u32>,
+        ready: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<LaunchFrame>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launcher_exit: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observe_message: Option<String>,
+    },
+    Opened {
+        stage_id: Option<String>,
+        reused: bool,
     },
     Acquired {
         lease: String,
@@ -317,7 +364,7 @@ pub enum ControlResponse {
     },
 }
 
-/// Translate Windows path (e.g. `C:\Users\HP\foo.txt`) to WSL path (`/mnt/c/Users/HP/foo.txt`).
+/// Translate a Windows path (e.g. `C:\work\foo.txt`) to its WSL path (`/mnt/c/work/foo.txt`).
 pub fn windows_path_to_wsl(path: &str) -> String {
     let bytes = path.as_bytes();
     if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
@@ -337,7 +384,9 @@ pub fn infer_stage_kind(app: &str) -> StageKind {
         .unwrap_or(app)
         .to_ascii_lowercase();
 
-    if base.contains("chromium") || base.contains("chrome") || base.contains("edge") || base.contains("brave") {
+    if ["firefox", "librewolf", "waterfox"].iter().any(|name| base.starts_with(name)) {
+        StageKind::Gecko
+    } else if base.contains("chromium") || base.contains("chrome") || base.contains("edge") || base.contains("brave") {
         StageKind::Chromium
     } else if base.contains("code")
         || base.contains("electron")
@@ -365,14 +414,14 @@ mod tests {
     #[test]
     fn windows_path_translation() {
         assert_eq!(
-            windows_path_to_wsl(r"C:\Users\HP\FocusStage\README.md"),
-            "/mnt/c/Users/HP/FocusStage/README.md"
+            windows_path_to_wsl(r"C:\work\project\README.md"),
+            "/mnt/c/work/project/README.md"
         );
         assert_eq!(
             windows_path_to_wsl("D:/work/test.txt"),
             "/mnt/d/work/test.txt"
         );
-        assert_eq!(windows_path_to_wsl("/home/scl/file.txt"), "/home/scl/file.txt");
+        assert_eq!(windows_path_to_wsl("/home/user/file.txt"), "/home/user/file.txt");
     }
 
     #[test]
@@ -384,6 +433,13 @@ mod tests {
         assert_eq!(infer_stage_kind("xterm"), StageKind::X11);
         assert_eq!(infer_stage_kind("wechat"), StageKind::X11);
         assert_eq!(infer_stage_kind("foot"), StageKind::Wayland);
+    }
+
+    #[test]
+    fn legacy_act_request_omits_settle_options() {
+        let request: ControlRequest =
+            serde_json::from_str(r#"{"op":"act","lease":"lease-1","actions":[]}"#).unwrap();
+        assert!(matches!(request, ControlRequest::Act { settle: None, settle_ms: None, .. }));
     }
 
     #[test]
@@ -401,6 +457,8 @@ mod tests {
                 },
             ],
             based_on: Some(42),
+            settle: Some(false),
+            settle_ms: Some(350),
         };
         let raw = serde_json::to_string(&req).unwrap();
         let parsed: ControlRequest = serde_json::from_str(&raw).unwrap();
@@ -409,10 +467,14 @@ mod tests {
                 lease,
                 actions,
                 based_on,
+                settle,
+                settle_ms,
             } => {
                 assert_eq!(lease, "lease-1");
                 assert_eq!(actions.len(), 2);
                 assert_eq!(based_on, Some(42));
+                assert_eq!(settle, Some(false));
+                assert_eq!(settle_ms, Some(350));
             }
             other => panic!("unexpected parsed request: {:?}", other),
         }

@@ -15,9 +15,11 @@ internal sealed partial class NativeHostWindow
     private const uint TmeLeave = 0x00000002, TmeCancel = 0x80000000;
     private const int BtnLeft = 0x110, BtnRight = 0x111, BtnMiddle = 0x112, BtnSide = 0x113, BtnExtra = 0x114;
     private const int VkTab = 0x09, VkPause = 0x13, VkEscape = 0x1B, VkSpace = 0x20, VkSnapshot = 0x2C, VkF4 = 0x73;
+    private const int KeyLeftShift = 42, KeyRightShift = 54, KeyLeftAlt = 56, KeyRightAlt = 100;
 
     private readonly HashSet<int> _keysDown = new();
     private readonly HashSet<int> _buttonsDown = new();
+    private int _pendingAltKey;
     private NativePoint _lastPointer;
     private bool _trackingPointer;
 
@@ -123,6 +125,8 @@ internal sealed partial class NativeHostWindow
         _lastPointer = NativePoint.FromLParam(lParam);
         if (pressed ? !_buttonsDown.Add(button) : !_buttonsDown.Remove(button))
             return;
+        if (pressed)
+            ForwardPendingAlt();
         EmitButton(button, pressed);
         if (pressed)
         {
@@ -155,6 +159,7 @@ internal sealed partial class NativeHostWindow
         bool horizontal = message.Msg == WmMouseHWheel;
         int h = horizontal ? delta : 0;
         int v = horizontal ? 0 : -delta;
+        ForwardPendingAlt();
         // Match the existing sink's logical distance of 15 per wheel detent, retaining partial detents.
         _emit(new { type = "pointer_scroll", window_id = _id, x, y, dx = h / 8.0, dy = v / 8.0, v120 = new[] { h, v } });
     }
@@ -169,10 +174,14 @@ internal sealed partial class NativeHostWindow
         if (alt && message.Msg == WmSysKeyDown)
         {
             if (vk is VkTab or VkEscape)
+            {
+                _pendingAltKey = 0;
                 return false; // Let Windows handle its task and window switching mnemonics.
+            }
             // AltGr arrives as Ctrl+Alt on Windows. Preserve it for Linux keyboard layouts.
             if (vk is VkF4 or VkSpace && !(GetKeyState(0xA5) < 0 && GetKeyState(0x11) < 0))
             {
+                _pendingAltKey = 0;
                 if (!repeated)
                 {
                     if (vk == VkSpace)
@@ -186,6 +195,26 @@ internal sealed partial class NativeHostWindow
         int key = EvdevKey(vk, (info >> 16) & 0xFF, (info & (1 << 24)) != 0);
         if (key == 0)
             return true;
+        if (_pendingAltKey == key)
+        {
+            if (!pressed)
+            {
+                _pendingAltKey = 0;
+                TapKey(key);
+            }
+            return true;
+        }
+        // Windows may consume the rest of Alt+Tab before it reaches this HWND. Keep an
+        // uncommitted Alt local, including while Shift is held for reverse switching.
+        if (pressed && !repeated && key is KeyLeftAlt or KeyRightAlt && _pendingAltKey == 0
+            && _buttonsDown.Count == 0 && _keysDown.All(k => k is KeyLeftShift or KeyRightShift))
+        {
+            _pendingAltKey = key;
+            return true;
+        }
+        if (pressed ? !repeated && key is not (KeyLeftShift or KeyRightShift) : _keysDown.Contains(key))
+            ForwardPendingAlt();
+
         if (vk == VkPause)
         {
             // Pause has no independent break scan code.
@@ -290,8 +319,19 @@ internal sealed partial class NativeHostWindow
 
     private void EmitKey(int key, bool pressed) => _emit(new { type = "key", window_id = _id, evdev_keycode = key, pressed });
 
+    private void ForwardPendingAlt()
+    {
+        if (_pendingAltKey == 0)
+            return;
+        int key = _pendingAltKey;
+        _pendingAltKey = 0;
+        _keysDown.Add(key);
+        EmitKey(key, true);
+    }
+
     private void ReleaseInput(bool releaseCapture = true)
     {
+        _pendingAltKey = 0;
         ReleaseButtons(releaseCapture);
         foreach (int key in _keysDown)
             EmitKey(key, false);

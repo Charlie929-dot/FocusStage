@@ -456,12 +456,18 @@ impl FocusStageState {
             .get(stage_id)
             .ok_or_else(|| format!("Stage '{}' not found", stage_id))?;
 
-        let surface = stage
-            .input_toplevel(window_id)
-            .and_then(|t| t.wl_surface())
+        let toplevel = stage.input_toplevel(window_id);
+        let surface = toplevel.and_then(|window| window.wl_surface())
             .ok_or_else(|| format!("Stage '{}' has no live surface", stage_id))?;
 
         let drop_pos = pos.unwrap_or(stage.input.pointer_pos);
+        let (surface, drop_pos) = match toplevel {
+            Some(crate::stage::StageToplevel::Wayland(_)) => {
+                let (target, origin) = self.hit_test_wayland_surface(&surface, drop_pos);
+                (target, drop_pos - origin)
+            }
+            _ => (surface, drop_pos),
+        };
         let uri_list = paths
             .iter()
             .map(|p| {
@@ -469,7 +475,7 @@ impl FocusStageState {
                 if wsl.starts_with("file://") {
                     wsl
                 } else {
-                    format!("file://{}", wsl.replace(' ', "%20"))
+                    crate::xdg::file_uri(&wsl)
                 }
             })
             .collect::<Vec<_>>()

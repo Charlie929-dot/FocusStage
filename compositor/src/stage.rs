@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::process::Child;
 use std::time::Instant;
@@ -7,7 +8,7 @@ use smithay::reexports::calloop::RegistrationToken;
 use smithay::reexports::wayland_server::backend::ClientId;
 use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::Client;
+use smithay::reexports::wayland_server::{Client, Resource};
 use smithay::utils::{IsAlive, Logical, Point, Size};
 use smithay::wayland::shell::xdg::ToplevelSurface;
 use smithay::xwayland::xwm::XwmId;
@@ -39,6 +40,18 @@ impl StageToplevel {
         match self {
             StageToplevel::Wayland(t) => Some(t.wl_surface().clone()),
             StageToplevel::X11(x) => x.wl_surface(),
+        }
+    }
+
+    /// The window connection's PID, independent of wrapper processes or launch tokens.
+    pub(crate) fn peer_pid(&self) -> Option<u32> {
+        if !self.alive() {
+            return None;
+        }
+        match self {
+            Self::Wayland(toplevel) => toplevel.wl_surface().client()?
+                .get_data::<crate::state::ClientState>()?.pid,
+            Self::X11(window) => window.get_client_pid().ok().filter(|&pid| pid > 1),
         }
     }
 
@@ -89,6 +102,8 @@ pub struct StageInputState {
     pub pressed_keys: HashSet<u32>,
     /// Pointer coordinates in Stage-logical pixels (origin = main window top-left)
     pub pointer_pos: Point<f64, Logical>,
+    /// Position of the focused Wayland surface relative to the window.
+    pub pointer_surface_origin: Point<f64, Logical>,
     pub pointer_window_id: Option<String>,
     /// Evdev mouse button codes currently pressed on this Stage
     pub pressed_buttons: HashSet<u32>,
@@ -124,6 +139,7 @@ impl StageInputState {
             mods_state,
             pressed_keys: HashSet::new(),
             pointer_pos: Point::from((10.0, 10.0)),
+            pointer_surface_origin: Point::default(),
             pointer_window_id: None,
             pressed_buttons: HashSet::new(),
             current_keyboard_target: None,
@@ -162,11 +178,6 @@ pub struct StageClipboard {
     pub x11_has_selection: bool,
 }
 
-pub struct PendingX11Launch {
-    pub env: std::collections::HashMap<String, String>,
-    pub cwd: Option<String>,
-}
-
 pub struct StageWindow {
     pub id: String,
     pub toplevel: StageToplevel,
@@ -181,6 +192,7 @@ pub struct StageWindow {
     pub host_close_requested: bool,
     pub mapped: bool,
     pub dirty: bool,
+    pub(crate) content_seq: u64,
 }
 
 impl StageWindow {
@@ -196,13 +208,15 @@ pub struct Stage {
     pub id: String,
     pub app: String,
     pub wm_class: String,
+    desktop_icon_png: OnceCell<Option<String>>,
     pub args: Vec<String>,
     pub kind: StageKind,
     pub pid: Option<u32>,
     pub child: Option<Child>,
     pub(crate) launch_token: Option<String>,
     pub(crate) next_process_check: Option<Instant>,
-    pub user_data_dir: Option<std::path::PathBuf>,
+    pub(crate) launch_env: HashMap<String, String>,
+    pub(crate) launch_cwd: Option<String>,
 
     pub display: DisplayState,
     pub input_owner: InputOwner,
@@ -211,6 +225,7 @@ pub struct Stage {
     pub initial_rect: SavedRect,
     pub default_scale: f64,
     pub frame_seq: u64,
+    pub(crate) settle_seq: u64,
 
     pub wayland_clients: HashMap<ClientId, Client>,
     pub windows: Vec<StageWindow>,
@@ -227,10 +242,16 @@ pub struct Stage {
     pub xwayland_client: Option<Client>,
     pub x11_display_number: Option<u32>,
     pub xwm_id: Option<XwmId>,
-    pub pending_x11_launch: Option<PendingX11Launch>,
+    pub(crate) pending_x11_launch: bool,
 }
 
 impl Stage {
+    pub(crate) fn desktop_icon_png(&self) -> Option<&str> {
+        self.desktop_icon_png
+            .get_or_init(|| crate::icons::app_icon_png(&self.wm_class))
+            .as_deref()
+    }
+
     pub fn derive_wm_class(app: &str) -> String {
         let base = std::path::Path::new(app)
             .file_name()
@@ -299,19 +320,22 @@ impl Stage {
             id,
             app,
             wm_class,
+            desktop_icon_png: OnceCell::new(),
             args,
             kind,
             pid: None,
             child: None,
             launch_token: None,
             next_process_check: None,
-            user_data_dir: None,
+            launch_env: HashMap::new(),
+            launch_cwd: None,
             display,
             input_owner: InputOwner::Human,
             lease: None,
             initial_rect: SavedRect { x: 100, y: 100, width, height },
             default_scale: scale,
             frame_seq: 0,
+            settle_seq: 0,
             wayland_clients: HashMap::new(),
             windows: Vec::new(),
             active_window_id: None,
@@ -324,7 +348,7 @@ impl Stage {
             xwayland_client: None,
             x11_display_number: None,
             xwm_id: None,
-            pending_x11_launch: None,
+            pending_x11_launch: false,
         }
     }
 
@@ -351,6 +375,7 @@ impl Stage {
             host_close_requested: false,
             mapped: false,
             dirty: true,
+            content_seq: 0,
         });
         id
     }
@@ -396,16 +421,26 @@ impl Stage {
     }
 
     pub fn bump_frame(&mut self) {
-        self.frame_seq = self.frame_seq.saturating_add(1);
-        for window in &mut self.windows {
-            window.dirty = true;
-        }
+        self.mark_visual_update(None, true);
     }
 
     pub fn bump_window_frame(&mut self, id: &str) {
-        if let Some(window) = self.window_mut(id) {
+        self.mark_visual_update(Some(id), true);
+    }
+
+    pub(crate) fn mark_visual_update(&mut self, window_id: Option<&str>, significant: bool) {
+        if let Some(id) = window_id {
+            let Some(window) = self.window_mut(id) else { return; };
             window.dirty = true;
-            self.frame_seq = self.frame_seq.saturating_add(1);
+        } else {
+            for window in &mut self.windows {
+                window.dirty = true;
+            }
+        }
+        self.frame_seq = self.frame_seq.saturating_add(1);
+        // Even a tiny repaint invalidates screenshot-based actions, but need not delay waiting.
+        if significant {
+            self.settle_seq = self.settle_seq.saturating_add(1);
         }
     }
 
@@ -417,7 +452,7 @@ impl Stage {
             app: self.app.clone(),
             title: window.map(|w| &w.title).unwrap_or(&self.app).clone(),
             kind: self.kind,
-            pid: self.pid,
+            pid: window.and_then(|w| w.toplevel.peer_pid()).or(self.pid),
             display: self.display,
             input_owner: self.input_owner.clone(),
             size: [size.w.max(1) as u32, size.h.max(1) as u32],

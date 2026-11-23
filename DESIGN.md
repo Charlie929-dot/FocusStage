@@ -38,7 +38,7 @@ FocusStage 要实现的体验：
 ### 1.4 设计原则
 
 1. **只自研不可替代的部分**：多焦点隔离、离屏托管与原生无标题栏 Win32 宿主（`NativeHost`）必须自己掌控；Linux 应用安装与分发外包给系统自带的应用中心 / `apt` 等标准机制，不自建包管理器。
-2. **单轨收敛，避免双套并养**：显示后端收敛到单一 `NativeHost`，停止长期同时维护 WSLg 与 Native 两套显示协议，减少状态分叉与维护心智。
+2. **单一显示后端**：`NativeSink` 与 `NativeHost` 统一管理窗口状态、帧提交和输入路由。
 3. **通用机制优先，不做逐应用打补丁**：进程归属、后台脱离存活、失败日志观测都通过通用机制解决，而不是针对每个软件堆砌特判。
 4. **Windows 侧只做交互与呈现壳，核心逻辑全在 WSL 内核**：启动器、内置系统软件和窗口宿主负责入口、展示、热键与原生窗口呈现；所有 Stage 状态、路由与租约逻辑集中在 `focusstaged`。
 
@@ -51,9 +51,9 @@ FocusStage 要实现的体验：
 **Stage（舞台）= 一个被托管的应用实例（进程树）**，包含它的所有顶层窗口、弹窗、子 surface。
 
 - 应用必须通过 FocusStage 启动（`stage.launch`），不能中途接管已经在 Win11 上运行的 `.exe`。
-- **每个 Stage 彼此进程隔离**：
-  - Chromium / Electron：每个 Stage 使用独立的 `--user-data-dir`（或等价参数），避免多个窗口落在同一个浏览器进程里；
-  - X11 应用：每个 Stage 配一个独立的 rootless `Xwayland` 实例。
+- 多焦点隔离服务于跨应用并发。Chromium、Electron 和 Gecko 默认使用各自的 WSL 用户配置，关闭再启动可以保留设置和 Cookie。安装器提供 `gnome-keyring`，守护进程在 `XDG_CURRENT_DESKTOP` 未设置时使用 `GNOME`，让应用能选择 Linux Secret Service。密钥环由用户会话管理，应用读取加密凭据时需要可用且已解锁的密钥环。主动指定的 profile 参数由应用处理。
+- 同款单实例应用的再次启动、链接及 URI 回调由 `focusstaged` 转交给已有的 Human Stage。被 Agent 租用、已冻结或归属不明确时返回错误。已有的显式 profile 随转交沿用。已经通过其他合成器启动的实例需先退出，再由 FocusStage 启动。
+- X11 应用每个 Stage 配一个独立的 rootless `Xwayland` 实例。
 - 同一应用内部的多个顶层窗口、对话框、菜单、弹窗都属于同一个 Stage，由 Stage 内部维护活跃窗口与窗口间切换；在 Windows 任务栏中按 Stage 分组呈现。
 
 > 为什么不按窗口隔离？同一进程的多个窗口共享一个 Wayland 连接，合成器无法让它们"同时都是前台"而不让客户端察觉矛盾。以应用实例为单位，矛盾就不存在了。
@@ -127,9 +127,7 @@ FocusStage 要实现的体验：
  │   A11y            AT-SPI 无障碍树（按 PID 归属到 Stage）        │
  │   Control API     Unix socket，供 MCP / 启动器 / CLI 使用     │
  │                                                              │
- │   DisplaySink 接口 ──┬── NativeSink  主力且唯一收敛目标（Win32）│
- │                      ├── WslgSink    M2 过渡实现（待清理移除）  │
- │                      └── DrmSink     远期：独立开机            │
+ │   DisplaySink 接口 ─── NativeSink  原生 Win32 窗口             │
  │                                                              │
  │        WAYLAND_DISPLAY=focusstage-0  /  每 Stage 一个 Xwayland │
  │              ▼                ▼                ▼              │
@@ -175,17 +173,14 @@ FocusStage 要实现的体验：
 
 统一接口：窗口创建/更新/销毁、显隐切换、脏区推帧、输入事件与窗口状态回调。
 
-**NativeSink（主力后端，唯一收敛目标）**
+**NativeSink（唯一桌面显示后端）**
 
 - `focusstaged` 通过 WSL 互操作启动 Windows 侧 `FocusStage.exe --window-host`，以 stdio 二进制协议传输 BGRA 像素帧与键鼠/窗口/DPI 事件；
 - 每个 Desktop 态顶层窗口对应一个独立的无边框 Win32 `HWND`：保留 Linux 应用自身的 CSD 标题栏控件，不叠加 Windows 标题栏，支持 Win11 原生圆角、任务栏按 Stage 分组（`AppUserModelID`）及同 Stage 多窗口；
 - 关闭单个宿主窗口仅向对应 Linux 窗口发送关闭请求；收入后台即隐藏宿主窗口并保留 `SavedRect`，恢复时原位呈现；
 - 跨显示器移动时，向支持 `wp_fractional_scale_v1` 的 Wayland 客户端同步该窗口的 DPI 更新；X11 客户端走 XWayland 缩放路径。
 
-**WslgSink（M2 历史过渡实现，计划从主线移除）**
-
-- 早期用于验证桌面三态闭环，但受限于 WSLg RAIL 的强制标题栏、企鹅角标与多窗口控制能力，已不再作为演进方向；
-- 当前代码暂保留 `--wslg` 作为应急回退，待 `NativeSink` 稳定性验证完成后整套清理，实现显示后端单轨维护。
+- 宿主不可用或显式指定 `--headless` 时，守护进程进入离屏模式，继续提供 Stage、截图和 MCP 输入。
 
 **DrmSink（远期）**
 
@@ -248,8 +243,11 @@ Windows 上的 Agent 以 **stdio** 方式连接：MCP 配置中把命令设为 `
 stage.list()
     → [{ stage_id, app, title, display, input_owner, size }]
 
-stage.launch(app, args?)
-    → stage_id
+stage.list_apps(query?)
+    → [{ id, name, name_zh_cn? }]
+
+stage.launch(app_id | app_name | app, args?, wait_ready_ms?=8000, observe?=true)
+    → { stage_id, pid, status, ready?, launcher_exit?, observe_message? } + PNG when captured
 
 stage.acquire(stage_id, ttl_s, hide?=true)
     → lease                         # 同一 Stage 同时只有一个租约
@@ -262,10 +260,13 @@ stage.act(lease, actions[], based_on?: frame_seq)
 
 stage.clipboard_get(lease) / stage.clipboard_set(lease, text)
 
+stage.drop_files(lease, paths, x?, y?)
+    → ok | preempted | expired | drop_failed
+
 stage.release(lease, show_on_desktop?=true)
 ```
 
-`actions[]` 支持：`move`、`click`、`double_click`、`drag`、`scroll`、`key`（含组合键）、`type_text`、`wait(ms)`；MCP 层同时结合纯视觉 Set-of-Mark（SoM）打标支持双字母短码与坐标操作。
+`actions[]` 支持：`move`、`click`、`double_click`、`drag`、`scroll`、`key`（含组合键）、`type_text`、`wait(ms)`。MCP 默认返回原图并支持坐标操作；`stage_observe` 和 `stage_act` 可通过 `som: true` 启用 Set-of-Mark 打标，租约下生成的标号可作为后续操作的目标。
 
 ### 5.2 语义约定
 
@@ -289,7 +290,7 @@ stage.release(lease, show_on_desktop?=true)
 
 ### M2：桌面三态闭环（已完成）
 
-- 通过 `WslgSink` 与托盘/热键验证「桌面正常使用 ↔ 一键收入后台 ↔ AI 操作 ↔ 热键原位恢复」完整闭环；实测发现 WSLg 强制标题栏与外观无法满足原生存在方式要求，触发向原生宿主切换。
+- 用早期的 WSLg 实现与托盘热键验证桌面、后台和接管闭环。测试中的标题栏和任务栏限制推动了 Win32 原生宿主的开发。
 
 ### M3：日常可用基础能力（已完成）
 
@@ -297,12 +298,11 @@ stage.release(lease, show_on_desktop?=true)
 
 ### M4：原生 Win32 宿主与架构收敛（当前阶段）
 
-- **已完成**：`NativeSink` + `FocusStage.exe --window-host` 原生无标题栏宿主、同 Stage 多窗口与任务栏分组、启动器基础形态与设置/运行中 Stages 雏形。
+- **已完成**：`NativeSink` + `FocusStage.exe --window-host` 原生无标题栏宿主、显示后端单轨化、同 Stage 多窗口与任务栏分组、启动器基础形态与设置/运行中 Stages 雏形。
 - **当前收敛与加固重点**：
-  1. **显示后端单轨化**：修稳 `NativeHost` 的派发、输入、IME 拦截、窗口尺寸同步与离屏激活状态后，彻底移除主线中的 `WslgSink`，结束双套显示协议并养；
-  2. **通用启动与进程生命周期**：解决包装脚本/Snap/Electron 壳进程脱离后台导致的误回收与窗口失联，并向日志透出启动失败错误，替代按单软件打补丁；
-  3. **内置系统软件成形**：将启动器中现有的「设置 + 运行中的 Stages」整理为清晰的内置系统软件（用于集中查看守护进程、Stage 状态、AI 租约与执行切换/接管），启动器其余外围功能封板；
-  4. **浏览器与 CDP 互补（按需）**：为托管浏览器预留远程调试端口能力，让纯网页任务可直接衔接 Playwright / Chrome DevTools MCP，FocusStage 聚焦桌面客户端与人机共享会话。
+  1. **通用启动与进程生命周期**：解决包装脚本/Snap/Electron 壳进程脱离后台导致的误回收与窗口失联，并向日志透出启动失败错误，替代按单软件打补丁；
+  2. **内置系统软件成形**：将启动器中现有的「设置 + 运行中的 Stages」整理为清晰的内置系统软件（用于集中查看守护进程、Stage 状态、AI 租约与执行切换/接管），启动器其余外围功能封板；
+  3. **浏览器与 CDP 互补（按需）**：为托管浏览器预留远程调试端口能力，让纯网页任务可直接衔接 Playwright / Chrome DevTools MCP，FocusStage 聚焦桌面客户端与人机共享会话。
 
 ### M5：独立开机形态（远期）
 
@@ -314,11 +314,10 @@ stage.release(lease, show_on_desktop?=true)
 
 | 风险 | 影响 | 应对 |
 | :--- | :--- | :--- |
-| 双显示后端（`NativeSink` + `WslgSink`）长期并存 | 窗口激活、焦点、DPI 语义互相掣肘，维护成本翻倍 | 明确单轨收敛到 `NativeSink`，稳定后彻底移除 `WslgSink` |
 | 包装脚本/Snap/Electron 壳进程脱离父进程后退出 | Stage 被提前销毁或窗口无法归属，应用点开无反应 | 通过通用进程归属（环境变量/隔离边界）+ 宽限期/窗口存活回收 + 启动 stderr 日志彻底解决 |
 | 自研 Win32 宿主陷入无止境细节坑 | IME、鼠标捕获、光标、缩放等边界问题拖慢迭代 | 聚焦“存在方式自然”，优先修共性机制问题；IME 后续评估 Win32 直通 `text-input-v3` |
 | 启动器膨胀成自研 Linux 应用商店 | 陷入 `.deb`/Snap/AppImage 碎片兼容无底洞 | 应用安装外包给应用中心/`apt`，启动器只认标准 `.desktop` 与自定义命令，UI 封板 |
-| 一个 Stage 被多个进程共享（如浏览器复用已有进程） | 虚拟焦点产生矛盾 | 强制独立 `--user-data-dir` / 独立 Xwayland |
+| 同款单实例应用由多个 Stage 启动 | 新 Stage 收不到窗口，或打断现有租约 | 将启动和回调统一交给现有 Human Stage，拒绝 Agent、Frozen 与歧义目标 |
 | `/mnt/c` 9P 性能差 | 大仓库读写卡顿 | 文档说明，性能敏感项目放 WSL 原生文件系统 |
 | AI 可读写真实用户目录 | 误删误改文件 | 后续为 Stage 增加可选沙箱（bubblewrap，目录白名单 / 只读挂载） |
 
@@ -327,7 +326,6 @@ stage.release(lease, show_on_desktop?=true)
 ## 8. 明确不做的事
 
 - **不按窗口分配 `wl_seat`**：依赖客户端的多 Seat 支持，兼容性没有保证。
-- **不再长期并养两套显示后端**：明确以 `NativeHost` 为唯一演进主线，不再同时维护 `WslgSink`。
 - **不把 Linux 软件改造成 Windows 交互体验**：追求的是像 Windows 软件一样的**存在方式与启动/管理便捷**，不魔改 Linux 应用内部手感。
 - **不自研 Linux 应用商店与包格式安装器**：软件安装交给系统应用中心或包管理器，启动器只负责基于 `.desktop` 的统一呈现、整理与启动。
 - **不为单个软件堆砌零碎补丁**：启动失败、后台脱离、窗口归属一律通过通用机制解决。

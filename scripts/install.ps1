@@ -1,7 +1,8 @@
 param(
     [string]$Distro = "Ubuntu",
     [switch]$SkipRustBuild,
-    [switch]$NoLaunch
+    [switch]$NoLaunch,
+    [switch]$SkipMcpConfig
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,14 +36,16 @@ $installCmd = @(
     "install -m 755 '$WslRepo/target/release/focusstage' /usr/local/bin/focusstage",
     "sed 's/\r`$//' '$WslRepo/scripts/focusstage-launch' > /usr/local/bin/focusstage-launch",
     "chmod 755 /usr/local/bin/focusstage-launch",
-    "if command -v apt-get >/dev/null 2>&1 && ! dpkg -s policykit-1-gnome xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq policykit-1-gnome xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland && fc-cache -f >/dev/null 2>&1 || true; fi",
+    "sed 's/\r`$//' '$WslRepo/scripts/focusstage-open' > /usr/local/bin/focusstage-open",
+    "chmod 755 /usr/local/bin/focusstage-open",
+    "if command -v apt-get >/dev/null 2>&1 && ! dpkg -s policykit-1-gnome gnome-keyring xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland xdg-utils desktop-file-utils >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq policykit-1-gnome gnome-keyring xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland xdg-utils desktop-file-utils && fc-cache -f >/dev/null 2>&1; fi",
     "/usr/local/bin/focusstage --json sync-apps >/dev/null"
 ) -join " && "
 wsl.exe -d $Distro -u root -e bash -lc $installCmd
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to install WSL binaries or run sync-apps."
 }
-wsl.exe -d $Distro -e bash -lc "if command -v gsettings >/dev/null 2>&1 && gsettings writable org.gnome.desktop.wm.preferences button-layout >/dev/null 2>&1; then gsettings set org.gnome.desktop.wm.preferences button-layout ':minimize,maximize,close'; fi" | Out-Null
+wsl.exe -d $Distro -e bash -lc "if command -v gsettings >/dev/null 2>&1; then if gsettings writable org.gnome.desktop.wm.preferences button-layout 2>/dev/null | grep -qx true; then gsettings set org.gnome.desktop.wm.preferences button-layout ':minimize,maximize,close'; fi; if gsettings writable org.gnome.desktop.interface toolkit-accessibility 2>/dev/null | grep -qx true; then gsettings set org.gnome.desktop.interface toolkit-accessibility true; fi; fi" | Out-Null
 
 Write-Host "[4/5] Publishing Windows Launcher & Tray app to '$InstallDir'..." -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
@@ -103,10 +106,27 @@ if ($LASTEXITCODE -ne 0) {
     throw "Failed to register the native Windows host in WSL '$Distro'."
 }
 
-Write-Host "[5/5] Creating Start Menu, Desktop & Startup shortcuts..." -ForegroundColor Cyan
+Write-Host "[5/5] Initializing Linux protocol associations and creating Windows shortcuts..." -ForegroundColor Cyan
+wsl.exe -d $Distro -e /usr/local/bin/focusstage --json settings init-defaults | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to initialize FocusStage protocol associations."
+}
 & $exePath --sync-shortcuts --distro $Distro
 if ($LASTEXITCODE -ne 0) {
     throw "FocusStage --sync-shortcuts failed."
+}
+
+if (-not $SkipMcpConfig) {
+    Write-Host "Registering FocusStage with Claude Code MCP..." -ForegroundColor Cyan
+    $claudeConfig = Join-Path $HOME ".claude.json"
+    $wslConfig = wsl.exe -d $Distro -e wslpath -a ($claudeConfig -replace '\\', '/')
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($wslConfig)) {
+        throw "Failed to resolve the Claude Code configuration path in WSL."
+    }
+    wsl.exe -d $Distro -e python3 -I "$WslRepo/scripts/claude-mcp.py" $wslConfig.Trim() --distro $Distro
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to register the Claude Code MCP server."
+    }
 }
 
 Write-Host ""
