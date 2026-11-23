@@ -380,10 +380,7 @@ internal sealed class FocusStageTrayContext : ApplicationContext
 
         _menu.Items.Add(new ToolStripSeparator());
 
-        var launchMenu = new ToolStripMenuItem("Quick Launch Stage");
-        launchMenu.DropDownItems.Add("Chromium (Wayland Browser)", null, (_, _) => _ = RunControlAndRefreshAsync("launch", "--ensure-daemon", "--kind", "chromium", "--wm-class", "focusstage-chromium_chromium", "chromium"));
-        launchMenu.DropDownItems.Add("Custom command...", null, (_, _) => PromptLaunchCustom());
-        _menu.Items.Add(launchMenu);
+        _menu.Items.Add(CreateQuickLaunchMenu());
 
         var syncAppsItem = new ToolStripMenuItem("Sync Linux Apps to Start Menu");
         syncAppsItem.Click += (_, _) => _ = SyncLinuxAppsAsync();
@@ -406,6 +403,48 @@ internal sealed class FocusStageTrayContext : ApplicationContext
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add("Exit", null, (_, _) => ExitThread());
     }
+
+    private ToolStripMenuItem CreateQuickLaunchMenu()
+    {
+        var menu = new ToolStripMenuItem("Quick Launch Stage");
+        var status = new ToolStripMenuItem("正在读取 Linux 浏览器…") { Enabled = false };
+        var custom = new ToolStripMenuItem("Custom command...", null, (_, _) => PromptLaunchCustom());
+        menu.DropDownItems.AddRange([status, custom]);
+        bool loading = false;
+        menu.DropDownOpening += async (_, _) =>
+        {
+            if (loading) return;
+            loading = true;
+            while (menu.DropDownItems.Count > 2)
+            {
+                var oldItem = menu.DropDownItems[1];
+                menu.DropDownItems.RemoveAt(1);
+                oldItem.Dispose();
+            }
+            status.Text = "正在读取 Linux 浏览器…";
+            status.Visible = true;
+            var (ok, apps, _) = await ShortcutManager.FetchLinuxAppsAsync(_distro);
+            loading = false;
+            if (menu.IsDisposed || menu.Owner is null) return;
+
+            var browsers = QuickLaunchBrowsers(apps);
+            foreach (var app in browsers)
+            {
+                var item = new ToolStripMenuItem(app.DisplayName, null, (_, _) => _ = RunControlAndRefreshAsync(
+                    LaunchCommandLine.ForStage(app.Cmd, app.Args, app.WmClass)));
+                menu.DropDownItems.Insert(menu.DropDownItems.Count - 1, item);
+            }
+            status.Text = ok ? "没有已安装的 Linux 浏览器" : "无法读取 Linux 浏览器列表";
+            status.Visible = browsers.Length == 0;
+        };
+        return menu;
+    }
+
+    internal static LinuxAppDto[] QuickLaunchBrowsers(IEnumerable<LinuxAppDto> apps) => apps
+        .Where(app => app.Source == "desktop" && !string.IsNullOrWhiteSpace(app.Cmd) &&
+            app.Categories?.Split(';').Contains("WebBrowser", StringComparer.Ordinal) == true)
+        .OrderBy(app => app.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+        .ToArray();
 
     public void PromptLaunchCustom(IWin32Window? owner = null)
     {
@@ -454,11 +493,20 @@ internal sealed class FocusStageTrayContext : ApplicationContext
             AutoSize = true,
             DialogResult = DialogResult.Cancel
         };
-        var ok = new Button
+        var ok = new Button { Text = "Launch", AutoSize = true };
+        string[] command = [];
+        ok.Click += (_, _) =>
         {
-            Text = "Launch",
-            AutoSize = true,
-            DialogResult = DialogResult.OK
+            try
+            {
+                command = LaunchCommandLine.Parse(box.Text);
+                form.DialogResult = DialogResult.OK;
+            }
+            catch (FormatException ex)
+            {
+                MessageBox.Show(form, ex.Message, "FocusStage", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                box.Focus();
+            }
         };
         buttons.Controls.Add(cancel);
         buttons.Controls.Add(ok);
@@ -495,20 +543,8 @@ internal sealed class FocusStageTrayContext : ApplicationContext
         form.Load += (_, _) => ApplyDpiLayout(form.DeviceDpi);
 
         var dialogResult = owner is not null ? form.ShowDialog(owner) : form.ShowDialog();
-        if (dialogResult == DialogResult.OK && !string.IsNullOrWhiteSpace(box.Text))
-        {
-            var parts = box.Text.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length > 0)
-            {
-                var args = new List<string> { "launch", "--ensure-daemon", parts[0] };
-                if (parts.Length > 1)
-                {
-                    args.Add("--");
-                    args.AddRange(parts.Skip(1));
-                }
-                _ = RunControlAndRefreshAsync(args.ToArray());
-            }
-        }
+        if (dialogResult == DialogResult.OK)
+            _ = RunControlAndRefreshAsync(LaunchCommandLine.ForStage(command[0], command[1..]));
     }
 
     public async Task TakeoverAllAsync()
