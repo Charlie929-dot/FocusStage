@@ -82,6 +82,12 @@ internal static class Program
     }
 }
 
+internal sealed record LinuxAppChoice(string Id, string Name);
+
+internal sealed record LinuxDesktopSettings(string Browser, List<LinuxAppChoice> Browsers,
+    string? Terminal, List<LinuxAppChoice> Terminals, Dictionary<string, string> Protocols,
+    bool XdgOpenInstalled, bool PortalActive, bool MimeappsSynced);
+
 internal sealed class StageDto
 {
     [JsonPropertyName("stage_id")]
@@ -521,6 +527,16 @@ internal sealed class FocusStageTrayContext : ApplicationContext
         {
             await _launcherForm.RefreshAppsAsync();
         }
+    }
+
+    internal async Task<LinuxDesktopSettings> LinuxSettingsAsync(params string[] settingsArgs)
+    {
+        var (code, stdout, stderr) = await RunFocusStageFullAsync(["--json", "settings", .. settingsArgs]);
+        if (code != 0)
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(stderr) ? "无法读取 Linux 设置" : stderr);
+        return JsonSerializer.Deserialize<LinuxDesktopSettings>(stdout,
+            new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower })
+            ?? throw new InvalidOperationException("Linux 设置响应为空");
     }
 
     public async Task<(bool Ok, string Message)> RunControlWithFeedbackAsync(params string[] focusstageArgs)

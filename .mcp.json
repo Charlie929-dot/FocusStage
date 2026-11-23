@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "focusstage": {
+      "type": "stdio",
+      "command": "wsl.exe",
+      "args": ["-d", "Ubuntu", "-e", "/usr/local/bin/focusstage", "mcp"]
+    }
+  }
+}

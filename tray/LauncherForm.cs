@@ -40,6 +40,7 @@ internal sealed class LauncherForm : Form
     private readonly DimOverlayPanel _settingsOverlay;
     private readonly RoundedPanel _settingsCard;
     private readonly Panel _settingsScrollBody;
+    private readonly LinuxSettingsPanel _linuxSettings;
     private readonly ToggleSwitch _toggleStartup;
     private readonly PillButton _btnSyncStartMenu;
     private readonly Panel _settingsDaemonDot;
@@ -536,7 +537,13 @@ internal sealed class LauncherForm : Form
         daemonCard.Controls.Add(daemonRow);
         daemonCard.Height = 122;
 
-        // --- Section 3: Running Stages (Zero-flicker, tucked inside Settings) ---
+        var linuxCard = CreateSettingsGroupCard("Linux 系统设置");
+        linuxCard.Height = 192;
+        _linuxSettings = new LinuxSettingsPanel(_ctx, ShowToast);
+        linuxCard.Controls.Add(_linuxSettings);
+        _linuxSettings.BringToFront();
+
+        // --- Running Stages (Zero-flicker, tucked inside Settings) ---
         var stagesCard = new RoundedPanel
         {
             CornerRadius = 16,
@@ -585,7 +592,7 @@ internal sealed class LauncherForm : Form
         stagesCard.Controls.Add(_stagesPanel);
         stagesCard.Controls.Add(stagesHeaderRow);
 
-        settingsStack.Controls.AddRange(new Control[] { generalCard, daemonCard, stagesCard });
+        settingsStack.Controls.AddRange(new Control[] { generalCard, daemonCard, linuxCard, stagesCard });
         _settingsScrollBody.Controls.Add(settingsStack);
 
         int lastSettingsContentWidth = -1;
@@ -599,6 +606,7 @@ internal sealed class LauncherForm : Form
             settingsStack.Width = contentW;
             generalCard.Width = contentW;
             daemonCard.Width = contentW;
+            linuxCard.Width = contentW;
             stagesCard.MinimumSize = new Size(contentW, 90);
             stagesCard.MaximumSize = new Size(contentW, 0);
             stagesCard.Width = contentW;
@@ -1226,6 +1234,7 @@ internal sealed class LauncherForm : Form
         CaptureOverlayBackdrop(_settingsOverlay);
         _settingsOverlay.BringToFront();
         _settingsOverlay.Visible = true;
+        _ = _linuxSettings.RefreshAsync();
     }
 
     private void CloseSettingsOverlay()

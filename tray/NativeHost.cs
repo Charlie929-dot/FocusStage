@@ -37,7 +37,28 @@ internal static class NativeHost
         string Type, string WindowId = "", string StageId = "", string Title = "",
         WindowRect Rect = default, double Scale = 1, string? ParentWindowId = null,
         int Direction = -1, bool Maximized = false, string Text = "",
-        int Width = 0, int Height = 0, ulong Seq = 0, string WmClass = "");
+        int Width = 0, int Height = 0, ulong Seq = 0, string WmClass = "", string Url = "");
+
+    private static void OpenWebUrl(string url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
+            uri.Scheme is not ("http" or "https") || string.IsNullOrEmpty(uri.Host))
+        {
+            Console.Error.WriteLine("FocusStage window host: rejected non-HTTP(S) browser URL.");
+            return;
+        }
+        try
+        {
+            using var browser = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(uri.AbsoluteUri)
+            {
+                UseShellExecute = true,
+            });
+        }
+        catch (Win32Exception)
+        {
+            Console.Error.WriteLine("FocusStage window host: could not open the Windows default browser.");
+        }
+    }
 
     private sealed class Session : IDisposable
     {
@@ -183,6 +204,12 @@ internal static class NativeHost
                     break;
                 case "clipboard":
                     _dispatcher.SetClipboard(command.Text);
+                    break;
+                case "open_url":
+                    OpenWebUrl(command.Url);
+                    break;
+                case "activate":
+                    window?.Activate();
                     break;
                 case "destroy" when window is not null:
                     _windows.Remove(id);

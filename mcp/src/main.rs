@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use focusstage_compositor::control::ControlClient;
+use focusstage_compositor::desktop::{self, DesktopEntry};
+use focusstage_compositor::xdg::{self, SettingsAction};
 use focusstage_compositor::protocol::{
     default_socket_path, Action, ControlRequest, ControlResponse, DisplayState, StageKind,
 };
@@ -51,14 +53,28 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Route one or more links or local files through FocusStage
+    Open {
+        #[arg(long)]
+        ensure_daemon: bool,
+        #[arg(long)]
+        handler: Option<String>,
+        #[arg(required = true)]
+        uris: Vec<String>,
+    },
+    /// Inspect or change user-level Linux desktop preferences
+    Settings {
+        #[command(subcommand)]
+        action: SettingsCommand,
+    },
     /// List discovered Linux GUI applications from .desktop entries
     ListApps,
-    /// Generate FocusStage wrapper .desktop entries for Linux GUI apps so WSLg adds them to Win11 Start Menu & Taskbar
+    /// Generate FocusStage wrapper .desktop entries for Linux GUI apps
     SyncApps {
         /// Remove previously generated focusstage-*.desktop wrappers
         #[arg(long, default_value_t = false)]
         remove: bool,
-        /// Target applications directory watched by WSLg (defaults to /usr/share/applications for root)
+        /// Target applications directory (defaults to /usr/share/applications for root)
         #[arg(long)]
         out_dir: Option<PathBuf>,
     },
@@ -148,11 +164,22 @@ enum Commands {
     Shutdown,
 }
 
+#[derive(Debug, Subcommand)]
+enum SettingsCommand {
+    Get,
+    InitDefaults,
+    SetBrowser { id: String },
+    SetTerminal { id: String },
+    SyncHandlers,
+    RemoveHandlers,
+}
+
 fn parse_kind(s: &str) -> anyhow::Result<StageKind> {
     match s.to_ascii_lowercase().as_str() {
         "wayland" => Ok(StageKind::Wayland),
         "chromium" => Ok(StageKind::Chromium),
         "electron" => Ok(StageKind::Electron),
+        "gecko" => Ok(StageKind::Gecko),
         "x11" => Ok(StageKind::X11),
         _ => anyhow::bail!("Invalid stage kind: {s}"),
     }
@@ -175,11 +202,21 @@ fn main() -> anyhow::Result<()> {
         return run_sync_apps(&target_dir, remove, cli.json);
     }
 
-    if let Commands::Launch {
-        ensure_daemon: true,
-        ..
-    } = &cli.command
-    {
+    if let Commands::Settings { action } = cli.command {
+        let action = match action {
+            SettingsCommand::Get => SettingsAction::Get,
+            SettingsCommand::InitDefaults => SettingsAction::InitDefaults,
+            SettingsCommand::SetBrowser { id } => SettingsAction::SetBrowser(id),
+            SettingsCommand::SetTerminal { id } => SettingsAction::SetTerminal(id),
+            SettingsCommand::SyncHandlers => SettingsAction::SyncHandlers,
+            SettingsCommand::RemoveHandlers => SettingsAction::RemoveHandlers,
+        };
+        let view = xdg::settings(action)?;
+        println!("{}", if cli.json { serde_json::to_string(&view)? } else { serde_json::to_string_pretty(&view)? });
+        return Ok(());
+    }
+
+    if matches!(cli.command, Commands::Launch { ensure_daemon: true, .. } | Commands::Open { ensure_daemon: true, .. }) {
         ensure_focusstaged_running(&sock)?;
     }
 
@@ -214,7 +251,21 @@ fn main() -> anyhow::Result<()> {
                 wm_class,
             }
         }
-        Commands::ListApps | Commands::SyncApps { .. } => unreachable!(),
+        Commands::Open { uris, handler, .. } => {
+            let mut ok = true;
+            for uri in uris {
+                let uri = if !uri.contains(':') && !uri.starts_with('/') {
+                    std::env::current_dir()?.join(uri).into_os_string().into_string()
+                        .map_err(|_| anyhow::anyhow!("Local path is not valid UTF-8"))?
+                } else { uri };
+                let response = client.call(&ControlRequest::OpenUri { uri, handler: handler.clone() })?;
+                ok &= !matches!(response, ControlResponse::Error { .. });
+                print_resp(&response, cli.json);
+            }
+            if !ok { std::process::exit(1); }
+            return Ok(());
+        }
+        Commands::ListApps | Commands::SyncApps { .. } | Commands::Settings { .. } => unreachable!(),
         Commands::Close { stage_id } => ControlRequest::Close { stage_id },
         Commands::Acquire {
             stage_id,
@@ -276,6 +327,8 @@ fn main() -> anyhow::Result<()> {
                 lease,
                 actions,
                 based_on,
+                settle: None,
+                settle_ms: None,
             }
         }
         Commands::Release { lease, keep_hidden } => ControlRequest::Release {
@@ -382,7 +435,7 @@ fn ensure_focusstaged_running(sock: &std::path::Path) -> anyhow::Result<()> {
                 "-p",
                 &format!("StandardError=append:{}", effective_log_path.display()),
             ]);
-        for key in ["DISPLAY", "WAYLAND_DISPLAY", "PULSE_SERVER", "WSL_INTEROP", "XDG_CONFIG_HOME"] {
+        for key in ["DISPLAY", "WAYLAND_DISPLAY", "PULSE_SERVER", "WSL_INTEROP", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_DATA_DIRS"] {
             if let Ok(val) = std::env::var(key) {
                 if !val.is_empty() {
                     sd.args(["-E", &format!("{key}={val}")]);
@@ -481,7 +534,7 @@ struct DiscoveredDesktopApp {
     wrapper_id: String,
     source: &'static str,
     file_path: Option<String>,
-    parsed: DesktopEntryParsed,
+    parsed: DesktopEntry,
     icon_path: Option<String>,
 }
 
@@ -595,9 +648,12 @@ fn discover_desktop_apps() -> Vec<DiscoveredDesktopApp> {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let Some(parsed) = parse_desktop_entry(&text) else {
+            let Some(parsed) = desktop::parse(&text) else {
                 continue;
             };
+            if parsed.no_display {
+                continue;
+            }
             // Windows opens these paths via the WSL share, which cannot follow Snap's `current` link.
             let icon_path = parsed
                 .icon
@@ -653,7 +709,7 @@ fn discover_desktop_apps() -> Vec<DiscoveredDesktopApp> {
                 wrapper_id: format!("focusstage-{id_key}"),
                 source,
                 file_path: Some(full.clone()),
-                parsed: DesktopEntryParsed {
+                parsed: DesktopEntry {
                     name: raw_stem.to_string(),
                     name_zh_cn: None,
                     generic_name: Some(if source == "appimage" {
@@ -665,6 +721,9 @@ fn discover_desktop_apps() -> Vec<DiscoveredDesktopApp> {
                     args: Vec::new(),
                     icon: None,
                     categories: Some("Downloads;".to_string()),
+                    mime_types: Vec::new(),
+                    wm_class: None,
+                    no_display: false,
                 },
                 icon_path: None,
             });
@@ -679,6 +738,7 @@ fn run_list_apps(json_mode: bool) -> anyhow::Result<()> {
     let apps: Vec<_> = discover_desktop_apps()
         .into_iter()
         .map(|app| {
+            let args = app.parsed.launch_args();
             serde_json::json!({
                 "id": app.wrapper_id,
                 "stem": app.stem,
@@ -688,7 +748,7 @@ fn run_list_apps(json_mode: bool) -> anyhow::Result<()> {
                 "name_zh_cn": app.parsed.name_zh_cn,
                 "generic_name": app.parsed.generic_name,
                 "cmd": app.parsed.cmd,
-                "args": app.parsed.args,
+                "args": args,
                 "wm_class": app.wrapper_id,
                 "icon": app.parsed.icon,
                 "icon_path": app.icon_path,
@@ -752,9 +812,10 @@ fn run_sync_apps(out_dir: &std::path::Path, remove: bool, json_mode: bool) -> an
             shell_quote_desktop(wrapper_id),
             shell_quote_desktop(&parsed.cmd)
         );
-        if !parsed.args.is_empty() {
+        let args = parsed.launch_args();
+        if !args.is_empty() {
             exec_line.push_str(" --");
-            for a in &parsed.args {
+            for a in &args {
                 exec_line.push(' ');
                 exec_line.push_str(&shell_quote_desktop(a));
             }
@@ -805,134 +866,6 @@ fn run_sync_apps(out_dir: &std::path::Path, remove: bool, json_mode: bool) -> an
     Ok(())
 }
 
-struct DesktopEntryParsed {
-    name: String,
-    name_zh_cn: Option<String>,
-    generic_name: Option<String>,
-    cmd: String,
-    args: Vec<String>,
-    icon: Option<String>,
-    categories: Option<String>,
-}
-
-fn parse_desktop_entry(text: &str) -> Option<DesktopEntryParsed> {
-    let mut in_main = false;
-    let mut entry_type = None;
-    let mut no_display = false;
-    let mut hidden = false;
-    let mut terminal = false;
-    let mut only_show_in = None;
-    let mut name = None;
-    let mut name_zh_cn = None;
-    let mut generic_name = None;
-    let mut exec = None;
-    let mut icon = None;
-    let mut categories = None;
-
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            in_main = line == "[Desktop Entry]";
-            continue;
-        }
-        if !in_main {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        let k = k.trim();
-        let v = v.trim();
-        match k {
-            "Type" => entry_type = Some(v.to_string()),
-            "NoDisplay" => no_display = v.eq_ignore_ascii_case("true"),
-            "Hidden" => hidden = v.eq_ignore_ascii_case("true"),
-            "Terminal" => terminal = v.eq_ignore_ascii_case("true"),
-            "OnlyShowIn" => only_show_in = Some(v.to_string()),
-            "Name" => name = Some(v.to_string()),
-            "Name[zh_CN]" => name_zh_cn = Some(v.to_string()),
-            "GenericName" => generic_name = Some(v.to_string()),
-            "Exec" => exec = Some(v.to_string()),
-            "Icon" => icon = Some(v.to_string()),
-            "Categories" => categories = Some(v.to_string()),
-            _ => {}
-        }
-    }
-
-    if entry_type.as_deref() != Some("Application") || no_display || hidden || terminal {
-        return None;
-    }
-    if let Some(ref osi) = only_show_in {
-        let allowed = osi
-            .split(';')
-            .any(|s| matches!(s.trim(), "GNOME" | "Ubuntu" | "ubuntu"));
-        if !allowed {
-            return None;
-        }
-    }
-    let name = name?;
-    let exec_str = exec?;
-    let tokens = split_desktop_exec(&exec_str);
-    let mut iter = tokens.into_iter().filter(|t| {
-        !matches!(
-            t.as_str(),
-            "%u" | "%U" | "%f" | "%F" | "%i" | "%c" | "%k" | "%d" | "%D" | "%n" | "%N" | "%v" | "%m"
-        )
-    });
-    let cmd = iter.next()?;
-    let args: Vec<String> = iter.collect();
-    Some(DesktopEntryParsed {
-        name,
-        name_zh_cn,
-        generic_name,
-        cmd,
-        args,
-        icon,
-        categories,
-    })
-}
-
-fn split_desktop_exec(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escape = false;
-    for ch in s.chars() {
-        if escape {
-            cur.push(ch);
-            escape = false;
-            continue;
-        }
-        if ch == '\\' && !in_single {
-            escape = true;
-            continue;
-        }
-        if ch == '\'' && !in_double {
-            in_single = !in_single;
-            continue;
-        }
-        if ch == '"' && !in_single {
-            in_double = !in_double;
-            continue;
-        }
-        if ch.is_whitespace() && !in_single && !in_double {
-            if !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-            }
-            continue;
-        }
-        cur.push(ch);
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
 fn shell_quote_desktop(arg: &str) -> String {
     if !arg.is_empty()
         && arg
@@ -972,20 +905,20 @@ Categories=Network;WebBrowser;
 Name=New Window
 Exec=/snap/bin/chromium
 "#;
-        let parsed = parse_desktop_entry(desktop).expect("should parse Application entry");
+        let parsed = desktop::parse(desktop).expect("should parse Application entry");
         assert_eq!(parsed.name, "Chromium Web Browser");
         assert_eq!(parsed.name_zh_cn.as_deref(), Some("Chromium 网页浏览器"));
         assert_eq!(parsed.cmd, "/snap/bin/chromium");
-        assert!(parsed.args.is_empty());
+        assert!(parsed.launch_args().is_empty());
         assert_eq!(parsed.icon.as_deref(), Some("/snap/chromium/current/chromium.png"));
     }
 
     #[test]
     fn skips_terminal_and_nodisplay_entries() {
         let term = "[Desktop Entry]\nType=Application\nName=Vim\nExec=vim %F\nTerminal=true\n";
-        assert!(parse_desktop_entry(term).is_none());
+        assert!(desktop::parse(term).is_none());
 
         let hidden = "[Desktop Entry]\nType=Application\nName=Helper\nExec=helper\nNoDisplay=true\n";
-        assert!(parse_desktop_entry(hidden).is_none());
+        assert!(desktop::parse(hidden).unwrap().no_display);
     }
 }

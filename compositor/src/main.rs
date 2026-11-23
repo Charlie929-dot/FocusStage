@@ -1,11 +1,11 @@
 use std::cell::Cell;
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use smithay::backend::input::AxisSource;
 use smithay::desktop::PopupManager;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -13,13 +13,11 @@ use smithay::reexports::calloop::{channel as calloop_channel, EventLoop, Interes
 use smithay::reexports::wayland_server::{Display, ListeningSocket};
 use tracing::{info, warn};
 
-use focusstage_compositor::control::spawn_control_server;
+use focusstage_compositor::control::{local_peer_pid, spawn_control_server};
 use focusstage_compositor::offscreen::send_frames_surface_tree;
 use focusstage_compositor::protocol::{default_socket_path, DisplayState, SavedRect};
 use focusstage_compositor::router::InputSource;
 use focusstage_compositor::sink::native::NativeSink;
-use focusstage_compositor::sink::wslg::WslgSink;
-use focusstage_compositor::sink::wslg_wayland::WslgWaylandSink;
 use focusstage_compositor::sink::{DisplaySink, SinkInputEvent};
 use focusstage_compositor::state::{ClientState, FocusStageState};
 
@@ -38,44 +36,17 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     frame_hz: u32,
 
-    /// Default HiDPI scale factor for WSLg and headless mode
+    /// Default HiDPI scale factor for offscreen mode.
     #[arg(long, default_value_t = 1.0)]
     scale: f64,
 
     /// Run offscreen without a desktop host.
-    #[arg(long, conflicts_with_all = ["wslg", "native_host"])]
-    headless: bool,
-
-    /// Use the legacy WSLg backend even if the Windows host is installed.
     #[arg(long, conflicts_with = "native_host")]
-    wslg: bool,
+    headless: bool,
 
     /// Start the native Windows host at this WSL path instead of the installed executable.
     #[arg(long, value_name = "FOCUSSTAGE_EXE")]
     native_host: Option<PathBuf>,
-}
-
-fn get_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
-    let mut ucred = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut ucred as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc == 0 && ucred.pid > 0 {
-        Some(ucred.pid as u32)
-    } else {
-        None
-    }
 }
 
 fn normalize_process_path() {
@@ -108,8 +79,8 @@ fn normalize_process_path() {
 fn ensure_desktop_session_helpers() {
     use std::process::{Command, Stdio};
 
-    // Export WSLg display variables to systemd --user / D-Bus activation so
-    // xdg-desktop-portal-gtk and session helpers see DISPLAY / WAYLAND_DISPLAY.
+    // Export WSLg display and desktop variables to systemd --user / D-Bus activation so
+    // xdg-desktop-portal-gtk, gnome-keyring.portal, and session helpers see them.
     let _ = Command::new("systemctl")
         .args([
             "--user",
@@ -118,6 +89,7 @@ fn ensure_desktop_session_helpers() {
             "WAYLAND_DISPLAY",
             "PULSE_SERVER",
             "XDG_DATA_DIRS",
+            "XDG_CURRENT_DESKTOP",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -207,48 +179,23 @@ fn installed_native_host() -> Option<PathBuf> {
     if path.is_empty() { None } else { Some(PathBuf::from(path)) }
 }
 
-fn connect_desktop(args: &Args) -> anyhow::Result<(Option<Box<dyn DisplaySink>>, SavedRect, f64)> {
+fn connect_desktop(args: &Args) -> (Option<Box<dyn DisplaySink>>, SavedRect, f64) {
     let default_monitor = SavedRect { x: 0, y: 0, width: 1920, height: 1080 };
     let default_scale = if args.scale.is_finite() { args.scale.max(1.0) } else { 1.0 };
     if args.headless {
-        return Ok((None, default_monitor, default_scale));
-    }
-    if !args.wslg {
-        if let Some(path) = args.native_host.clone().or_else(installed_native_host) {
-            match NativeSink::connect(&path) {
-                Ok((host, monitor, scale)) => {
-                    info!(scale, "Connected to native Win32 display host");
-                    return Ok((Some(Box::new(host)), monitor, scale));
-                }
-                Err(err) if args.native_host.is_some() => {
-                    return Err(err.context(format!("start native Windows host at {}", path.display())));
-                }
-                Err(err) => {
-                    warn!("Native Windows host unavailable at {} ({err}); using WSLg", path.display());
-                }
+        info!("Headless mode requested; running offscreen");
+    } else if let Some(path) = args.native_host.clone().or_else(installed_native_host) {
+        match NativeSink::connect(&path) {
+            Ok((host, monitor, scale)) => {
+                info!(scale, "Connected to native Win32 display host");
+                return (Some(Box::new(host)), monitor, scale);
             }
+            Err(err) => warn!("Native Windows host unavailable at {} ({err}); running offscreen", path.display()),
         }
+    } else {
+        info!("No native Windows host configured; running offscreen");
     }
-    let sink: Option<Box<dyn DisplaySink>> = match WslgWaylandSink::connect() {
-        Ok(sink) => Some(Box::new(sink)),
-        Err(wl_err) => {
-            let display = std::env::var("WSLG_DISPLAY").ok().or_else(|| std::env::var("DISPLAY").ok());
-            match display.as_deref().filter(|d| !d.is_empty()) {
-                Some(d) => match WslgSink::connect(Some(d)) {
-                    Ok(sink) => Some(Box::new(sink)),
-                    Err(err) => {
-                        warn!("WSLg unavailable (Wayland: {wl_err}; X11: {err}); running offscreen");
-                        None
-                    }
-                },
-                None => {
-                    warn!("WSLg unavailable ({wl_err}); running offscreen");
-                    None
-                }
-            }
-        }
-    };
-    Ok((sink, default_monitor, default_scale))
+    (None, default_monitor, default_scale)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -262,17 +209,18 @@ fn main() -> anyhow::Result<()> {
     }
 
     let args = Args::parse();
+    let control_socket = args.socket.clone().unwrap_or_else(default_socket_path);
+    // Child processes that call focusstage-open must return to this daemon.
+    std::env::set_var("FOCUSSTAGE_SOCKET", &control_socket);
+    // Provide a standard GNOME desktop identity when unset so xdg-open avoids WSL fallback,
+    // portals match gtk/gnome-keyring backends, and Chromium/Electron use libsecret.
+    if std::env::var_os("XDG_CURRENT_DESKTOP").is_none_or(|v| v.is_empty()) {
+        std::env::set_var("XDG_CURRENT_DESKTOP", "GNOME");
+    }
     if !args.headless {
         ensure_desktop_session_helpers();
     }
-    let (display_sink, monitor, scale) = connect_desktop(&args)?;
-    let control_socket = args.socket.unwrap_or_else(default_socket_path);
-    let runtime_base = control_socket
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("focusstage-runtime");
-    std::fs::create_dir_all(&runtime_base)?;
+    let (display_sink, monitor, scale) = connect_desktop(&args);
 
     let mut event_loop: EventLoop<FocusStageState> = EventLoop::try_new()?;
     let display: Display<FocusStageState> = Display::new()?;
@@ -294,7 +242,6 @@ fn main() -> anyhow::Result<()> {
         &dh,
         event_loop.handle(),
         wayland_name.clone(),
-        runtime_base,
         scale,
         frame_hz,
         monitor,
@@ -314,7 +261,7 @@ fn main() -> anyhow::Result<()> {
             Generic::new(listener, Interest::READ, Mode::Level),
             |_, listener, state| {
                 while let Ok(Some(stream)) = listener.accept() {
-                    let pid = get_peer_pid(&stream);
+                    let pid = local_peer_pid(&stream);
                     let stage_id = pid.and_then(|p| state.resolve_stage_for_pid(p));
                     let cdata = Arc::new(ClientState {
                         compositor_state: Default::default(),
@@ -395,10 +342,9 @@ fn main() -> anyhow::Result<()> {
             break;
         }
 
-        // 1. Drain any WslgSink events queued internally (e.g. during roundtrip/show)
         dispatch_sink_events(&mut state);
 
-        // 2. Tick pending AI action sequences, expire leases, reap exited processes
+        // Tick pending AI action sequences, expire leases, and reap exited processes.
         state.tick_pending_act_jobs();
         state.expire_leases();
         state.reap_exited_stages();
@@ -425,7 +371,7 @@ fn main() -> anyhow::Result<()> {
             let window = state.stages[stage_id].window(&id).unwrap();
             let overrides = state.x11_override_windows_for(&window.toplevel);
             let sink = state.display_sink.as_mut().unwrap();
-            let mut pixels = sink.take_frame_buffer(0);
+            let mut pixels = sink.take_frame_buffer();
             if let Ok((width, height)) = state.offscreen.render_window_bgra_into(
                 Some(window), window.logical_size, window.scale, &overrides, &mut pixels,
             ) {
@@ -457,13 +403,8 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // 6. Flush outgoing Wayland & WSLg buffers before sleeping
+        // Flush Wayland replies before blocking on clients, the host, or the frame timer.
         let _ = state.display_handle.backend_handle().flush(None);
-        if let Some(ref mut sink) = state.display_sink {
-            sink.flush();
-        }
-
-        // 7. Block until any registered FD or frame timer is ready
         event_loop.dispatch(None, &mut state)?;
     }
 
@@ -490,38 +431,31 @@ fn dispatch_sink_events(state: &mut FocusStageState) -> bool {
                     state.leave_window_pointer(&stage_id, &window_id);
                 }
             }
-            SinkInputEvent::PointerMotion { window_id, x, y, time } => {
+            SinkInputEvent::PointerMotion { window_id, x, y } => {
                 if let Some(stage_id) = human_input_stage(state, &window_id) {
-                    let time = state.resolve_input_time(time);
-                    state.send_window_pointer_motion_at(&stage_id, Some(&window_id), x, y, time);
+                    state.send_window_pointer_motion_at(&stage_id, Some(&window_id), x, y, state.now_ms());
                 }
             }
-            SinkInputEvent::PointerButton { window_id, button, pressed, x, y, time } => {
+            SinkInputEvent::PointerButton { window_id, button, pressed, x, y } => {
                 if let Some(stage_id) = human_input_stage(state, &window_id) {
                     if pressed {
                         state.activate_sink_window(&stage_id, &window_id);
                     }
-                    let time = state.resolve_input_time(time);
-                    state.send_window_button_at(&stage_id, Some(&window_id), x, y, button, pressed, time);
+                    state.send_window_button_at(&stage_id, Some(&window_id), x, y, button, pressed, state.now_ms());
                 }
             }
-            SinkInputEvent::PointerScroll { window_id, dx, dy, position, source, v120, stop, time } => {
+            SinkInputEvent::PointerScroll { window_id, x, y, dx, dy, v120 } => {
                 if let Some(stage_id) = human_input_stage(state, &window_id) {
-                    let pos = state.stages[&stage_id].input.pointer_pos;
-                    let (x, y) = position.unwrap_or((pos.x, pos.y));
-                    let time = state.resolve_input_time(time);
                     state.send_window_scroll_frame(
-                        &stage_id, Some(&window_id), x, y, dx, dy, source, v120, stop, Some(time),
+                        &stage_id, Some(&window_id), x, y, dx, dy,
+                        Some(AxisSource::Wheel), Some(v120), (false, false), None,
                     );
                 }
             }
-            SinkInputEvent::Key { window_id, evdev_keycode, pressed, time } => {
+            SinkInputEvent::Key { window_id, evdev_keycode, pressed } => {
                 if let Some(stage_id) = human_input_stage(state, &window_id) {
-                    state.send_sink_key(&stage_id, &window_id, evdev_keycode, pressed, time);
+                    state.send_sink_key(&stage_id, &window_id, evdev_keycode, pressed);
                 }
-            }
-            SinkInputEvent::Resized { window_id, rect } => {
-                state.resize_window_from_sink(&window_id, rect);
             }
             SinkInputEvent::WindowChanged { window_id, state: host_state } => {
                 state.update_window_from_sink(&window_id, host_state);

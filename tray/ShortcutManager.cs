@@ -239,7 +239,7 @@ internal static class ShortcutManager
 
     public static async Task<(bool Ok, string Message, int Count)> SyncAllAsync(string distro, bool createDesktopForLauncher = true, bool createStartupTray = true)
     {
-        // 1. Sync /usr/share/applications/focusstage-*.desktop for WSLg RAIL WM_CLASS & icon matching
+        // 1. Sync the Linux desktop entries used for app identity and icon lookup.
         var (syncCode, syncOut, syncErr) = await RunWslAsync(distro, true, "/usr/local/bin/focusstage", "--json", "sync-apps");
         if (syncCode != 0)
         {

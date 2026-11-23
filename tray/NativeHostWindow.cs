@@ -137,6 +137,13 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         ReportState();
     }
 
+    internal void Activate()
+    {
+        if (IsIconic(Handle))
+            ShowWindow(Handle, SwRestore);
+        SetForegroundWindow(Handle);
+    }
+
     internal void Minimize()
     {
         if (!CanReportGeometry)

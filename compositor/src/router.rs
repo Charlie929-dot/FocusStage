@@ -137,11 +137,79 @@ impl Dispatch<ZwpTextInputV3, ()> for FocusStageState {
 }
 
 pub struct SettleState {
-    pub initial_seq: u64,
-    pub last_seq: u64,
-    pub quiet_since: Instant,
-    pub started_at: Instant,
-    pub deadline: Instant,
+    initial_seq: u64,
+    last_seq: u64,
+    quiet_since: Instant,
+    started_at: Instant,
+    deadline: Instant,
+}
+
+impl SettleState {
+    pub fn timeout(settle: Option<bool>, settle_ms: Option<u64>) -> Option<Duration> {
+        const DEFAULT_MS: u64 = 600;
+        // The control connection has its own deadline. Leave time for dispatch and reply.
+        const MAX_MS: u64 = 10_000;
+        let ms = settle_ms.unwrap_or(DEFAULT_MS).min(MAX_MS);
+        (settle.unwrap_or(true) && ms > 0).then(|| Duration::from_millis(ms))
+    }
+
+    pub fn new(settle_seq: u64, now: Instant, timeout: Duration) -> Self {
+        Self {
+            initial_seq: settle_seq,
+            last_seq: settle_seq,
+            quiet_since: now,
+            started_at: now,
+            deadline: now + timeout,
+        }
+    }
+
+    fn is_settled(&mut self, settle_seq: u64, now: Instant) -> bool {
+        if settle_seq != self.last_seq {
+            self.last_seq = settle_seq;
+            self.quiet_since = now;
+        }
+        now >= self.deadline
+            || (self.last_seq != self.initial_seq
+                && now.duration_since(self.quiet_since) >= Duration::from_millis(180))
+            || (self.last_seq == self.initial_seq
+                && now.duration_since(self.started_at) >= Duration::from_millis(220))
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::*;
+
+    #[test]
+    fn settled_when_no_frames_arrive() {
+        let start = Instant::now();
+        let mut settle = SettleState::new(5, start, SettleState::timeout(None, None).unwrap());
+        assert!(!settle.is_settled(5, start + Duration::from_millis(219)));
+        assert!(settle.is_settled(5, start + Duration::from_millis(220)));
+    }
+
+    #[test]
+    fn a_new_frame_restarts_the_quiet_period() {
+        let start = Instant::now();
+        let mut settle = SettleState::new(5, start, Duration::from_secs(1));
+        assert!(!settle.is_settled(6, start + Duration::from_millis(50)));
+        assert!(!settle.is_settled(7, start + Duration::from_millis(229)));
+        assert!(!settle.is_settled(7, start + Duration::from_millis(408)));
+        assert!(settle.is_settled(7, start + Duration::from_millis(409)));
+    }
+
+    #[test]
+    fn timeout_bounds_continuous_updates_and_can_be_skipped() {
+        assert_eq!(SettleState::timeout(Some(false), Some(350)), None);
+        assert_eq!(SettleState::timeout(None, Some(0)), None);
+        let timeout = SettleState::timeout(Some(true), Some(350)).unwrap();
+        let start = Instant::now();
+        let mut settle = SettleState::new(5, start, timeout);
+        for elapsed in (50..350).step_by(50) {
+            assert!(!settle.is_settled(5 + elapsed, start + Duration::from_millis(elapsed)));
+        }
+        assert!(settle.is_settled(12, start + Duration::from_millis(350)));
+    }
 }
 
 pub struct PendingActJob {
@@ -150,6 +218,7 @@ pub struct PendingActJob {
     pub remaining: VecDeque<Action>,
     pub executed_steps: usize,
     pub wait_until: Option<Instant>,
+    pub settle_timeout: Option<Duration>,
     pub settling: Option<SettleState>,
     pub reply_tx: std::sync::mpsc::Sender<crate::protocol::ControlResponse>,
 }
@@ -157,31 +226,6 @@ pub struct PendingActJob {
 impl FocusStageState {
     pub fn now_ms(&self) -> u32 {
         self.start_time.elapsed().as_millis() as u32
-    }
-
-    pub fn resolve_input_time(&mut self, sink_time: u32) -> u32 {
-        let now = self.now_ms();
-        if sink_time == 0 {
-            return now;
-        }
-        match self.wslg_time_anchor {
-            Some((base_sink, base_local)) => {
-                let delta = sink_time.wrapping_sub(base_sink) as i32;
-                let mapped_i64 = (base_local as i64).wrapping_add(delta as i64);
-                let mapped = if mapped_i64 >= 0 { mapped_i64 as u32 } else { 0 };
-                let drift = (mapped.wrapping_sub(now) as i32).abs();
-                if drift > 5000 {
-                    self.wslg_time_anchor = Some((sink_time, now));
-                    now
-                } else {
-                    mapped
-                }
-            }
-            None => {
-                self.wslg_time_anchor = Some((sink_time, now));
-                now
-            }
-        }
     }
 
     fn set_keyboard_target(
@@ -1198,21 +1242,12 @@ impl FocusStageState {
             }
 
             if let Some(ref mut st) = job.settling {
-                let cur_seq = self.stages.get(&job.stage_id).map(|s| s.frame_seq).unwrap_or(0);
-                if cur_seq != st.last_seq {
-                    st.last_seq = cur_seq;
-                    st.quiet_since = now;
-                }
-                let settled = now >= st.deadline
-                    || (st.last_seq != st.initial_seq
-                        && now.duration_since(st.quiet_since) >= Duration::from_millis(180))
-                    || (st.last_seq == st.initial_seq
-                        && now.duration_since(st.started_at) >= Duration::from_millis(220));
-                if settled {
+                let stage = self.stages.get(&job.stage_id);
+                if st.is_settled(stage.map_or(0, |s| s.settle_seq), now) {
                     let _ = job.reply_tx.send(crate::protocol::ControlResponse::ActResult {
                         act_status: ActStatus::Ok,
                         executed_steps: job.executed_steps,
-                        frame_seq: cur_seq,
+                        frame_seq: stage.map_or(0, |s| s.frame_seq),
                         message: None,
                     });
                 } else {
@@ -1252,16 +1287,12 @@ impl FocusStageState {
 
             if paused_for_wait {
                 still_pending.push(job);
-            } else if failed_msg.is_none() && job.executed_steps > 0 {
-                let cur_seq = self.stages.get(&job.stage_id).map(|s| s.frame_seq).unwrap_or(0);
-                let t = Instant::now();
-                job.settling = Some(SettleState {
-                    initial_seq: cur_seq,
-                    last_seq: cur_seq,
-                    quiet_since: t,
-                    started_at: t,
-                    deadline: t + Duration::from_millis(1200),
-                });
+                continue;
+            }
+
+            if let Some(timeout) = job.settle_timeout.filter(|_| failed_msg.is_none()) {
+                let settle_seq = self.stages.get(&job.stage_id).map_or(0, |s| s.settle_seq);
+                job.settling = Some(SettleState::new(settle_seq, Instant::now(), timeout));
                 still_pending.push(job);
             } else {
                 let frame_seq = self.stages.get(&job.stage_id).map(|s| s.frame_seq).unwrap_or(0);

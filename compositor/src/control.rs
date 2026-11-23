@@ -21,6 +21,18 @@ use crate::state::FocusStageState;
 pub struct ControlServerMessage {
     pub request: ControlRequest,
     pub reply_tx: mpsc::Sender<ControlResponse>,
+    pub peer_pid: Option<u32>,
+}
+
+pub fn local_peer_pid(stream: &UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(), &mut len)
+    };
+    (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
 }
 
 pub fn spawn_control_server(
@@ -58,6 +70,7 @@ pub fn spawn_control_server(
 }
 
 fn handle_client(stream: UnixStream, tx: CalloopSender<ControlServerMessage>) {
+    let peer_pid = local_peer_pid(&stream);
     let Ok(write_stream) = stream.try_clone() else {
         return;
     };
@@ -75,7 +88,7 @@ fn handle_client(stream: UnixStream, tx: CalloopSender<ControlServerMessage>) {
         let resp = match serde_json::from_str::<ControlRequest>(trimmed) {
             Ok(req) => {
                 let (reply_tx, reply_rx) = mpsc::channel();
-                if tx.send(ControlServerMessage { request: req, reply_tx }).is_err() {
+                if tx.send(ControlServerMessage { request: req, reply_tx, peer_pid }).is_err() {
                     ControlResponse::Error {
                         code: "daemon_down".to_string(),
                         message: "Compositor loop shut down".to_string(),
@@ -171,7 +184,7 @@ impl FocusStageState {
                 let _ = reply_tx.send(ControlResponse::Pong {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     wayland_display: self.wayland_socket_name.clone(),
-                    wslg_active: self.display_sink.is_some(),
+                    desktop_active: self.display_sink.is_some(),
                 });
             }
             ControlRequest::List => {
@@ -209,6 +222,13 @@ impl FocusStageState {
                 };
                 let _ = reply_tx.send(resp);
             }
+            ControlRequest::OpenUri { uri, handler } => {
+                let response = self.open_uri(&uri, handler.as_deref(), msg.peer_pid).unwrap_or_else(|e| ControlResponse::Error {
+                    code: "open_failed".into(),
+                    message: e.to_string(),
+                });
+                let _ = reply_tx.send(response);
+            }
             ControlRequest::Close { stage_id } => {
                 let resp = match self.close_stage(&stage_id) {
                     Ok(()) => ControlResponse::Ok,
@@ -245,8 +265,11 @@ impl FocusStageState {
                 lease,
                 actions,
                 based_on,
+                settle,
+                settle_ms,
             } => {
-                self.handle_act(lease, actions, based_on, reply_tx);
+                let settle_timeout = SettleState::timeout(settle, settle_ms);
+                self.handle_act(lease, actions, based_on, settle_timeout, reply_tx);
             }
             ControlRequest::Release {
                 lease,
@@ -488,6 +511,7 @@ impl FocusStageState {
         lease_id: String,
         actions: Vec<crate::protocol::Action>,
         based_on: Option<u64>,
+        settle_timeout: Option<Duration>,
         reply_tx: mpsc::Sender<ControlResponse>,
     ) {
         let Some(stage_id) = self.find_stage_by_lease(&lease_id) else {
@@ -540,6 +564,7 @@ impl FocusStageState {
                         remaining,
                         executed_steps,
                         wait_until: Some(Instant::now() + dur),
+                        settle_timeout,
                         settling: None,
                         reply_tx,
                     });
@@ -561,28 +586,23 @@ impl FocusStageState {
             }
         }
 
-        if executed_steps > 0 {
-            let cur_seq = self.stages.get(&stage_id).map(|s| s.frame_seq).unwrap_or(0);
-            let now = Instant::now();
+        let stage = self.stages.get(&stage_id);
+        let frame_seq = stage.map_or(0, |s| s.frame_seq);
+        if let Some(timeout) = settle_timeout.filter(|_| executed_steps > 0) {
+            let settle_seq = stage.map_or(0, |s| s.settle_seq);
             self.pending_act_jobs.push(PendingActJob {
                 stage_id,
                 lease_id,
                 remaining,
                 executed_steps,
                 wait_until: None,
-                settling: Some(SettleState {
-                    initial_seq: cur_seq,
-                    last_seq: cur_seq,
-                    quiet_since: now,
-                    started_at: now,
-                    deadline: now + Duration::from_millis(1200),
-                }),
+                settle_timeout,
+                settling: Some(SettleState::new(settle_seq, Instant::now(), timeout)),
                 reply_tx,
             });
             return;
         }
 
-        let frame_seq = self.stages.get(&stage_id).map(|s| s.frame_seq).unwrap_or(0);
         let _ = reply_tx.send(ControlResponse::ActResult {
             act_status: ActStatus::Ok,
             executed_steps,

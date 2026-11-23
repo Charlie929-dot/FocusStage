@@ -1,8 +1,4 @@
 pub mod native;
-pub mod wslg;
-pub mod wslg_wayland;
-
-use smithay::backend::input::AxisSource;
 
 use crate::protocol::SavedRect;
 
@@ -14,7 +10,6 @@ pub enum SinkInputEvent {
         window_id: String,
         x: f64,
         y: f64,
-        time: u32,
     },
     PointerButton {
         window_id: String,
@@ -22,27 +17,19 @@ pub enum SinkInputEvent {
         pressed: bool,
         x: f64,
         y: f64,
-        time: u32,
     },
     PointerScroll {
         window_id: String,
+        x: f64,
+        y: f64,
         dx: f64,
         dy: f64,
-        position: Option<(f64, f64)>,
-        source: Option<AxisSource>,
-        v120: Option<(i32, i32)>,
-        stop: (bool, bool),
-        time: u32,
+        v120: (i32, i32),
     },
     Key {
         window_id: String,
         evdev_keycode: u32,
         pressed: bool,
-        time: u32,
-    },
-    Resized {
-        window_id: String,
-        rect: SavedRect,
     },
     WindowChanged {
         window_id: String,
@@ -87,15 +74,12 @@ pub struct WindowState {
 
 pub trait DisplaySink {
     fn show(&mut self, window: WindowInfo<'_>);
-    fn hide(&mut self, window_id: &str) -> Option<SavedRect>;
+    fn hide(&mut self, window_id: &str);
     fn destroy(&mut self, window_id: &str);
-    fn take_frame_buffer(&mut self, min_capacity: usize) -> Vec<u8> {
-        Vec::with_capacity(min_capacity)
+    fn take_frame_buffer(&mut self) -> Vec<u8> {
+        Vec::new()
     }
-    fn present(&mut self, window_id: &str, width: u32, height: u32, bgra: &[u8]);
-    fn present_owned(&mut self, window_id: &str, width: u32, height: u32, bgra: Vec<u8>) {
-        self.present(window_id, width, height, &bgra);
-    }
+    fn present_owned(&mut self, window_id: &str, width: u32, height: u32, bgra: Vec<u8>);
     fn set_title(&mut self, window_id: &str, title: &str);
     fn set_parent(&mut self, _window_id: &str, _parent_window_id: Option<&str>) {}
     fn begin_move(&mut self, _window_id: &str) {}
@@ -103,10 +87,11 @@ pub trait DisplaySink {
     fn minimize(&mut self, _window_id: &str) {}
     fn set_maximized(&mut self, _window_id: &str, _maximized: bool) {}
     fn set_host_clipboard(&mut self, _text: &str) {}
+    fn activate(&mut self, _window_id: &str) {}
+    fn open_web_url(&mut self, _url: &str) -> bool { false }
     fn event_fd(&self) -> Option<std::os::fd::OwnedFd> {
         None
     }
-    fn flush(&mut self) {}
     fn is_frame_pending(&self, _window_id: &str) -> bool {
         false
     }

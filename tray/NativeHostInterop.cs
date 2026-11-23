@@ -250,6 +250,7 @@ internal static class NativeHostInterop
     [DllImport("user32.dll")] internal static extern bool IsIconic(nint hwnd);
     [DllImport("user32.dll")] internal static extern bool IsWindowVisible(nint hwnd);
     [DllImport("user32.dll")] internal static extern bool ShowWindow(nint hwnd, int command);
+    [DllImport("user32.dll")] internal static extern bool SetForegroundWindow(nint hwnd);
     [DllImport("user32.dll", EntryPoint = "SetWindowTextW", CharSet = CharSet.Unicode, ExactSpelling = true)]
     internal static extern bool SetWindowText(nint hwnd, string title);
     [DllImport("user32.dll")] internal static extern nint GetWindow(nint hwnd, uint command);

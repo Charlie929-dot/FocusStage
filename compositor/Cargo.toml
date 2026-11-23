@@ -17,11 +17,7 @@ smithay = { version = "0.7.0", default-features = false, features = [
     "xwayland",
     "x11rb_event_source",
 ] }
-wayland-protocols = { version = "0.32", features = ["server", "client", "staging", "unstable"] }
 wayland-server = "0.31"
-wayland-client = "0.31"
-x11rb = { version = "0.14", features = ["allow-unsafe-code", "xfixes"] }
-xkbcommon = { version = "0.8", features = ["wayland"] }
 drm-fourcc = "2.2"
 pixman = { version = "0.2.1", default-features = false, features = ["drm-fourcc", "sync"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -31,8 +27,12 @@ base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-thiserror = "2.0"
 anyhow = "1.0"
+tempfile = "3"
 libc = "0.2"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }

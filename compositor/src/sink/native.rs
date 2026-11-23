@@ -12,7 +12,6 @@ use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use smithay::backend::input::AxisSource;
 use tracing::warn;
 
 use super::{DisplaySink, SinkInputEvent, WindowInfo, WindowState};
@@ -61,6 +60,12 @@ enum HostCommand<'a> {
     },
     Clipboard {
         text: &'a str,
+    },
+    Activate {
+        window_id: &'a str,
+    },
+    OpenUrl {
+        url: &'a str,
     },
     Frame {
         window_id: &'a str,
@@ -139,7 +144,6 @@ impl HostEvent {
                 window_id,
                 x,
                 y,
-                time: 0,
             },
             Self::PointerLeave { window_id } => Input::PointerLeave { window_id },
             Self::PointerButton {
@@ -154,7 +158,6 @@ impl HostEvent {
                 y,
                 button,
                 pressed,
-                time: 0,
             },
             Self::PointerScroll {
                 window_id,
@@ -165,13 +168,11 @@ impl HostEvent {
                 v120,
             } => Input::PointerScroll {
                 window_id,
+                x,
+                y,
                 dx,
                 dy,
-                position: Some((x, y)),
-                source: Some(AxisSource::Wheel),
-                v120: Some(v120),
-                stop: (false, false),
-                time: 0,
+                v120,
             },
             Self::Key {
                 window_id,
@@ -181,7 +182,6 @@ impl HostEvent {
                 window_id,
                 evdev_keycode,
                 pressed,
-                time: 0,
             },
             Self::CloseRequested { window_id } => Input::CloseRequested { window_id },
             Self::HostClipboardChanged { text } => Input::HostClipboardChanged { text },
@@ -359,9 +359,8 @@ impl DisplaySink for NativeSink {
         });
     }
 
-    fn hide(&mut self, window_id: &str) -> Option<SavedRect> {
+    fn hide(&mut self, window_id: &str) {
         self.command(HostCommand::Hide { window_id });
-        None // The compositor already receives current placement through WindowChanged.
     }
 
     fn destroy(&mut self, window_id: &str) {
@@ -369,15 +368,10 @@ impl DisplaySink for NativeSink {
         self.command(HostCommand::Destroy { window_id });
     }
 
-    fn take_frame_buffer(&mut self, min_capacity: usize) -> Vec<u8> {
+    fn take_frame_buffer(&mut self) -> Vec<u8> {
         let mut pixels = self.recycled.try_recv().unwrap_or_default();
         pixels.clear();
-        pixels.reserve(min_capacity);
         pixels
-    }
-
-    fn present(&mut self, window_id: &str, width: u32, height: u32, bgra: &[u8]) {
-        self.present_owned(window_id, width, height, bgra.to_vec());
     }
 
     fn present_owned(&mut self, window_id: &str, width: u32, height: u32, bgra: Vec<u8>) {
@@ -430,6 +424,14 @@ impl DisplaySink for NativeSink {
 
     fn set_host_clipboard(&mut self, text: &str) {
         self.command(HostCommand::Clipboard { text });
+    }
+
+    fn activate(&mut self, window_id: &str) {
+        self.command(HostCommand::Activate { window_id });
+    }
+
+    fn open_web_url(&mut self, url: &str) -> bool {
+        crate::xdg::valid_web_url(url) && self.send(HostCommand::OpenUrl { url }, Vec::new())
     }
 
     fn event_fd(&self) -> Option<OwnedFd> {

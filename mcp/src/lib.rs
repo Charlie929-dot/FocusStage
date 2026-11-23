@@ -293,18 +293,17 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
             }
         }
         "stage_observe" => {
-            let Some(lease) = args.get("lease").and_then(|v| v.as_str()).map(String::from) else {
-                return text_err("Missing 'lease'");
-            };
+            let lease = args.get("lease").and_then(Value::as_str);
+            let stage_id = args.get("stage_id").and_then(Value::as_str);
             let image = args.get("image").and_then(|v| v.as_bool()).unwrap_or(true);
-            let som_enabled = args.get("som").and_then(|v| v.as_bool()).unwrap_or(true);
+            let som_enabled = args.get("som").and_then(|v| v.as_bool()).unwrap_or(false);
             let a11y = args.get("a11y").and_then(|v| v.as_bool()).unwrap_or(false);
             let include_marks = args
                 .get("include_marks")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            observe_with_som(client, state, &lease, image, som_enabled, a11y, include_marks)
+            observe_with_som(client, state, lease, stage_id, image, som_enabled, a11y, include_marks)
         }
         "stage_act" => {
             let lease = match args.get("lease").and_then(|v| v.as_str()) {
@@ -325,12 +324,17 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
                 .get("observe")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
-            let som_enabled = args.get("som").and_then(|v| v.as_bool()).unwrap_or(true);
+            let som_enabled = args.get("som").and_then(|v| v.as_bool()).unwrap_or(false);
+            let settle = args.get("settle").and_then(Value::as_bool);
+            let settle = settle.or((!follow_observe).then_some(false));
+            let settle_ms = args.get("settle_ms").and_then(Value::as_u64);
 
             match client.call(&ControlRequest::Act {
                 lease: lease.clone(),
                 actions,
                 based_on,
+                settle,
+                settle_ms,
             }) {
                 Ok(ControlResponse::ActResult {
                     act_status,
@@ -348,7 +352,8 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
                         let obs = observe_with_som(
                             client,
                             state,
-                            &lease,
+                            Some(&lease),
+                            None,
                             true,
                             som_enabled,
                             false,
@@ -442,15 +447,19 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
 fn observe_with_som(
     client: &ControlClient,
     state: &McpState,
-    lease: &str,
+    lease: Option<&str>,
+    stage_id: Option<&str>,
     image: bool,
     som_enabled: bool,
     a11y: bool,
     include_marks: bool,
 ) -> Value {
+    if lease.is_none() && stage_id.is_none() {
+        return text_err("Either 'lease' or 'stage_id' is required");
+    }
     match client.call(&ControlRequest::Observe {
-        lease: Some(lease.to_string()),
-        stage_id: None,
+        lease: lease.map(String::from),
+        stage_id: stage_id.filter(|_| lease.is_none()).map(String::from),
         image,
         a11y,
     }) {
@@ -495,7 +504,7 @@ fn observe_with_som(
                                     marks_payload = Some(Value::Array(list));
                                 }
                                 state.store_marks(
-                                    Some(lease),
+                                    lease,
                                     CachedStageMarks {
                                         stage_id: stage_id.clone(),
                                         frame_seq,
@@ -961,7 +970,7 @@ fn mcp_tools_schema() -> Vec<Value> {
                     "width": { "type": "integer" },
                     "height": { "type": "integer" },
                     "show_on_desktop": { "type": "boolean" },
-                    "wm_class": { "type": "string", "description": "Optional WM_CLASS override for WSLg window grouping/icon matching" }
+                    "wm_class": { "type": "string", "description": "Optional application identity override for window grouping and icon lookup" }
                 },
                 "required": ["app"]
             }
@@ -994,29 +1003,32 @@ fn mcp_tools_schema() -> Vec<Value> {
         }),
         json!({
             "name": "stage_observe",
-            "description": "Capture an on-demand screenshot of the leased Stage with MarkScreen pure-vision Set-of-Mark (SoM) bounding boxes and 2-letter badges (AA, AC, ..., case-insensitive) overlaid by default. Use the badge codes directly as 'target' in stage_act.",
+            "description": "Observe a Stage by lease or by stage_id. Observing by stage_id is read-only and leaves input ownership and visibility unchanged. Screenshots are unmarked by default. Set som to true to generate MarkScreen Set-of-Mark badges; use marks from a leased observation as targets in stage_act.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "lease": { "type": "string" },
+                    "lease": { "type": "string", "description": "Lease token. Takes precedence when both identifiers are supplied." },
+                    "stage_id": { "type": "string", "description": "Stage ID for observation without a lease." },
                     "image": { "type": "boolean", "default": true },
-                    "som": { "type": "boolean", "default": true, "description": "Annotate screenshot with MarkScreen pure-vision SoM boxes and 2-letter badges (default true)" },
+                    "som": { "type": "boolean", "default": false, "description": "Annotate the screenshot with MarkScreen SoM boxes and 2-letter badges." },
                     "a11y": { "type": "boolean", "default": false },
-                    "include_marks": { "type": "boolean", "default": false, "description": "Include resolved mark coordinates map in text output (optional; omitted by default to save tokens)" }
+                    "include_marks": { "type": "boolean", "default": false, "description": "Include resolved mark coordinates in text output when som and image are enabled." }
                 },
-                "required": ["lease"]
+                "anyOf": [{ "required": ["lease"] }, { "required": ["stage_id"] }]
             }
         }),
         json!({
             "name": "stage_act",
-            "description": "Execute a sequence of input actions on a leased Stage, wait for UI settle, and automatically return a fresh SoM-annotated screenshot by default (set observe=false to skip). Targets accept MarkScreen 2-letter mark codes from stage_observe (e.g. 'AE', case-insensitive, or 'P3'), [x, y] Stage logical coordinates, or explicit x/y fields. Supports click (with clicks=2/button), double_click, move/hover, drag (from/to or by), scroll (direction up/down/left/right or dx/dy), key (single key or chord like 'Ctrl+A' or array), type_text/type (with optional target click, mode='cover', send=true), and wait/sleep.",
+            "description": "Execute input actions on a leased Stage. By default, wait for the UI to settle and return a fresh unmarked screenshot. Targets accept [x, y] Stage logical coordinates, explicit x/y fields, or mark codes (e.g. 'AE' or 'P3') from a screenshot taken with som enabled on the same lease. Supports click (with clicks=2/button), double_click, move/hover, drag (from/to or by), scroll (direction up/down/left/right or dx/dy), key (single key or chord like 'Ctrl+A' or array), type_text/type (with optional target click, mode='cover', send=true), and wait/sleep.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "lease": { "type": "string" },
                     "based_on": { "type": "integer", "description": "Optional frame_seq for stale-frame guard" },
-                    "observe": { "type": "boolean", "default": true, "description": "Wait for UI settle and return a fresh SoM-annotated screenshot after executing actions (default true; pass false to skip)" },
-                    "som": { "type": "boolean", "default": true },
+                    "observe": { "type": "boolean", "default": true, "description": "Return a fresh screenshot after executing actions." },
+                    "settle": { "type": "boolean", "description": "Wait for the UI to settle after executing actions. Defaults to the value of observe." },
+                    "settle_ms": { "type": "integer", "minimum": 0, "maximum": 10000, "description": "Maximum UI settling time in milliseconds (default 600). Zero skips settling." },
+                    "som": { "type": "boolean", "default": false, "description": "Annotate the follow-up screenshot with MarkScreen SoM boxes and badges." },
                     "actions": {
                         "type": "array",
                         "items": {
@@ -1122,6 +1134,91 @@ mod tests {
         assert!(names.contains(&"stage_act"));
         assert!(names.contains(&"stage_release"));
         assert!(names.contains(&"stage_close"));
+        for name in ["stage_observe", "stage_act"] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            assert_eq!(tool["inputSchema"]["properties"]["som"]["default"], false);
+        }
+    }
+
+    #[test]
+    fn observe_schema_accepts_either_identifier() {
+        let schema = &mcp_tools_schema().into_iter()
+            .find(|tool| tool["name"] == "stage_observe").unwrap()["inputSchema"];
+        assert_eq!(schema["properties"]["lease"]["type"], "string");
+        assert_eq!(schema["properties"]["stage_id"]["type"], "string");
+        assert_eq!(schema["anyOf"], json!([
+            { "required": ["lease"] }, { "required": ["stage_id"] }
+        ]));
+    }
+
+    #[test]
+    fn observe_rejects_missing_identifiers_before_using_control_socket() {
+        let client = ControlClient::new("/tmp/nonexistent-focusstage.sock");
+        let result = call_tool(&client, &McpState::default(), "stage_observe", json!({}));
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"][0]["text"], "Either 'lease' or 'stage_id' is required");
+    }
+
+    #[test]
+    fn observe_by_stage_sends_no_lease_and_caches_only_by_stage() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut png_bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png_bytes, 64, 64);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.write_header().unwrap().write_image_data(&[255; 64 * 64 * 4]).unwrap();
+        }
+        let png_base64 = base64::engine::general_purpose::STANDARD.encode(png_bytes);
+        let raw_png = png_base64.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                assert!(matches!(
+                    serde_json::from_str(&request).unwrap(),
+                    ControlRequest::Observe { lease: None, stage_id: Some(id), image: true, a11y: true }
+                        if id == "stage-1"
+                ));
+                let response = ControlResponse::Observed {
+                    stage_id: "stage-1".into(),
+                    frame_seq: 8,
+                    width: 64,
+                    height: 64,
+                    scale: 1.0,
+                    png_base64: Some(png_base64.clone()),
+                    a11y_tree: Some(Vec::new()),
+                };
+                writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            }
+        });
+
+        let state = McpState::default();
+        state.store_marks(Some("lease-1"), sample_cache());
+        let client = ControlClient::new(socket);
+        let result = call_tool(&client, &state, "stage_observe", json!({
+            "stage_id": "stage-1", "a11y": true
+        }));
+        assert_eq!(result["isError"], false, "{result}");
+        let meta: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(meta["som"], false);
+        assert_eq!(result["content"][1]["data"], raw_png);
+        assert_eq!(state.by_stage.lock().unwrap()["stage-1"].frame_seq, 7);
+
+        let result = call_tool(&client, &state, "stage_observe", json!({
+            "stage_id": "stage-1", "a11y": true, "som": true
+        }));
+        assert_eq!(result["isError"], false, "{result}");
+        let meta: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(meta["som"], true);
+        assert_eq!(state.by_stage.lock().unwrap()["stage-1"].frame_seq, 8);
+        assert_eq!(state.get_for_lease("lease-1").unwrap().frame_seq, 7);
+        assert_eq!(state.by_lease.lock().unwrap().len(), 1);
+        server.join().unwrap();
     }
 
     #[test]
