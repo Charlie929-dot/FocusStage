@@ -37,7 +37,8 @@ internal static class NativeHost
         string Type, string WindowId = "", string StageId = "", string Title = "",
         WindowRect Rect = default, double Scale = 1, string? ParentWindowId = null,
         int Direction = -1, bool Maximized = false, string Text = "",
-        int Width = 0, int Height = 0, ulong Seq = 0, string WmClass = "", string Url = "");
+        int Width = 0, int Height = 0, ulong Seq = 0, string WmClass = "", string Url = "",
+        string? IconPng = null);
 
     private static void OpenWebUrl(string url)
     {
@@ -184,7 +185,8 @@ internal static class NativeHost
                     bool added = window is null;
                     if (window is null)
                     {
-                        window = new NativeHostWindow(id, _renderer, Emit, command.Rect, command.Scale, command.WmClass);
+                        window = new NativeHostWindow(id, _renderer, Emit, command.Rect, command.Scale,
+                            command.WmClass, command.IconPng);
                         _windows.Add(id, window);
                     }
                     window.SetStage(command.StageId);

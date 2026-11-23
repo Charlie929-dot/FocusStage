@@ -169,6 +169,29 @@ pub fn valid_id(id: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_' | b'.'))
 }
 
+pub fn launcher_application_dirs() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.as_ref().map(|p| p.join(".local/share")));
+    let mut dirs = application_dirs(data_home.as_deref().unwrap_or(Path::new("/nonexistent")));
+    if let Some(home) = home {
+        dirs.extend([home.join("Desktop"), home.join("Downloads")]);
+    }
+    dirs
+}
+
+pub(crate) fn app_by_id(dirs: &[PathBuf], id: &str) -> Option<DesktopEntry> {
+    let id = id.strip_prefix(WRAPPER_PREFIX).unwrap_or(id);
+    if !valid_id(id) {
+        return None;
+    }
+    let filename = format!("{id}.desktop");
+    let text = dirs.iter().find_map(|dir| std::fs::read_to_string(dir.join(&filename)).ok())?;
+    parse(&text)
+}
+
 pub fn application_dirs(data_home: &Path) -> Vec<PathBuf> {
     let dirs = std::env::var_os("XDG_DATA_DIRS")
         .filter(|v| !v.is_empty())

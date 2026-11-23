@@ -215,12 +215,27 @@ internal static class ShortcutManager
 
     public static void SaveBitmapAsIco(Bitmap bmp, string icoPath)
     {
+        using var output = File.Create(icoPath);
+        WriteBitmapAsIco(bmp, output);
+    }
+
+    internal static Icon IconFromPng(string image)
+    {
+        using var input = new MemoryStream(Convert.FromBase64String(image));
+        using var bitmap = new Bitmap(input);
+        using var ico = new MemoryStream();
+        WriteBitmapAsIco(bitmap, ico);
+        ico.Position = 0;
+        return new Icon(ico);
+    }
+
+    private static void WriteBitmapAsIco(Bitmap bmp, Stream output)
+    {
         using var pngStream = new MemoryStream();
         bmp.Save(pngStream, ImageFormat.Png);
         var pngBytes = pngStream.ToArray();
 
-        using var fs = File.Create(icoPath);
-        using var bw = new BinaryWriter(fs);
+        using var bw = new BinaryWriter(output, System.Text.Encoding.UTF8, leaveOpen: true);
         // ICONDIR (6 bytes)
         bw.Write((ushort)0);
         bw.Write((ushort)1); // 1 = ICO

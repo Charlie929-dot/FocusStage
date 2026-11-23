@@ -509,6 +509,7 @@ dependencies = [
  "clap",
  "drm-fourcc",
  "libc",
+ "libloading",
  "pixman",
  "png",
  "serde",

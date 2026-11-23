@@ -39,7 +39,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         int PixelWidth, int PixelHeight, double Scale, bool Activated, bool Maximized, bool Resizing, int Tiled);
 
     internal NativeHostWindow(string id, NativeHostRenderer.Factory renderer, Action<object> emit,
-        NativeHost.WindowRect initialRect, double initialScale, string wmClass)
+        NativeHost.WindowRect initialRect, double initialScale, string wmClass, string? iconPng)
     {
         _id = id;
         _emit = emit;
@@ -55,7 +55,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         });
         // The Linux client handles input composition for this window.
         ImmAssociateContext(Handle, 0);
-        _appIcon = LoadAppIcon(wmClass);
+        _appIcon = LoadAppIcon(wmClass, iconPng);
         nint icon = (_appIcon ?? SystemIcons.Application).Handle;
         SendMessage(Handle, WmSetIcon, 0, icon); // ICON_SMALL
         SendMessage(Handle, WmSetIcon, 1, icon); // ICON_BIG
@@ -63,8 +63,17 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         DragAcceptFiles(Handle, true);
     }
 
-    private static Icon? LoadAppIcon(string wmClass)
+    private static Icon? LoadAppIcon(string wmClass, string? iconPng)
     {
+        if (!string.IsNullOrEmpty(iconPng))
+        {
+            try { return ShortcutManager.IconFromPng(iconPng); }
+            catch (Exception ex) when (ex is FormatException or ArgumentException or IOException)
+            {
+                Console.Error.WriteLine($"FocusStage window host: unable to decode desktop icon: {ex.Message}");
+            }
+        }
+
         string path = ShortcutManager.AppIconPath(wmClass);
         try
         {

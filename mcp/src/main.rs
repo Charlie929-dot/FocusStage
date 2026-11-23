@@ -4,6 +4,7 @@ use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use focusstage_compositor::control::ControlClient;
 use focusstage_compositor::desktop::{self, DesktopEntry};
+use focusstage_compositor::icons::DesktopIcons;
 use focusstage_compositor::xdg::{self, SettingsAction};
 use focusstage_compositor::protocol::{
     default_socket_path, Action, ControlRequest, ControlResponse, DisplayState, StageKind,
@@ -535,7 +536,6 @@ struct DiscoveredDesktopApp {
     source: &'static str,
     file_path: Option<String>,
     parsed: DesktopEntry,
-    icon_path: Option<String>,
 }
 
 fn detect_windows_user_dir_for_apps() -> Option<PathBuf> {
@@ -555,71 +555,12 @@ fn detect_windows_user_dir_for_apps() -> Option<PathBuf> {
     None
 }
 
-fn resolve_icon_path(icon: &str) -> Option<String> {
-    let icon = icon.trim();
-    if icon.is_empty() {
-        return None;
-    }
-    let p = std::path::Path::new(icon);
-    if p.is_absolute() && p.is_file() {
-        return Some(icon.to_string());
-    }
-
-    let exts = ["png", "ico", "bmp", "xpm", "svg"];
-    let mut candidate_dirs = vec![
-        PathBuf::from("/usr/share/icons/hicolor/512x512/apps"),
-        PathBuf::from("/usr/share/icons/hicolor/256x256/apps"),
-        PathBuf::from("/usr/share/icons/hicolor/128x128/apps"),
-        PathBuf::from("/usr/share/icons/hicolor/64x64/apps"),
-        PathBuf::from("/usr/share/icons/hicolor/48x48/apps"),
-        PathBuf::from("/usr/share/icons/hicolor/32x32/apps"),
-        PathBuf::from("/usr/share/icons/Yaru/256x256/apps"),
-        PathBuf::from("/usr/share/icons/Yaru/128x128/apps"),
-        PathBuf::from("/usr/share/icons/Yaru/48x48/apps"),
-        PathBuf::from("/usr/share/pixmaps"),
-        PathBuf::from("/usr/local/share/pixmaps"),
-        PathBuf::from("/var/lib/snapd/desktop/icons"),
-        PathBuf::from("/var/lib/flatpak/exports/share/icons/hicolor/256x256/apps"),
-        PathBuf::from("/var/lib/flatpak/exports/share/icons/hicolor/128x128/apps"),
-        PathBuf::from("/var/lib/flatpak/exports/share/icons/hicolor/48x48/apps"),
-        PathBuf::from("/usr/share/icons/hicolor/scalable/apps"),
-        PathBuf::from("/usr/share/icons/Yaru/scalable/apps"),
-    ];
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            candidate_dirs.push(PathBuf::from(&home).join(".local/share/icons/hicolor/256x256/apps"));
-            candidate_dirs.push(PathBuf::from(&home).join(".local/share/icons/hicolor/128x128/apps"));
-            candidate_dirs.push(PathBuf::from(&home).join(".local/share/icons/hicolor/48x48/apps"));
-            candidate_dirs.push(PathBuf::from(&home).join(".local/share/icons"));
-        }
-    }
-
-    for ext in exts {
-        for dir in &candidate_dirs {
-            let candidate = dir.join(format!("{icon}.{ext}"));
-            if candidate.is_file() {
-                return Some(candidate.display().to_string());
-            }
-        }
-    }
-    None
-}
-
 fn discover_desktop_apps() -> Vec<DiscoveredDesktopApp> {
-    let mut scan_dirs = vec![
-        PathBuf::from("/usr/share/applications"),
-        PathBuf::from("/usr/local/share/applications"),
-        PathBuf::from("/var/lib/snapd/desktop/applications"),
-        PathBuf::from("/var/lib/flatpak/exports/share/applications"),
-    ];
+    let scan_dirs = desktop::launcher_application_dirs();
     let mut download_dirs = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
             let h = PathBuf::from(&home);
-            scan_dirs.push(h.join(".local/share/applications"));
-            scan_dirs.push(h.join(".local/share/flatpak/exports/share/applications"));
-            scan_dirs.push(h.join("Desktop"));
-            scan_dirs.push(h.join("Downloads"));
             download_dirs.push(h.join("Downloads"));
         }
     }
@@ -630,47 +571,19 @@ fn discover_desktop_apps() -> Vec<DiscoveredDesktopApp> {
     let mut apps = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
 
-    for dir in &scan_dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
+    for (stem, (path, parsed)) in desktop::discover(&scan_dirs) {
+        seen_ids.insert(stem.clone());
+        if parsed.no_display {
             continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if stem.starts_with("focusstage-") || !seen_ids.insert(stem.to_string()) {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Some(parsed) = desktop::parse(&text) else {
-                continue;
-            };
-            if parsed.no_display {
-                continue;
-            }
-            // Windows opens these paths via the WSL share, which cannot follow Snap's `current` link.
-            let icon_path = parsed
-                .icon
-                .as_deref()
-                .and_then(resolve_icon_path)
-                .and_then(|path| std::fs::canonicalize(path).ok())
-                .map(|path| path.display().to_string());
-            let wrapper_id = format!("focusstage-{stem}");
-            apps.push(DiscoveredDesktopApp {
-                stem: stem.to_string(),
-                wrapper_id,
-                source: "desktop",
-                file_path: Some(path.display().to_string()),
-                parsed,
-                icon_path,
-            });
         }
+        let wrapper_id = format!("focusstage-{stem}");
+        apps.push(DiscoveredDesktopApp {
+            stem,
+            wrapper_id,
+            source: "desktop",
+            file_path: Some(path.display().to_string()),
+            parsed,
+        });
     }
 
     // Discover browser-downloaded .AppImage and .deb files
@@ -725,7 +638,6 @@ fn discover_desktop_apps() -> Vec<DiscoveredDesktopApp> {
                     wm_class: None,
                     no_display: false,
                 },
-                icon_path: None,
             });
         }
     }
@@ -735,10 +647,14 @@ fn discover_desktop_apps() -> Vec<DiscoveredDesktopApp> {
 }
 
 fn run_list_apps(json_mode: bool) -> anyhow::Result<()> {
+    let icons = DesktopIcons::new(&desktop::launcher_application_dirs());
     let apps: Vec<_> = discover_desktop_apps()
         .into_iter()
         .map(|app| {
             let args = app.parsed.launch_args();
+            let icon_path = app.parsed.icon.as_deref()
+                .and_then(|name| icons.resolve(name))
+                .and_then(|path| icons.windows_path(path));
             serde_json::json!({
                 "id": app.wrapper_id,
                 "stem": app.stem,
@@ -751,7 +667,7 @@ fn run_list_apps(json_mode: bool) -> anyhow::Result<()> {
                 "args": args,
                 "wm_class": app.wrapper_id,
                 "icon": app.parsed.icon,
-                "icon_path": app.icon_path,
+                "icon_path": icon_path,
                 "categories": app.parsed.categories,
             })
         })

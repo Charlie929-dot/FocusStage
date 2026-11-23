@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::process::Child;
 use std::time::Instant;
@@ -203,6 +204,7 @@ pub struct Stage {
     pub id: String,
     pub app: String,
     pub wm_class: String,
+    desktop_icon_png: OnceCell<Option<String>>,
     pub args: Vec<String>,
     pub kind: StageKind,
     pub pid: Option<u32>,
@@ -240,6 +242,12 @@ pub struct Stage {
 }
 
 impl Stage {
+    pub(crate) fn desktop_icon_png(&self) -> Option<&str> {
+        self.desktop_icon_png
+            .get_or_init(|| crate::icons::app_icon_png(&self.wm_class))
+            .as_deref()
+    }
+
     pub fn derive_wm_class(app: &str) -> String {
         let base = std::path::Path::new(app)
             .file_name()
@@ -308,6 +316,7 @@ impl Stage {
             id,
             app,
             wm_class,
+            desktop_icon_png: OnceCell::new(),
             args,
             kind,
             pid: None,

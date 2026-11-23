@@ -15,6 +15,7 @@ fn show(sink: &mut dyn DisplaySink, stage: &Stage, window: &StageWindow) {
         stage_id: &stage.id,
         title: &window.title,
         wm_class: &stage.wm_class,
+        icon_png: stage.desktop_icon_png(),
         rect: window.saved_rect,
         scale: window.scale,
         parent_window_id: window.parent_window_id.as_deref(),

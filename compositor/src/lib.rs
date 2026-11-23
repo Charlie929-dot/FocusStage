@@ -3,6 +3,7 @@ pub mod clipboard;
 pub mod control;
 pub mod desktop;
 mod dpi;
+pub mod icons;
 pub mod manager;
 pub mod offscreen;
 pub mod protocol;

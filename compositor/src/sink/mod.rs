@@ -54,6 +54,7 @@ pub struct WindowInfo<'a> {
     pub stage_id: &'a str,
     pub title: &'a str,
     pub wm_class: &'a str,
+    pub icon_png: Option<&'a str>,
     pub rect: SavedRect,
     pub scale: f64,
     pub parent_window_id: Option<&'a str>,
