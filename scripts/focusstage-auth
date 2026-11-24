@@ -49,7 +49,7 @@ polkit.addRule(function(action, subject) {
     var scope = subject.local ? (subject.active ? "active" : "inactive") : "any";
     try {
         var result = polkit.spawn(["/usr/bin/python3", "-I", "/usr/local/libexec/focusstage-auth",
-            "check-polkit", subject.user, action.id, scope]);
+            "check-polkit", subject.user, action.id, scope, subject.session || ""]);
         if (result === "verified") return polkit.Result.YES;
     } catch (error) {
         // If the helper failed, Polkit continues its normal authorization check.
@@ -109,9 +109,71 @@ def check_sudo():
     return has_grant(pwd.getpwnam(user).pw_uid)
 
 
-def check_polkit(user, action_id, scope):
-    if scope not in ('active', 'inactive', 'any') or not has_grant(pwd.getpwnam(user).pw_uid):
+def loginctl_props(kind, target, *props):
+    if not target or target.startswith('-'):
+        return {}
+    cmd = ['/usr/bin/loginctl', f'show-{kind}']
+    for prop in props:
+        cmd.extend(['-p', prop])
+    cmd.extend(['--', target])
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=2, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if res.returncode != 0:
+        return {}
+    values = {}
+    for line in res.stdout.splitlines():
+        if '=' in line:
+            key, val = line.split('=', 1)
+            values[key] = val.strip()
+    return values
+
+
+def wsl_session_scope(uid, session):
+    # WSL2 logind sessions have no physical Seat, so Polkit sees subject.local=false
+    # and passes scope="any". Treat active local (non-remote) WSL sessions as active.
+    if not Path('/run/WSL').is_dir():
+        return 'any'
+    if session:
+        if not re.fullmatch(r'[a-zA-Z0-9._-]+', session) or session.startswith('-'):
+            return 'any'
+        props = loginctl_props('session', session, 'Seat', 'Remote', 'Active', 'State')
+        if not props or props.get('Remote') != 'no' or props.get('Seat', '') != '':
+            return 'any'
+        if props.get('Active') == 'yes' or props.get('State') == 'active':
+            return 'active'
+        return 'inactive'
+
+    # Processes in systemd --user (e.g. gvfsd, apps launched by focusstaged) or wsl.exe
+    # outside a PAM session scope may have an empty subject.session.
+    user_props = loginctl_props('user', str(uid), 'Display', 'Sessions')
+    candidates = []
+    display = user_props.get('Display', '')
+    if display:
+        candidates.append(display)
+    for item in user_props.get('Sessions', '').split():
+        if item and item not in candidates:
+            candidates.append(item)
+    for cand in candidates:
+        if not re.fullmatch(r'[a-zA-Z0-9._-]+', cand) or cand.startswith('-'):
+            continue
+        props = loginctl_props('session', cand, 'Seat', 'Remote', 'Active', 'State')
+        if props.get('Remote') == 'no' and props.get('Seat', '') == '' and (
+            props.get('Active') == 'yes' or props.get('State') == 'active'
+        ):
+            return 'active'
+    return 'any'
+
+
+def check_polkit(user, action_id, scope, session=''):
+    if scope not in ('active', 'inactive', 'any'):
         return
+    uid = pwd.getpwnam(user).pw_uid
+    if not has_grant(uid):
+        return
+    if scope == 'any':
+        scope = wsl_session_scope(uid, session)
     # Only reuse authentication for actions whose default rule calls for it. Site rules run first.
     for policy in Path('/usr/share/polkit-1/actions').glob('*.policy'):
         try:
@@ -207,7 +269,7 @@ def remove():
 def main(args):
     if args == ['check-sudo']:
         return 0 if check_sudo() else 1
-    if len(args) == 4 and args[0] == 'check-polkit':
+    if len(args) in (4, 5) and args[0] == 'check-polkit':
         check_polkit(*args[1:])
         return 0
     if os.geteuid() == 0:
