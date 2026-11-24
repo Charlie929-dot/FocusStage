@@ -596,7 +596,10 @@ fn run_sync_apps(out_dir: &std::path::Path, remove: bool, json_mode: bool) -> an
             for entry in entries.flatten() {
                 let p = entry.path();
                 if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                    if name.starts_with("focusstage-") && name.ends_with(".desktop") {
+                    if name.starts_with("focusstage-")
+                        && !name.starts_with("focusstage-handler-")
+                        && name.ends_with(".desktop")
+                    {
                         std::fs::remove_file(&p)?;
                         removed.push(p.display().to_string());
                     }
@@ -617,13 +620,16 @@ fn run_sync_apps(out_dir: &std::path::Path, remove: bool, json_mode: bool) -> an
 
     std::fs::create_dir_all(out_dir)?;
     let mut created = Vec::new();
+    let mut kept = std::collections::HashSet::new();
     for app in discover_desktop_apps() {
         if app.source != "desktop" {
             continue;
         }
         let parsed = &app.parsed;
         let wrapper_id = &app.wrapper_id;
-        let wrapper_path = out_dir.join(format!("{wrapper_id}.desktop"));
+        let filename = format!("{wrapper_id}.desktop");
+        kept.insert(filename.clone());
+        let wrapper_path = out_dir.join(&filename);
         let mut exec_line = format!(
             "/usr/local/bin/focusstage-launch --wm-class {} {}",
             shell_quote_desktop(wrapper_id),
@@ -667,10 +673,28 @@ fn run_sync_apps(out_dir: &std::path::Path, remove: bool, json_mode: bool) -> an
         }));
     }
 
+    let mut removed = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(out_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                if name.starts_with("focusstage-")
+                    && !name.starts_with("focusstage-handler-")
+                    && name.ends_with(".desktop")
+                    && !kept.contains(name)
+                    && std::fs::remove_file(&p).is_ok()
+                {
+                    removed.push(p.display().to_string());
+                }
+            }
+        }
+    }
+
     let payload = serde_json::json!({
         "status": "ok",
         "count": created.len(),
         "entries": created,
+        "removed": removed,
     });
     println!(
         "{}",

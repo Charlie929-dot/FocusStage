@@ -118,7 +118,18 @@ fn uninstall_desktop_app(
     };
 
     for wrapper in wrapper_paths(&app.stem) {
-        if wrapper.is_file() && std::fs::remove_file(&wrapper).is_ok() {
+        if !wrapper.is_file() {
+            continue;
+        }
+        let removed_ok = if std::fs::remove_file(&wrapper).is_ok() {
+            true
+        } else if wrapper.starts_with("/usr/share/applications") {
+            let path_str = wrapper.to_string_lossy().into_owned();
+            run_root(&["rm", "-f", path_str.as_str()]).is_ok() && !wrapper.exists()
+        } else {
+            false
+        };
+        if removed_ok {
             removed.push(wrapper.display().to_string());
         }
     }
@@ -142,11 +153,23 @@ fn remove_managed_package(
             "-y",
             pkg.as_str(),
         ])?;
+        ensure_desktop_removed(path, &format!("apt-get remove {pkg}"))?;
         return Ok(Some(("apt-remove", vec![path.to_string()])));
     }
     if let Some(snap) = snap_name(path) {
         run_root(&["snap", "remove", snap.as_str()])?;
-        return Ok(Some(("snap-remove", vec![path.to_string()])));
+        if snap_is_installed(&snap) {
+            return Err(UninstallError::new(
+                "command_failed",
+                format!("snap {snap} is still installed after snap remove"),
+            ));
+        }
+        let mut removed = remove_stale_snap_desktop_files(&snap)?;
+        ensure_desktop_removed(path, &format!("snap remove {snap}"))?;
+        if !removed.iter().any(|p| p == path) {
+            removed.insert(0, path.to_string());
+        }
+        return Ok(Some(("snap-remove", removed)));
     }
     if let Some((id, system)) = flatpak_id(path) {
         let scope = if system { "--system" } else { "--user" };
@@ -156,9 +179,52 @@ fn remove_managed_package(
         } else {
             run_user(&args)?;
         }
+        ensure_desktop_removed(path, &format!("flatpak uninstall {id}"))?;
         return Ok(Some(("flatpak-uninstall", vec![path.to_string()])));
     }
     Ok(None)
+}
+
+fn ensure_desktop_removed(path: &str, action: &str) -> Result<(), UninstallError> {
+    if Path::new(path).exists() {
+        return Err(UninstallError::new(
+            "command_failed",
+            format!("{action} completed, but desktop entry still exists: {path}"),
+        ));
+    }
+    Ok(())
+}
+
+fn snap_is_installed(snap: &str) -> bool {
+    Command::new("snap")
+        .args(["list", snap])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+fn remove_stale_snap_desktop_files(snap: &str) -> Result<Vec<String>, UninstallError> {
+    let dir = Path::new("/var/lib/snapd/desktop/applications");
+    let prefix = format!("{snap}_");
+    let mut targets = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                if name.starts_with(&prefix) && name.ends_with(".desktop") {
+                    targets.push(p.display().to_string());
+                }
+            }
+        }
+    }
+    if targets.is_empty() {
+        return Ok(targets);
+    }
+    let mut args = vec!["rm", "-f"];
+    for target in &targets {
+        args.push(target.as_str());
+    }
+    run_root(&args)?;
+    Ok(targets)
 }
 
 fn dpkg_package(path: &str) -> Result<Option<String>, UninstallError> {
@@ -204,13 +270,16 @@ fn flatpak_id(path: &str) -> Option<(String, bool)> {
 
 fn wrapper_paths(stem: &str) -> Vec<PathBuf> {
     let name = format!("{WRAPPER_PREFIX}{stem}.desktop");
+    let handler_name = format!("focusstage-handler-{stem}.desktop");
     let mut paths = vec![PathBuf::from("/usr/share/applications").join(&name)];
-    if let Ok(home) = std::env::var("HOME") {
-        paths.push(
-            PathBuf::from(home)
-                .join(".local/share/applications")
-                .join(&name),
-        );
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+    if let Some(data_home) = data_home {
+        let apps_dir = data_home.join("applications");
+        paths.push(apps_dir.join(&name));
+        paths.push(apps_dir.join(&handler_name));
     }
     paths
 }
