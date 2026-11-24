@@ -113,6 +113,10 @@ pub struct StageInputState {
     pub current_pointer_target: Option<StageInputTarget>,
     /// Whether a temporary custom keymap is currently uploaded to clients
     pub custom_keymap_active: bool,
+    /// Whether the AI virtual cursor should be drawn on desktop overlay windows
+    pub agent_pointer_visible: bool,
+    /// Current AI virtual cursor visual action state ("idle" | "move" | "down" | "click" | "drag" | "scroll")
+    pub agent_pointer_state: &'static str,
 }
 
 impl StageInputState {
@@ -145,7 +149,14 @@ impl StageInputState {
             current_keyboard_target: None,
             current_pointer_target: None,
             custom_keymap_active: false,
+            agent_pointer_visible: false,
+            agent_pointer_state: "idle",
         }
+    }
+
+    pub fn reset_agent_pointer(&mut self) {
+        self.agent_pointer_visible = false;
+        self.agent_pointer_state = "idle";
     }
 
     pub fn update_key(&mut self, evdev_code: u32, pressed: bool) -> (Keycode, ModifiersState) {

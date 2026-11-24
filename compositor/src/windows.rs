@@ -3,8 +3,9 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::Sta
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::compositor::get_parent;
 
-use crate::protocol::{DisplayState, SavedRect};
-use crate::sink::{DisplaySink, WindowInfo, WindowState};
+use crate::protocol::{DisplayState, InputOwner, SavedRect};
+use crate::router::InputSource;
+use crate::sink::{AgentOverlay, DisplaySink, WindowInfo, WindowState};
 use crate::stage::{Stage, StageToplevel, StageWindow};
 use crate::state::FocusStageState;
 use crate::xwayland::hosted_x11_geometry;
@@ -77,11 +78,13 @@ impl FocusStageState {
             self.clear_window_inputs(&stage_id, window_id);
         }
         let stage = self.stages.get_mut(&stage_id).unwrap();
+        let is_desktop = stage.display == DisplayState::Desktop;
         let window = stage.window_mut(window_id).unwrap();
         window.mapped = mapped;
+        let sync_overlay = mapped && is_desktop;
         if mapped {
             window.dirty = true;
-            if stage.display == DisplayState::Desktop {
+            if is_desktop {
                 if let Some(sink) = self.display_sink.as_mut() {
                     show(sink.as_mut(), stage, stage.window(window_id).unwrap());
                 }
@@ -90,6 +93,9 @@ impl FocusStageState {
             sink.hide(window_id);
         }
         self.ensure_virtual_focus(&stage_id);
+        if sync_overlay {
+            self.sync_stage_agent_overlay(&stage_id);
+        }
     }
 
     pub fn remove_window(&mut self, window_id: &str) {
@@ -173,26 +179,107 @@ impl FocusStageState {
     }
 
     pub fn update_stage_window_visibility(&mut self, stage_id: &str) {
-        let Some(stage) = self.stages.get_mut(stage_id) else {
+        let mut sync_overlay = false;
+        {
+            let Some(stage) = self.stages.get_mut(stage_id) else {
+                return;
+            };
+            let Some(sink) = self.display_sink.as_mut() else {
+                return;
+            };
+            match stage.display {
+                DisplayState::Hidden => {
+                    for window in &stage.windows {
+                        sink.hide(&window.id);
+                    }
+                }
+                DisplayState::Desktop => {
+                    for window in stage.windows.iter().filter(|w| w.mapped) {
+                        show(sink.as_mut(), stage, window);
+                    }
+                    for window in &mut stage.windows {
+                        window.dirty = true;
+                    }
+                    sync_overlay = true;
+                }
+            }
+        }
+        if sync_overlay {
+            self.sync_stage_agent_overlay(stage_id);
+        }
+    }
+
+    pub fn sync_stage_agent_overlay(&mut self, stage_id: &str) {
+        let Some(stage) = self.stages.get(stage_id) else {
             return;
         };
+        if stage.display != DisplayState::Desktop {
+            return;
+        }
         let Some(sink) = self.display_sink.as_mut() else {
             return;
         };
-        match stage.display {
-            DisplayState::Hidden => {
-                for window in &stage.windows {
-                    sink.hide(&window.id);
-                }
+        let (active, agent_name) = match &stage.input_owner {
+            InputOwner::Agent { agent_name, .. } => (true, agent_name.as_deref()),
+            _ => (false, None),
+        };
+        let active_window_id = stage.active_window().map(|w| w.id.as_str());
+        let pos = stage.input.pointer_pos;
+        let pointer_visible = active && stage.input.agent_pointer_visible;
+        let pointer_state = if active { stage.input.agent_pointer_state } else { "idle" };
+
+        for window in stage.windows.iter().filter(|w| w.mapped) {
+            let show_pointer = pointer_visible && active_window_id == Some(window.id.as_str());
+            sink.set_agent_overlay(AgentOverlay {
+                window_id: &window.id,
+                active,
+                agent_name,
+                pointer_x: pos.x,
+                pointer_y: pos.y,
+                pointer_visible: show_pointer,
+                pointer_state: if show_pointer { pointer_state } else { "idle" },
+            });
+        }
+    }
+
+    pub fn update_agent_pointer_overlay(&mut self, stage_id: &str, pointer_state: &'static str) {
+        if let Some(stage) = self.stages.get_mut(stage_id) {
+            if matches!(stage.input_owner, InputOwner::Agent { .. }) {
+                stage.input.agent_pointer_visible = true;
+                stage.input.agent_pointer_state = pointer_state;
             }
-            DisplayState::Desktop => {
-                for window in stage.windows.iter().filter(|w| w.mapped) {
-                    show(sink.as_mut(), stage, window);
-                }
-                for window in &mut stage.windows {
-                    window.dirty = true;
-                }
+        }
+        self.sync_stage_agent_overlay(stage_id);
+    }
+
+    pub fn handle_sink_key(&mut self, window_id: &str, evdev_keycode: u32, pressed: bool) {
+        let Some(stage_id) = self.desktop_stage_for_window(window_id) else {
+            return;
+        };
+        if matches!(
+            self.stages.get(&stage_id).map(|s| &s.input_owner),
+            Some(InputOwner::Agent { .. })
+        ) {
+            // Evdev KEY_ESC (1) immediately cancels AI takeover without forwarding to the app.
+            if evdev_keycode == 1 && pressed {
+                self.human_takeover(Some(&stage_id));
             }
+            return;
+        }
+        if self.is_input_allowed(&stage_id, InputSource::Human, None) {
+            self.send_sink_key(&stage_id, window_id, evdev_keycode, pressed);
+        }
+    }
+
+    pub fn handle_sink_cancel_takeover(&mut self, window_id: &str) {
+        let Some(stage_id) = self.desktop_stage_for_window(window_id) else {
+            return;
+        };
+        if matches!(
+            self.stages.get(&stage_id).map(|s| &s.input_owner),
+            Some(InputOwner::Agent { .. })
+        ) {
+            self.human_takeover(Some(&stage_id));
         }
     }
 

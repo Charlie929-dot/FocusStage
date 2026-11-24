@@ -15,7 +15,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use super::{DisplaySink, SinkInputEvent, WindowInfo, WindowState};
+use super::{AgentOverlay, DisplaySink, SinkInputEvent, WindowInfo, WindowState};
 use crate::protocol::SavedRect;
 
 #[derive(Serialize)]
@@ -69,6 +69,16 @@ enum HostCommand<'a> {
     },
     Activate {
         window_id: &'a str,
+    },
+    AgentOverlay {
+        window_id: &'a str,
+        active: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_name: Option<&'a str>,
+        pointer_x: f64,
+        pointer_y: f64,
+        pointer_visible: bool,
+        pointer_state: &'a str,
     },
     OpenUrl {
         url: &'a str,
@@ -140,6 +150,9 @@ enum HostEvent {
         paths: Vec<String>,
         x: f64,
         y: f64,
+    },
+    CancelTakeover {
+        window_id: String,
     },
     FrameDone {
         window_id: String,
@@ -220,6 +233,7 @@ impl HostEvent {
                 x,
                 y,
             },
+            Self::CancelTakeover { window_id } => Input::CancelTakeover { window_id },
         })
     }
 }
@@ -478,6 +492,18 @@ impl DisplaySink for NativeSink {
         self.command(HostCommand::Activate { window_id });
     }
 
+    fn set_agent_overlay(&mut self, overlay: AgentOverlay<'_>) {
+        self.command(HostCommand::AgentOverlay {
+            window_id: overlay.window_id,
+            active: overlay.active,
+            agent_name: overlay.agent_name,
+            pointer_x: overlay.pointer_x,
+            pointer_y: overlay.pointer_y,
+            pointer_visible: overlay.pointer_visible,
+            pointer_state: overlay.pointer_state,
+        });
+    }
+
     fn open_web_url(&mut self, url: &str) -> bool {
         crate::xdg::valid_web_url(url) && self.command(HostCommand::OpenUrl { url })
     }
@@ -536,5 +562,36 @@ mod tests {
         assert_eq!(state.rect.width, 768);
         assert_eq!(state.tiled, [true, false, true, true]);
         assert_eq!(state.pixel_size, Some([960, 740]));
+    }
+
+    #[test]
+    fn agent_overlay_command_serializes_and_cancel_takeover_deserializes() {
+        let json = serde_json::to_value(HostCommand::AgentOverlay {
+            window_id: "stage-2/1",
+            active: true,
+            agent_name: Some("Claude"),
+            pointer_x: 120.5,
+            pointer_y: 88.0,
+            pointer_visible: true,
+            pointer_state: "click",
+        })
+        .unwrap();
+        assert_eq!(json["type"], "agent_overlay");
+        assert_eq!(json["window_id"], "stage-2/1");
+        assert_eq!(json["active"], true);
+        assert_eq!(json["agent_name"], "Claude");
+        assert_eq!(json["pointer_x"], 120.5);
+        assert_eq!(json["pointer_y"], 88.0);
+        assert_eq!(json["pointer_visible"], true);
+        assert_eq!(json["pointer_state"], "click");
+
+        let event = serde_json::from_str::<HostEvent>(
+            r#"{"type":"cancel_takeover","window_id":"stage-2/1"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            event.into_sink_event(),
+            Some(SinkInputEvent::CancelTakeover { window_id }) if window_id == "stage-2/1"
+        ));
     }
 }

@@ -936,6 +936,17 @@ mod tests {
         (pool, buf)
     }
 
+    #[derive(Debug, Clone, PartialEq)]
+    struct RecordedOverlay {
+        window_id: String,
+        active: bool,
+        agent_name: Option<String>,
+        pointer_x: f64,
+        pointer_y: f64,
+        pointer_visible: bool,
+        pointer_state: String,
+    }
+
     #[derive(Default)]
     struct WindowLog {
         shown: Vec<(String, String, Option<String>)>,
@@ -943,6 +954,7 @@ mod tests {
         destroyed: Vec<String>,
         host_clipboard_texts: Vec<String>,
         host_clipboard_images: Vec<Vec<u8>>,
+        overlays: Vec<RecordedOverlay>,
     }
 
     struct TestSink(Arc<Mutex<WindowLog>>);
@@ -961,6 +973,17 @@ mod tests {
         }
         fn set_host_clipboard_image(&mut self, png_bytes: &[u8]) {
             self.0.lock().unwrap().host_clipboard_images.push(png_bytes.to_vec());
+        }
+        fn set_agent_overlay(&mut self, overlay: crate::sink::AgentOverlay<'_>) {
+            self.0.lock().unwrap().overlays.push(RecordedOverlay {
+                window_id: overlay.window_id.to_string(),
+                active: overlay.active,
+                agent_name: overlay.agent_name.map(str::to_owned),
+                pointer_x: overlay.pointer_x,
+                pointer_y: overlay.pointer_y,
+                pointer_visible: overlay.pointer_visible,
+                pointer_state: overlay.pointer_state.to_string(),
+            });
         }
         fn present_owned(&mut self, _: &str, _: u32, _: u32, _: Vec<u8>) {}
         fn poll_events(&mut self) -> Vec<crate::sink::SinkInputEvent> { Vec::new() }
@@ -1529,5 +1552,168 @@ mod tests {
         assert!(c1.active_selection.is_none());
         assert!(state.stages[&sid1].clipboard.content.is_none());
         assert!(state.stages[&sid2].clipboard.content.is_none());
+    }
+
+    #[test]
+    fn agent_overlay_syncs_actions_visibility_and_esc_cancel_takeover() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use crate::control::ControlServerMessage;
+        use crate::protocol::{Action, ControlRequest, ControlResponse, InputOwner};
+
+        let event_loop: EventLoop<'static, FocusStageState> = EventLoop::try_new().unwrap();
+        let mut display = Display::new().unwrap();
+        let mut dh = display.handle();
+        let log = Arc::new(Mutex::new(WindowLog::default()));
+        let mut state = FocusStageState::new(
+            &dh,
+            event_loop.handle(),
+            "focusstage-overlay-test".into(),
+            1.0,
+            60,
+            SavedRect { x: 0, y: 0, width: 1920, height: 1080 },
+            Some(Box::new(TestSink(log.clone()))),
+        );
+        let (server_sock, client_sock) = UnixStream::pair().unwrap();
+        let _client = dh.insert_client(server_sock, Arc::new(ClientState::default())).unwrap();
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue = conn.new_event_queue();
+        let qh = queue.handle();
+        let mut client = TestClient::default();
+        let _registry = conn.display().get_registry(&qh, ());
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        let compositor = client.compositor.as_ref().unwrap().clone();
+        let wm = client.wm_base.as_ref().unwrap().clone();
+        let shm = client.shm.as_ref().unwrap().clone();
+        let surface = compositor.create_surface(&qh, ());
+        let xdg = wm.get_xdg_surface(&surface, &qh, ());
+        let _toplevel = xdg.get_toplevel(&qh, ());
+        surface.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let (_pool, buffer) = create_shm_buffer(&shm, &qh, 640, 480);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        let (sid, wid) = {
+            let log = log.lock().unwrap();
+            assert_eq!(log.shown.len(), 1);
+            (log.shown[0].0.clone(), log.shown[0].1.clone())
+        };
+        log.lock().unwrap().overlays.clear();
+
+        let send_ctrl = |state: &mut FocusStageState, request: ControlRequest| -> ControlResponse {
+            let (tx, rx) = mpsc::channel();
+            state.handle_control_message(ControlServerMessage {
+                request,
+                reply_tx: tx,
+                peer_pid: None,
+            });
+            rx.recv().unwrap()
+        };
+
+        // 1. Acquire with hide=false preserves Desktop visibility and turns on the overlay.
+        let resp = send_ctrl(
+            &mut state,
+            ControlRequest::Acquire {
+                stage_id: sid.clone(),
+                ttl_s: 60,
+                hide: false,
+                agent_name: Some("Claude".into()),
+            },
+        );
+        assert!(matches!(resp, ControlResponse::Acquired { .. }));
+        assert_eq!(state.stages[&sid].display, DisplayState::Desktop);
+        assert!(matches!(state.stages[&sid].input_owner, InputOwner::Agent { .. }));
+        {
+            let overlays = &log.lock().unwrap().overlays;
+            let last = overlays.last().expect("acquire should sync active overlay");
+            assert_eq!(last.window_id, wid);
+            assert!(last.active);
+            assert_eq!(last.agent_name.as_deref(), Some("Claude"));
+            assert!(!last.pointer_visible);
+            assert_eq!(last.pointer_state, "idle");
+        }
+
+        // 2. Pointer actions sync virtual cursor coordinates and action states.
+        log.lock().unwrap().overlays.clear();
+        state.execute_single_action(&sid, &Action::Move { x: 100.0, y: 120.0 }).unwrap();
+        state.execute_single_action(&sid, &Action::Click { x: 200.0, y: 240.0, button: None }).unwrap();
+        state.execute_single_action(
+            &sid,
+            &Action::Drag { from_x: 10.0, from_y: 20.0, to_x: 50.0, to_y: 60.0, button: None, steps: Some(2) },
+        ).unwrap();
+        state.execute_single_action(&sid, &Action::Scroll { x: 300.0, y: 150.0, dx: 0.0, dy: 45.0 }).unwrap();
+        {
+            let overlays = &log.lock().unwrap().overlays;
+            assert!(overlays.iter().any(|o| o.active && o.pointer_visible && o.pointer_state == "move" && (o.pointer_x - 100.0).abs() < 1e-6));
+            assert!(overlays.iter().any(|o| o.active && o.pointer_visible && o.pointer_state == "click" && (o.pointer_x - 200.0).abs() < 1e-6));
+            assert!(overlays.iter().any(|o| o.active && o.pointer_visible && o.pointer_state == "down" && (o.pointer_x - 10.0).abs() < 1e-6));
+            assert!(overlays.iter().any(|o| o.active && o.pointer_visible && o.pointer_state == "drag"));
+            let last = overlays.last().unwrap();
+            assert_eq!(last.pointer_state, "scroll");
+            assert!(last.pointer_visible);
+            assert!((last.pointer_x - 300.0).abs() < 1e-6 && (last.pointer_y - 150.0).abs() < 1e-6);
+        }
+
+        // 3. Non-Esc keys are ignored while Agent owns the stage; Esc triggers human_takeover and clears overlay.
+        log.lock().unwrap().overlays.clear();
+        state.handle_sink_key(&wid, 30, true); // 'a' key
+        assert!(matches!(state.stages[&sid].input_owner, InputOwner::Agent { .. }));
+        state.handle_sink_key(&wid, 1, true); // KEY_ESC
+        assert_eq!(state.stages[&sid].input_owner, InputOwner::Human);
+        assert!(!state.stages[&sid].input.pressed_keys.contains(&1));
+        {
+            let overlays = &log.lock().unwrap().overlays;
+            let last = overlays.last().expect("Esc takeover should clear overlay");
+            assert!(!last.active);
+            assert!(!last.pointer_visible);
+        }
+
+        // 4. Acquire with hide=true hides stage; switching back to Desktop shows active overlay; banner cancel clears it.
+        log.lock().unwrap().overlays.clear();
+        let resp = send_ctrl(
+            &mut state,
+            ControlRequest::Acquire {
+                stage_id: sid.clone(),
+                ttl_s: 60,
+                hide: true,
+                agent_name: Some("Tester".into()),
+            },
+        );
+        assert!(matches!(resp, ControlResponse::Acquired { .. }));
+        assert_eq!(state.stages[&sid].display, DisplayState::Hidden);
+        assert!(log.lock().unwrap().overlays.is_empty());
+
+        assert!(matches!(state.set_stage_display(&sid, DisplayState::Desktop), ControlResponse::Ok));
+        {
+            let overlays = &log.lock().unwrap().overlays;
+            let last = overlays.last().expect("switching Agent stage to Desktop should sync active overlay");
+            assert!(last.active);
+            assert_eq!(last.agent_name.as_deref(), Some("Tester"));
+        }
+
+        log.lock().unwrap().overlays.clear();
+        state.handle_sink_cancel_takeover(&wid);
+        assert_eq!(state.stages[&sid].input_owner, InputOwner::Human);
+        assert!(!log.lock().unwrap().overlays.last().unwrap().active);
+
+        // 5. Lease expiry reverts to Human and clears overlay.
+        let _ = send_ctrl(
+            &mut state,
+            ControlRequest::Acquire {
+                stage_id: sid.clone(),
+                ttl_s: 60,
+                hide: false,
+                agent_name: None,
+            },
+        );
+        log.lock().unwrap().overlays.clear();
+        state.stages.get_mut(&sid).unwrap().lease.as_mut().unwrap().expires_at =
+            Instant::now() - Duration::from_secs(1);
+        state.expire_leases();
+        assert_eq!(state.stages[&sid].input_owner, InputOwner::Human);
+        assert!(!log.lock().unwrap().overlays.last().unwrap().active);
     }
 }
