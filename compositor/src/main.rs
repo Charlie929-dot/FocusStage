@@ -19,6 +19,7 @@ use focusstage_compositor::protocol::{default_socket_path, DisplayState, SavedRe
 use focusstage_compositor::router::InputSource;
 use focusstage_compositor::sink::native::NativeSink;
 use focusstage_compositor::sink::{DisplaySink, SinkInputEvent};
+use focusstage_compositor::stage::ClipboardContent;
 use focusstage_compositor::state::{ClientState, FocusStageState};
 
 #[derive(Debug, Parser)]
@@ -464,8 +465,13 @@ fn dispatch_sink_events(state: &mut FocusStageState) -> bool {
             SinkInputEvent::CloseRequested { window_id } => {
                 state.close_window_from_sink(&window_id);
             }
-            SinkInputEvent::HostClipboardChanged { text } => {
-                state.sync_from_host_clipboard(text);
+            SinkInputEvent::HostClipboardChanged { text, image_png } => {
+                let content = if let Some(png) = image_png {
+                    Some(ClipboardContent::ImagePng(png))
+                } else {
+                    text.map(ClipboardContent::Text)
+                };
+                state.sync_from_host_clipboard_content(content);
             }
             SinkInputEvent::FilesDropped { window_id, paths, x, y } => {
                 if let Some(stage_id) = human_input_stage(state, &window_id) {

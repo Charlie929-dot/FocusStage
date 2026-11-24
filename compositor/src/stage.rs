@@ -169,13 +169,57 @@ impl StageInputState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardContent {
+    Text(String),
+    ImagePng(Vec<u8>),
+}
+
+impl ClipboardContent {
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(s) => Some(s.as_str()),
+            Self::ImagePng(_) => None,
+        }
+    }
+
+    pub fn mime_types(&self) -> Vec<String> {
+        match self {
+            Self::Text(_) => vec![
+                "text/plain;charset=utf-8".to_string(),
+                "UTF8_STRING".to_string(),
+                "text/plain".to_string(),
+            ],
+            Self::ImagePng(_) => vec!["image/png".to_string()],
+        }
+    }
+
+    pub fn x11_mime_types(&self) -> Vec<String> {
+        match self {
+            Self::Text(_) => vec![
+                "UTF8_STRING".to_string(),
+                "text/plain;charset=utf-8".to_string(),
+                "text/plain".to_string(),
+                "STRING".to_string(),
+            ],
+            Self::ImagePng(_) => vec!["image/png".to_string()],
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct StageClipboard {
-    pub text: Option<String>,
+    pub content: Option<ClipboardContent>,
     pub mime_types: Vec<String>,
     pub seq: u64,
     pub client_source: Option<WlDataSource>,
     pub x11_has_selection: bool,
+}
+
+impl StageClipboard {
+    pub fn text(&self) -> Option<String> {
+        self.content.as_ref().and_then(|c| c.text().map(str::to_owned))
+    }
 }
 
 pub struct StageWindow {

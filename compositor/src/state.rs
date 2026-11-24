@@ -49,7 +49,7 @@ use crate::offscreen::OffscreenCore;
 use crate::protocol::{DisplayState, SavedRect, StageKind};
 use crate::router::{PendingActJob, StageTextInputManagerState};
 use crate::sink::DisplaySink;
-use crate::stage::{Stage, StageToplevel};
+use crate::stage::{ClipboardContent, Stage, StageToplevel};
 
 #[derive(Default)]
 pub struct ClientState {
@@ -91,7 +91,7 @@ pub struct FocusStageState {
     pub virtual_outputs: VirtualOutputs,
 
     pub clipboard_state: StageDataDeviceManagerState,
-    pub clipboard_update_tx: calloop_channel::Sender<(String, String)>,
+    pub clipboard_update_tx: calloop_channel::Sender<(String, u64, ClipboardContent)>,
     pub text_input_state: StageTextInputManagerState,
 
     pub stages: HashMap<String, Stage>,
@@ -138,10 +138,11 @@ impl FocusStageState {
         let offscreen = OffscreenCore::new();
         let virtual_outputs = VirtualOutputs::new(dh, primary_monitor, default_scale, frame_hz);
         FractionalScaleManagerState::new::<Self>(dh);
-        let (clipboard_update_tx, clipboard_update_rx) = calloop_channel::channel::<(String, String)>();
+        let (clipboard_update_tx, clipboard_update_rx) =
+            calloop_channel::channel::<(String, u64, ClipboardContent)>();
         let _ = loop_handle.insert_source(clipboard_update_rx, |event, _, state| {
-            if let calloop_channel::Event::Msg((sid, text)) = event {
-                state.handle_clipboard_update_from_stage(&sid, text);
+            if let calloop_channel::Event::Msg((sid, expected_seq, content)) = event {
+                state.handle_clipboard_update_from_stage(&sid, expected_seq, content);
             }
         });
         let a11y = A11yCollector::spawn();
@@ -599,8 +600,8 @@ mod tests {
     use smithay::reexports::wayland_server::Display;
     use wayland_client::protocol::{
         wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
-        wl_data_offer, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_subcompositor,
-        wl_subsurface, wl_surface,
+        wl_data_offer, wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
+        wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
     };
     use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
     use wayland_protocols::wp::fractional_scale::v1::client::{
@@ -669,6 +670,10 @@ mod tests {
         text_input_manager: Option<c_text_manager::ZwpTextInputManagerV3>,
         text_input_enters: Vec<wl_surface::WlSurface>,
         drop_enters: Vec<(u32, f64, f64)>,
+        offer_mimes: HashMap<u32, Vec<String>>,
+        active_selection: Option<wl_data_offer::WlDataOffer>,
+        selection_cleared_count: usize,
+        source_payloads: HashMap<u32, Vec<u8>>,
         fractional_scale: Option<c_scale_manager::WpFractionalScaleManagerV1>,
         preferred_scales: HashMap<u32, u32>,
         window_configures: HashMap<u32, (i32, i32, Vec<u32>)>,
@@ -757,7 +762,22 @@ mod tests {
         fn event(_: &mut Self, _: &wl_data_device_manager::WlDataDeviceManager, _: wl_data_device_manager::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
     }
     impl Dispatch<wl_data_offer::WlDataOffer, ()> for TestClient {
-        fn event(_: &mut Self, _: &wl_data_offer::WlDataOffer, _: wl_data_offer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+        fn event(state: &mut Self, offer: &wl_data_offer::WlDataOffer, event: wl_data_offer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+            if let wl_data_offer::Event::Offer { mime_type } = event {
+                state.offer_mimes.entry(offer.id().protocol_id()).or_default().push(mime_type);
+            }
+        }
+    }
+    impl Dispatch<wl_data_source::WlDataSource, ()> for TestClient {
+        fn event(state: &mut Self, source: &wl_data_source::WlDataSource, event: wl_data_source::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+            if let wl_data_source::Event::Send { fd, .. } = event {
+                use std::io::Write;
+                if let Some(bytes) = state.source_payloads.get(&source.id().protocol_id()) {
+                    let mut file = std::fs::File::from(fd);
+                    let _ = file.write_all(bytes);
+                }
+            }
+        }
     }
     impl Dispatch<wl_data_device::WlDataDevice, ()> for TestClient {
         wayland_client::event_created_child!(TestClient, wl_data_device::WlDataDevice, [
@@ -765,8 +785,17 @@ mod tests {
         ]);
 
         fn event(state: &mut Self, _: &wl_data_device::WlDataDevice, event: wl_data_device::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-            if let wl_data_device::Event::Enter { surface, x, y, .. } = event {
-                state.drop_enters.push((surface.id().protocol_id(), x, y));
+            match event {
+                wl_data_device::Event::Enter { surface, x, y, .. } => {
+                    state.drop_enters.push((surface.id().protocol_id(), x, y));
+                }
+                wl_data_device::Event::Selection { id } => {
+                    if id.is_none() {
+                        state.selection_cleared_count += 1;
+                    }
+                    state.active_selection = id;
+                }
+                _ => {}
             }
         }
     }
@@ -912,6 +941,8 @@ mod tests {
         shown: Vec<(String, String, Option<String>)>,
         hidden: Vec<String>,
         destroyed: Vec<String>,
+        host_clipboard_texts: Vec<String>,
+        host_clipboard_images: Vec<Vec<u8>>,
     }
 
     struct TestSink(Arc<Mutex<WindowLog>>);
@@ -925,6 +956,12 @@ mod tests {
         }
         fn destroy(&mut self, id: &str) { self.0.lock().unwrap().destroyed.push(id.into()); }
         fn set_title(&mut self, _: &str, _: &str) {}
+        fn set_host_clipboard(&mut self, text: &str) {
+            self.0.lock().unwrap().host_clipboard_texts.push(text.to_string());
+        }
+        fn set_host_clipboard_image(&mut self, png_bytes: &[u8]) {
+            self.0.lock().unwrap().host_clipboard_images.push(png_bytes.to_vec());
+        }
         fn present_owned(&mut self, _: &str, _: u32, _: u32, _: Vec<u8>) {}
         fn poll_events(&mut self) -> Vec<crate::sink::SinkInputEvent> { Vec::new() }
     }
@@ -1362,5 +1399,135 @@ mod tests {
         );
 
         let _ = event_loop.dispatch(Some(std::time::Duration::ZERO), &mut state);
+    }
+
+    #[test]
+    fn clipboard_inherits_host_and_syncs_across_human_stages_for_text_image_and_clear() {
+        use std::io::Read;
+        use std::os::fd::AsFd;
+
+        let mut event_loop: EventLoop<'static, FocusStageState> = EventLoop::try_new().unwrap();
+        let mut display = Display::new().unwrap();
+        let mut dh = display.handle();
+        let log = Arc::new(Mutex::new(WindowLog::default()));
+        let mut state = FocusStageState::new(
+            &dh,
+            event_loop.handle(),
+            "focusstage-clipboard-test".into(),
+            1.0,
+            60,
+            SavedRect { x: 0, y: 0, width: 1920, height: 1080 },
+            Some(Box::new(TestSink(log.clone()))),
+        );
+
+        // Host already had clipboard text before any Stage connected.
+        state.sync_from_host_clipboard("from-windows".into());
+
+        let mut connect = || {
+            let (server_sock, client_sock) = UnixStream::pair().unwrap();
+            let peer = dh.insert_client(server_sock, Arc::new(ClientState::default())).unwrap();
+            let conn = Connection::from_socket(client_sock).unwrap();
+            let queue = conn.new_event_queue();
+            conn.display().get_registry(&queue.handle(), ());
+            let sid = state.ensure_stage_for_client(&peer);
+            (sid, conn, queue, TestClient::default())
+        };
+
+        let (sid1, conn1, mut q1, mut c1) = connect();
+        let (sid2, conn2, mut q2, mut c2) = connect();
+        let (sid_agent, conn_agent, mut q_agent, mut c_agent) = connect();
+        state.stages.get_mut(&sid_agent).unwrap().input_owner = crate::protocol::InputOwner::Agent {
+            lease_id: "lease-agent".into(),
+            agent_name: Some("agent".into()),
+        };
+
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+        pump(&mut display, &mut state, &conn2, &mut q2, &mut c2);
+        pump(&mut display, &mut state, &conn_agent, &mut q_agent, &mut c_agent);
+
+        let read_offer = |offer: &wl_data_offer::WlDataOffer,
+                          mime: &str,
+                          display: &mut Display<FocusStageState>,
+                          state: &mut FocusStageState,
+                          conn: &Connection,
+                          queue: &mut wayland_client::EventQueue<TestClient>,
+                          client: &mut TestClient| {
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+            let writer = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+            offer.receive(mime.to_string(), writer.as_fd());
+            drop(writer);
+            pump(display, state, conn, queue, client);
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).unwrap();
+            out
+        };
+
+        // 1. New Human stage inherits latest_host_clipboard on get_data_device.
+        let qh1 = q1.handle();
+        let _dev1 = c1.data_device_manager.as_ref().unwrap()
+            .get_data_device(c1.seat.as_ref().unwrap(), &qh1, ());
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+        let offer1 = c1.active_selection.clone().expect("stage 1 should inherit host clipboard");
+        assert!(c1.offer_mimes[&offer1.id().protocol_id()].contains(&"text/plain;charset=utf-8".to_string()));
+        assert_eq!(
+            read_offer(&offer1, "text/plain;charset=utf-8", &mut display, &mut state, &conn1, &mut q1, &mut c1),
+            b"from-windows"
+        );
+
+        // Agent stage must remain isolated from host clipboard.
+        let qh_agent = q_agent.handle();
+        let _dev_agent = c_agent.data_device_manager.as_ref().unwrap()
+            .get_data_device(c_agent.seat.as_ref().unwrap(), &qh_agent, ());
+        pump(&mut display, &mut state, &conn_agent, &mut q_agent, &mut c_agent);
+        assert!(c_agent.active_selection.is_none());
+
+        // 2. Stage 2 copies an image (offering text/html + image/png) -> propagates to Stage 1 and Host.
+        let qh2 = q2.handle();
+        let dev2 = c2.data_device_manager.as_ref().unwrap()
+            .get_data_device(c2.seat.as_ref().unwrap(), &qh2, ());
+        let src2 = c2.data_device_manager.as_ref().unwrap().create_data_source(&qh2, ());
+        let fake_png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4];
+        c2.source_payloads.insert(src2.id().protocol_id(), fake_png.clone());
+        src2.offer("text/html".into());
+        src2.offer("image/png".into());
+        dev2.set_selection(Some(&src2), 1);
+
+        // Pump client 2 so it responds to WlDataSource::Send, then dispatch event_loop for clipboard_update_rx.
+        for _ in 0..10 {
+            pump(&mut display, &mut state, &conn2, &mut q2, &mut c2);
+            let _ = event_loop.dispatch(Some(std::time::Duration::from_millis(5)), &mut state);
+            if !log.lock().unwrap().host_clipboard_images.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(log.lock().unwrap().host_clipboard_images, vec![fake_png.clone()]);
+        assert_eq!(
+            state.stages[&sid2].clipboard.content,
+            Some(crate::stage::ClipboardContent::ImagePng(fake_png.clone()))
+        );
+        assert_eq!(
+            state.stages[&sid1].clipboard.content,
+            Some(crate::stage::ClipboardContent::ImagePng(fake_png.clone()))
+        );
+        assert!(state.stages[&sid_agent].clipboard.content.is_none());
+
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+        let offer1_img = c1.active_selection.clone().expect("stage 1 should receive PNG offer from stage 2");
+        assert_eq!(c1.offer_mimes[&offer1_img.id().protocol_id()], vec!["image/png".to_string()]);
+        assert_eq!(
+            read_offer(&offer1_img, "image/png", &mut display, &mut state, &conn1, &mut q1, &mut c1),
+            fake_png
+        );
+
+        // 3. Host clears clipboard -> Human stages clear their selection.
+        let cleared_before = c1.selection_cleared_count;
+        state.sync_from_host_clipboard_content(None);
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+        assert_eq!(c1.selection_cleared_count, cleared_before + 1);
+        assert!(c1.active_selection.is_none());
+        assert!(state.stages[&sid1].clipboard.content.is_none());
+        assert!(state.stages[&sid2].clipboard.content.is_none());
     }
 }

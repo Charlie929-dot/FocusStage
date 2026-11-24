@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::sync::Mutex;
 
 use smithay::reexports::wayland_server::{
@@ -16,7 +16,16 @@ use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use tracing::{debug, warn};
 
 use crate::protocol::{windows_path_to_wsl, InputOwner};
+use crate::stage::ClipboardContent;
 use crate::state::{ClientState, FocusStageState};
+
+pub const MAX_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardReadKind {
+    Text,
+    ImagePng,
+}
 
 #[derive(Debug, Default)]
 pub struct DataSourceUserData {
@@ -26,7 +35,7 @@ pub struct DataSourceUserData {
 
 #[derive(Debug)]
 pub enum OfferBackend {
-    StaticText(String),
+    StaticContent(ClipboardContent),
     StaticUriList(String),
     ClientSource(WlDataSource),
 }
@@ -41,7 +50,7 @@ pub struct DataOfferUserData {
 pub struct StageDataDeviceManagerState {
     pub global: Option<GlobalId>,
     pub devices: Vec<(String, Weak<WlDataDevice>)>,
-    pub latest_host_clipboard: Option<String>,
+    pub latest_host_clipboard: Option<ClipboardContent>,
     pub host_clipboard_seq: u64,
 }
 
@@ -54,6 +63,12 @@ impl StageDataDeviceManagerState {
             latest_host_clipboard: None,
             host_clipboard_seq: 0,
         }
+    }
+
+    pub fn latest_host_text(&self) -> Option<String> {
+        self.latest_host_clipboard
+            .as_ref()
+            .and_then(|c| c.text().map(str::to_owned))
     }
 }
 
@@ -106,10 +121,29 @@ impl Dispatch<WlDataDeviceManager, ()> for FocusStageState {
                     .push((stage_id.clone(), device.downgrade()));
                 let _ = seat;
 
-                // If the Stage already has server-side clipboard text, advertise it immediately.
+                // Inherit the latest host clipboard if this Human stage has no selection yet.
+                if let Some(host_content) = state.clipboard_state.latest_host_clipboard.clone() {
+                    if let Some(stage) = state.stages.get_mut(&stage_id) {
+                        if stage.clipboard.content.is_none()
+                            && stage.clipboard.client_source.is_none()
+                            && stage.clipboard.seq == 0
+                            && stage.input_owner == InputOwner::Human
+                        {
+                            stage.clipboard.content = Some(host_content.clone());
+                            stage.clipboard.mime_types = host_content.mime_types();
+                            stage.clipboard.seq = 1;
+                        }
+                    }
+                }
+
+                // If the Stage already has a clipboard selection, advertise it immediately.
                 if let Some(stage) = state.stages.get(&stage_id) {
-                    if let Some(ref text) = stage.clipboard.text {
-                        send_text_offer_to_device(dh, &device, text.clone());
+                    if let Some(ref content) = stage.clipboard.content {
+                        send_content_offer_to_device(dh, &device, content.clone());
+                    } else if let Some(ref src) = stage.clipboard.client_source {
+                        if src.is_alive() {
+                            send_source_offer_to_device(dh, &device, src.clone(), &stage.clipboard.mime_types);
+                        }
                     }
                 }
             }
@@ -153,11 +187,20 @@ impl Dispatch<WlDataOffer, DataOfferUserData> for FocusStageState {
     ) {
         match request {
             wl_data_offer::Request::Receive { mime_type, fd } => match &data.backend {
-                OfferBackend::StaticText(text) | OfferBackend::StaticUriList(text) => {
+                OfferBackend::StaticContent(content) => {
+                    let bytes = match content {
+                        ClipboardContent::Text(text) => text.as_bytes().to_vec(),
+                        ClipboardContent::ImagePng(png) => png.clone(),
+                    };
+                    std::thread::spawn(move || {
+                        let mut file = std::fs::File::from(fd);
+                        let _ = file.write_all(&bytes);
+                    });
+                }
+                OfferBackend::StaticUriList(text) => {
                     let bytes = text.as_bytes().to_vec();
                     std::thread::spawn(move || {
-                        let mut file = unsafe { std::fs::File::from_raw_fd(fd.as_raw_fd()) };
-                        std::mem::forget(fd);
+                        let mut file = std::fs::File::from(fd);
                         let _ = file.write_all(&bytes);
                     });
                 }
@@ -200,26 +243,8 @@ impl Dispatch<WlDataDevice, String> for FocusStageState {
                     }
                 }
 
-                // Read text asynchronously from the client's WlDataSource if it offers text.
-                let text_mime = pick_text_mime(&mimes);
-                if let (Some(src), Some(mime)) = (&source, text_mime) {
-                    if let Ok((read_fd, write_fd)) = create_pipe() {
-                        src.send(mime, write_fd.as_fd());
-                        // Spawn a short helper thread to read clipboard payload without blocking compositor loop.
-                        let tx = state.clipboard_update_tx.clone();
-                        let sid = stage_id.clone();
-                        std::thread::spawn(move || {
-                            let mut file = std::fs::File::from(read_fd);
-                            let mut buf = Vec::new();
-                            let _ = file.read_to_end(&mut buf);
-                            if let Ok(text) = String::from_utf8(buf) {
-                                let _ = tx.send((sid, text));
-                            }
-                        });
-                    }
-                }
-
-                if let Some(stage) = state.stages.get_mut(&stage_id) {
+                let picked = pick_clipboard_mime(&mimes);
+                let (expected_seq, xwm_id) = if let Some(stage) = state.stages.get_mut(&stage_id) {
                     if let Some(old) = stage.clipboard.client_source.take() {
                         if Some(&old) != source.as_ref() && old.is_alive() {
                             old.cancelled();
@@ -227,22 +252,68 @@ impl Dispatch<WlDataDevice, String> for FocusStageState {
                     }
                     stage.clipboard.client_source = source.clone();
                     stage.clipboard.mime_types = mimes.clone();
+                    stage.clipboard.content = None;
+                    stage.clipboard.x11_has_selection = false;
                     stage.clipboard.seq = stage.clipboard.seq.saturating_add(1);
-                    if source.is_none() {
-                        stage.clipboard.text = None;
+                    (stage.clipboard.seq, stage.xwm_id)
+                } else {
+                    return;
+                };
+
+                // Read supported clipboard payload asynchronously from the client's WlDataSource.
+                if let (Some(src), Some((mime, kind))) = (&source, picked) {
+                    if let Ok((read_fd, write_fd)) = create_pipe() {
+                        src.send(mime, write_fd.as_fd());
+                        let tx = state.clipboard_update_tx.clone();
+                        let sid = stage_id.clone();
+                        std::thread::spawn(move || {
+                            let file = std::fs::File::from(read_fd);
+                            let mut buf = Vec::new();
+                            if file
+                                .take((MAX_CLIPBOARD_BYTES + 1) as u64)
+                                .read_to_end(&mut buf)
+                                .is_ok()
+                                && buf.len() <= MAX_CLIPBOARD_BYTES
+                            {
+                                let content = match kind {
+                                    ClipboardReadKind::Text => {
+                                        String::from_utf8(buf).ok().map(ClipboardContent::Text)
+                                    }
+                                    ClipboardReadKind::ImagePng => {
+                                        (!buf.is_empty()).then_some(ClipboardContent::ImagePng(buf))
+                                    }
+                                };
+                                if let Some(content) = content {
+                                    let _ = tx.send((sid, expected_seq, content));
+                                }
+                            }
+                        });
                     }
                 }
 
-                // Advertise ONLY to other WlDataDevices within the SAME Stage (never across Stages!).
-                if let Some(ref src) = source {
-                    for (dev_sid, weak_dev) in &state.clipboard_state.devices {
-                        if dev_sid == &stage_id {
-                            if let Ok(dev) = weak_dev.upgrade() {
-                                if dev.id() != resource.id() {
+                // Advertise to other WlDataDevices within the SAME Stage immediately.
+                // Cross-stage and Windows propagation happen once the payload read finishes.
+                for (dev_sid, weak_dev) in &state.clipboard_state.devices {
+                    if dev_sid == &stage_id {
+                        if let Ok(dev) = weak_dev.upgrade() {
+                            if dev.id() != resource.id() {
+                                if let Some(ref src) = source {
                                     send_source_offer_to_device(dh, &dev, src.clone(), &mimes);
+                                } else {
+                                    dev.selection(None);
                                 }
                             }
                         }
+                    }
+                }
+
+                if let Some(xwm_id) = xwm_id {
+                    if let Some(wm) = state.xwms.get_mut(&xwm_id) {
+                        let x11_mimes = source.as_ref().map(|_| mimes.clone());
+                        let _ = wm.new_selection(
+                            smithay::wayland::selection::SelectionTarget::Clipboard,
+                            x11_mimes,
+                        );
                     }
                 }
             }
@@ -252,7 +323,7 @@ impl Dispatch<WlDataDevice, String> for FocusStageState {
     }
 }
 
-pub fn pick_text_mime(mimes: &[String]) -> Option<String> {
+pub fn pick_clipboard_mime(mimes: &[String]) -> Option<(String, ClipboardReadKind)> {
     for preferred in [
         "text/plain;charset=utf-8",
         "UTF8_STRING",
@@ -261,10 +332,27 @@ pub fn pick_text_mime(mimes: &[String]) -> Option<String> {
         "TEXT",
     ] {
         if mimes.iter().any(|m| m == preferred) {
-            return Some(preferred.to_string());
+            return Some((preferred.to_string(), ClipboardReadKind::Text));
         }
     }
-    mimes.iter().find(|m| m.starts_with("text/")).cloned()
+    if mimes.iter().any(|m| m == "image/png") {
+        return Some(("image/png".to_string(), ClipboardReadKind::ImagePng));
+    }
+    mimes
+        .iter()
+        .find(|m| m.starts_with("text/"))
+        .cloned()
+        .map(|m| (m, ClipboardReadKind::Text))
+}
+
+pub fn pick_text_mime(mimes: &[String]) -> Option<String> {
+    pick_clipboard_mime(mimes).and_then(|(m, kind)| {
+        if kind == ClipboardReadKind::Text {
+            Some(m)
+        } else {
+            None
+        }
+    })
 }
 
 fn create_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
@@ -276,20 +364,20 @@ fn create_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
-fn send_text_offer_to_device(dh: &DisplayHandle, device: &WlDataDevice, text: String) {
+fn send_content_offer_to_device(
+    dh: &DisplayHandle,
+    device: &WlDataDevice,
+    content: ClipboardContent,
+) {
     let Some(client) = device.client() else {
         return;
     };
-    let mimes = vec![
-        "text/plain;charset=utf-8".to_string(),
-        "UTF8_STRING".to_string(),
-        "text/plain".to_string(),
-    ];
+    let mimes = content.mime_types();
     let offer = match client.create_resource::<WlDataOffer, _, FocusStageState>(
         dh,
         device.version(),
         DataOfferUserData {
-            backend: OfferBackend::StaticText(text),
+            backend: OfferBackend::StaticContent(content),
             mime_types: mimes.clone(),
         },
     ) {
@@ -357,6 +445,15 @@ impl FocusStageState {
     }
 
     pub fn set_stage_clipboard_text(&mut self, stage_id: &str, text: String, from_host: bool) {
+        self.set_stage_clipboard_content(stage_id, Some(ClipboardContent::Text(text)), from_host);
+    }
+
+    pub fn set_stage_clipboard_content(
+        &mut self,
+        stage_id: &str,
+        content: Option<ClipboardContent>,
+        from_host: bool,
+    ) {
         let Some(stage) = self.stages.get_mut(stage_id) else {
             return;
         };
@@ -364,20 +461,27 @@ impl FocusStageState {
             // Agent/Frozen stage is isolated from host clipboard.
             return;
         }
-        stage.clipboard.text = Some(text.clone());
-        stage.clipboard.mime_types = vec![
-            "text/plain;charset=utf-8".to_string(),
-            "UTF8_STRING".to_string(),
-            "text/plain".to_string(),
-        ];
+        if let Some(old) = stage.clipboard.client_source.take() {
+            if old.is_alive() {
+                old.cancelled();
+            }
+        }
+        stage.clipboard.content = content.clone();
+        stage.clipboard.mime_types = content
+            .as_ref()
+            .map(ClipboardContent::mime_types)
+            .unwrap_or_default();
         stage.clipboard.seq = stage.clipboard.seq.saturating_add(1);
-        stage.clipboard.client_source = None;
+        stage.clipboard.x11_has_selection = false;
 
         // Push to Wayland devices of this stage
         for (dev_sid, weak_dev) in &self.clipboard_state.devices {
             if dev_sid == stage_id {
                 if let Ok(dev) = weak_dev.upgrade() {
-                    send_text_offer_to_device(&self.display_handle, &dev, text.clone());
+                    match &content {
+                        Some(c) => send_content_offer_to_device(&self.display_handle, &dev, c.clone()),
+                        None => dev.selection(None),
+                    }
                 }
             }
         }
@@ -385,44 +489,69 @@ impl FocusStageState {
         // Push to XWayland WM if this is an X11 stage
         if let Some(xwm_id) = stage.xwm_id {
             if let Some(wm) = self.xwms.get_mut(&xwm_id) {
+                let x11_mimes = content.as_ref().map(ClipboardContent::x11_mime_types);
                 let _ = wm.new_selection(
                     smithay::wayland::selection::SelectionTarget::Clipboard,
-                    Some(vec![
-                        "UTF8_STRING".to_string(),
-                        "text/plain;charset=utf-8".to_string(),
-                        "STRING".to_string(),
-                    ]),
+                    x11_mimes,
                 );
             }
         }
     }
 
-    pub fn handle_clipboard_update_from_stage(&mut self, stage_id: &str, text: String) {
-        let is_human = if let Some(stage) = self.stages.get_mut(stage_id) {
-            stage.clipboard.text = Some(text.clone());
+    pub fn handle_clipboard_update_from_stage(
+        &mut self,
+        stage_id: &str,
+        expected_seq: u64,
+        content: ClipboardContent,
+    ) {
+        let is_human = {
+            let Some(stage) = self.stages.get_mut(stage_id) else {
+                return;
+            };
+            if stage.clipboard.seq != expected_seq {
+                // Ignore stale async pipe read if a newer selection already replaced it.
+                return;
+            }
+            stage.clipboard.content = Some(content.clone());
             stage.clipboard.seq = stage.clipboard.seq.saturating_add(1);
             stage.input_owner == InputOwner::Human
-        } else {
-            false
         };
 
         if is_human {
-            if self.clipboard_state.latest_host_clipboard.as_deref() != Some(&text) {
-                self.clipboard_state.latest_host_clipboard = Some(text.clone());
+            // Propagate across other Human stages so Ctrl+C in one window pastes into another.
+            let other_human_ids: Vec<String> = self
+                .stages
+                .iter()
+                .filter(|(id, s)| id.as_str() != stage_id && s.input_owner == InputOwner::Human)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for sid in other_human_ids {
+                self.set_stage_clipboard_content(&sid, Some(content.clone()), true);
+            }
+
+            if self.clipboard_state.latest_host_clipboard.as_ref() != Some(&content) {
+                self.clipboard_state.latest_host_clipboard = Some(content.clone());
                 self.clipboard_state.host_clipboard_seq += 1;
                 // Push the selection to the desktop backend when one is connected.
                 if let Some(ref mut sink) = self.display_sink {
-                    sink.set_host_clipboard(&text);
+                    match &content {
+                        ClipboardContent::Text(text) => sink.set_host_clipboard(text),
+                        ClipboardContent::ImagePng(png) => sink.set_host_clipboard_image(png),
+                    }
                 }
             }
         }
     }
 
     pub fn sync_from_host_clipboard(&mut self, text: String) {
-        if self.clipboard_state.latest_host_clipboard.as_deref() == Some(&text) {
+        self.sync_from_host_clipboard_content(Some(ClipboardContent::Text(text)));
+    }
+
+    pub fn sync_from_host_clipboard_content(&mut self, content: Option<ClipboardContent>) {
+        if self.clipboard_state.latest_host_clipboard == content {
             return;
         }
-        self.clipboard_state.latest_host_clipboard = Some(text.clone());
+        self.clipboard_state.latest_host_clipboard = content.clone();
         self.clipboard_state.host_clipboard_seq += 1;
 
         let human_ids: Vec<String> = self
@@ -433,7 +562,7 @@ impl FocusStageState {
             .collect();
 
         for sid in human_ids {
-            self.set_stage_clipboard_text(&sid, text.clone(), true);
+            self.set_stage_clipboard_content(&sid, content.clone(), true);
         }
     }
 
@@ -521,5 +650,31 @@ impl FocusStageState {
         } else {
             Err(format!("Stage '{}' has no active wl_data_device", stage_id))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pick_clipboard_mime_prefers_plain_text_then_png_over_html() {
+        assert_eq!(
+            pick_clipboard_mime(&["text/html".into(), "image/png".into()]),
+            Some(("image/png".into(), ClipboardReadKind::ImagePng))
+        );
+        assert_eq!(
+            pick_clipboard_mime(&[
+                "text/html".into(),
+                "text/plain;charset=utf-8".into(),
+                "image/png".into(),
+            ]),
+            Some(("text/plain;charset=utf-8".into(), ClipboardReadKind::Text))
+        );
+        assert_eq!(
+            pick_clipboard_mime(&["text/plain".into(), "UTF8_STRING".into()]),
+            Some(("UTF8_STRING".into(), ClipboardReadKind::Text))
+        );
+        assert_eq!(pick_clipboard_mime(&["application/octet-stream".into()]), None);
     }
 }

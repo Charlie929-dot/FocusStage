@@ -1,8 +1,9 @@
 use std::io::Write;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::process::Stdio;
 
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
@@ -10,8 +11,9 @@ use smithay::xwayland::xwm::{Reorder, ResizeEdge, WmWindowProperty, X11Surface, 
 use smithay::xwayland::{XWayland, XWaylandEvent};
 use tracing::{debug, info, warn};
 
-use crate::clipboard::pick_text_mime;
-use crate::stage::StageToplevel;
+use crate::clipboard::{pick_clipboard_mime, ClipboardReadKind, MAX_CLIPBOARD_BYTES};
+use crate::protocol::InputOwner;
+use crate::stage::{ClipboardContent, StageToplevel};
 use crate::state::FocusStageState;
 
 pub(crate) fn hosted_x11_geometry(size: Size<i32, Logical>) -> Rectangle<i32, Logical> {
@@ -228,17 +230,24 @@ impl XwmHandler for FocusStageState {
         true
     }
 
-    fn send_selection(&mut self, xwm: XwmId, _selection: SelectionTarget, _mime_type: String, fd: OwnedFd) {
-        let text = self
-            .xwm_to_stage
-            .get(&xwm)
-            .and_then(|sid| self.stages.get(sid))
-            .and_then(|s| s.clipboard.text.clone())
-            .unwrap_or_default();
-        std::thread::spawn(move || {
-            let mut file = std::fs::File::from(fd);
-            let _ = file.write_all(text.as_bytes());
-        });
+    fn send_selection(&mut self, xwm: XwmId, _selection: SelectionTarget, mime_type: String, fd: OwnedFd) {
+        let Some(stage) = self.xwm_to_stage.get(&xwm).and_then(|sid| self.stages.get(sid)) else {
+            return;
+        };
+        if let Some(ref content) = stage.clipboard.content {
+            let bytes = match content {
+                ClipboardContent::Text(t) => t.as_bytes().to_vec(),
+                ClipboardContent::ImagePng(png) => png.clone(),
+            };
+            std::thread::spawn(move || {
+                let mut file = std::fs::File::from(fd);
+                let _ = file.write_all(&bytes);
+            });
+        } else if let Some(ref src) = stage.clipboard.client_source {
+            if src.is_alive() {
+                src.send(mime_type, fd.as_fd());
+            }
+        }
     }
 
     fn new_selection(&mut self, xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
@@ -248,13 +257,26 @@ impl XwmHandler for FocusStageState {
         let Some(stage_id) = self.xwm_to_stage.get(&xwm).cloned() else {
             return;
         };
-        let Some(mime) = pick_text_mime(&mime_types) else {
+        let Some((mime, kind)) = pick_clipboard_mime(&mime_types) else {
+            if let Some(stage) = self.stages.get_mut(&stage_id) {
+                stage.clipboard.x11_has_selection = true;
+                stage.clipboard.mime_types = mime_types;
+                stage.clipboard.content = None;
+                stage.clipboard.client_source = None;
+                stage.clipboard.seq = stage.clipboard.seq.saturating_add(1);
+            }
             return;
         };
-        if let Some(stage) = self.stages.get_mut(&stage_id) {
+        let expected_seq = if let Some(stage) = self.stages.get_mut(&stage_id) {
             stage.clipboard.x11_has_selection = true;
             stage.clipboard.mime_types = mime_types;
-        }
+            stage.clipboard.content = None;
+            stage.clipboard.client_source = None;
+            stage.clipboard.seq = stage.clipboard.seq.saturating_add(1);
+            stage.clipboard.seq
+        } else {
+            return;
+        };
         // Read selection content into StageClipboard asynchronously via pipe
         let (read_fd, write_fd) = match create_x11_pipe() {
             Ok(p) => p,
@@ -266,11 +288,18 @@ impl XwmHandler for FocusStageState {
                 let tx = self.clipboard_update_tx.clone();
                 std::thread::spawn(move || {
                     use std::io::Read;
-                    let mut file = std::fs::File::from(read_fd);
+                    let file = std::fs::File::from(read_fd);
                     let mut buf = Vec::new();
-                    let _ = file.read_to_end(&mut buf);
-                    if let Ok(text) = String::from_utf8(buf) {
-                        let _ = tx.send((stage_id, text));
+                    if file.take((MAX_CLIPBOARD_BYTES + 1) as u64).read_to_end(&mut buf).is_ok()
+                        && buf.len() <= MAX_CLIPBOARD_BYTES
+                    {
+                        let content = match kind {
+                            ClipboardReadKind::Text => String::from_utf8(buf).ok().map(ClipboardContent::Text),
+                            ClipboardReadKind::ImagePng => (!buf.is_empty()).then_some(ClipboardContent::ImagePng(buf)),
+                        };
+                        if let Some(content) = content {
+                            let _ = tx.send((stage_id, expected_seq, content));
+                        }
                     }
                 });
             }
@@ -352,8 +381,26 @@ impl FocusStageState {
                     XWaylandEvent::Ready { x11_socket, display_number } => {
                         info!("XWayland ready for {} on DISPLAY=:{}", sid_for_cb, display_number);
                         match X11Wm::start_wm(handle.clone(), x11_socket, client.clone()) {
-                            Ok(wm) => {
+                            Ok(mut wm) => {
                                 let xwm_id = wm.id();
+                                let host_content = state.clipboard_state.latest_host_clipboard.clone();
+                                let initial_x11_mimes = state.stages.get_mut(&sid_for_cb).and_then(|stage| {
+                                    if stage.clipboard.content.is_none()
+                                        && stage.clipboard.client_source.is_none()
+                                        && stage.clipboard.seq == 0
+                                        && stage.input_owner == InputOwner::Human
+                                    {
+                                        if let Some(content) = host_content {
+                                            stage.clipboard.content = Some(content.clone());
+                                            stage.clipboard.mime_types = content.mime_types();
+                                            stage.clipboard.seq = 1;
+                                        }
+                                    }
+                                    stage.clipboard.content.as_ref().map(ClipboardContent::x11_mime_types)
+                                });
+                                if let Some(mimes) = initial_x11_mimes {
+                                    let _ = wm.new_selection(SelectionTarget::Clipboard, Some(mimes));
+                                }
                                 state.xwms.insert(xwm_id, wm);
                                 state.xwm_to_stage.insert(xwm_id, sid_for_cb.clone());
                                 if let Some(stage) = state.stages.get_mut(&sid_for_cb) {

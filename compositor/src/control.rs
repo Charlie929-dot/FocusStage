@@ -426,7 +426,7 @@ impl FocusStageState {
             }
             ControlRequest::GetHostClipboard => {
                 let _ = reply_tx.send(ControlResponse::Clipboard {
-                    text: self.clipboard_state.latest_host_clipboard.clone(),
+                    text: self.clipboard_state.latest_host_text(),
                     seq: self.clipboard_state.host_clipboard_seq,
                 });
             }
@@ -838,7 +838,7 @@ impl FocusStageState {
         };
 
         ControlResponse::Clipboard {
-            text: stage.clipboard.text.clone(),
+            text: stage.clipboard.text(),
             seq: stage.clipboard.seq,
         }
     }

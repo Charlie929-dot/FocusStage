@@ -39,7 +39,8 @@ pub enum SinkInputEvent {
         window_id: String,
     },
     HostClipboardChanged {
-        text: String,
+        text: Option<String>,
+        image_png: Option<Vec<u8>>,
     },
     FilesDropped {
         window_id: String,
@@ -88,6 +89,7 @@ pub trait DisplaySink {
     fn minimize(&mut self, _window_id: &str) {}
     fn set_maximized(&mut self, _window_id: &str, _maximized: bool) {}
     fn set_host_clipboard(&mut self, _text: &str) {}
+    fn set_host_clipboard_image(&mut self, _png_bytes: &[u8]) {}
     fn activate(&mut self, _window_id: &str) {}
     fn open_web_url(&mut self, _url: &str) -> bool { false }
     fn event_fd(&self) -> Option<std::os::fd::OwnedFd> {

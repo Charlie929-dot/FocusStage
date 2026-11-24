@@ -11,6 +11,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -61,7 +62,10 @@ enum HostCommand<'a> {
         maximized: bool,
     },
     Clipboard {
-        text: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        image_png_base64: Option<&'a str>,
     },
     Activate {
         window_id: &'a str,
@@ -122,7 +126,10 @@ enum HostEvent {
         window_id: String,
     },
     HostClipboardChanged {
-        text: String,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        image_png_base64: Option<String>,
     },
     FilesDropped {
         window_id: String,
@@ -186,7 +193,18 @@ impl HostEvent {
                 pressed,
             },
             Self::CloseRequested { window_id } => Input::CloseRequested { window_id },
-            Self::HostClipboardChanged { text } => Input::HostClipboardChanged { text },
+            Self::HostClipboardChanged {
+                text,
+                image_png_base64,
+            } => {
+                let image_png = image_png_base64.and_then(|b64| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .map_err(|err| warn!("Invalid host clipboard PNG base64: {err}"))
+                        .ok()
+                });
+                Input::HostClipboardChanged { text, image_png }
+            }
             Self::FilesDropped {
                 window_id,
                 paths,
@@ -427,7 +445,18 @@ impl DisplaySink for NativeSink {
     }
 
     fn set_host_clipboard(&mut self, text: &str) {
-        self.command(HostCommand::Clipboard { text });
+        self.command(HostCommand::Clipboard {
+            text: Some(text),
+            image_png_base64: None,
+        });
+    }
+
+    fn set_host_clipboard_image(&mut self, png_bytes: &[u8]) {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png_bytes);
+        self.command(HostCommand::Clipboard {
+            text: None,
+            image_png_base64: Some(&encoded),
+        });
     }
 
     fn activate(&mut self, window_id: &str) {
