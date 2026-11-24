@@ -7,7 +7,7 @@ use smithay::utils::{Logical, Point, Rectangle, Size};
 use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{Reorder, ResizeEdge, WmWindowProperty, X11Surface, X11Wm, XwmId, XwmHandler};
-use smithay::xwayland::{XWayland, XWaylandEvent};
+use smithay::xwayland::{XWayland, XWaylandClientData, XWaylandEvent};
 use tracing::{debug, info, warn};
 
 use crate::clipboard::pick_text_mime;
@@ -327,11 +327,14 @@ fn create_x11_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
 
 impl FocusStageState {
     pub fn spawn_xwayland_for_stage(&mut self, stage_id: String) -> Result<(), String> {
-        let dh = self.display_handle.clone();
+        let stage = self.stages.get_mut(&stage_id).ok_or("Stage no longer exists")?;
+        let scale = stage.default_scale;
+        let driver = stage.launch_env.get("GALLIUM_DRIVER").map(std::ffi::OsString::from)
+            .or_else(crate::manager::wsl_gallium_driver);
         let (xwayland, client) = XWayland::spawn(
-            &dh,
+            &self.display_handle,
             None,
-            std::iter::empty::<(String, String)>(),
+            driver.map(|driver| ("GALLIUM_DRIVER", driver)),
             true,
             Stdio::null(),
             Stdio::null(),
@@ -339,9 +342,10 @@ impl FocusStageState {
         )
         .map_err(|e| format!("spawn XWayland: {e}"))?;
 
-        if let Some(stage) = self.stages.get_mut(&stage_id) {
-            stage.xwayland_client = Some(client.clone());
-        }
+        // X11 windows and their buffers use physical pixels. Smithay maps their
+        // geometry and pointer coordinates to the compositor's logical space.
+        client.get_data::<XWaylandClientData>().unwrap().compositor_state.set_client_scale(scale);
+        stage.xwayland_client = Some(client.clone());
 
         let handle = self.loop_handle.clone();
         let sid_for_cb = stage_id.clone();
@@ -352,7 +356,11 @@ impl FocusStageState {
                     XWaylandEvent::Ready { x11_socket, display_number } => {
                         info!("XWayland ready for {} on DISPLAY=:{}", sid_for_cb, display_number);
                         match X11Wm::start_wm(handle.clone(), x11_socket, client.clone()) {
-                            Ok(wm) => {
+                            Ok(mut wm) => {
+                                let dpi = (96.0 * 1024.0 * scale).round() as i32;
+                                if let Err(err) = wm.set_xsettings([("Xft/DPI".into(), dpi.into())].into_iter()) {
+                                    warn!(stage = sid_for_cb, "Could not set X11 DPI: {err}");
+                                }
                                 let xwm_id = wm.id();
                                 state.xwms.insert(xwm_id, wm);
                                 state.xwm_to_stage.insert(xwm_id, sid_for_cb.clone());

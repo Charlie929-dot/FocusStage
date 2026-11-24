@@ -352,9 +352,6 @@ fn main() -> anyhow::Result<()> {
         state.popups.cleanup();
         state.virtual_outputs.cleanup();
 
-        let frame_done = state.display_sink.as_mut()
-            .map(|sink| sink.take_frame_done_windows()).unwrap_or_default();
-
         let mut desktop_dirty = Vec::new();
         if let Some(sink) = state.display_sink.as_ref() {
             for stage in state.stages.values().filter(|s| s.display == DisplayState::Desktop) {
@@ -381,25 +378,16 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Hidden and idle windows still receive frame callbacks on the compositor timer.
-        let is_tick = tick_due.replace(false);
-        if is_tick || !frame_done.is_empty() {
+        // Let clients prepare the next frame while the host receives the previous one.
+        // The pending check above still bounds transport to one frame per window.
+        if tick_due.replace(false) {
             let now_ms = state.now_ms();
-            let surfaces: Vec<_> = state.stages.values().flat_map(|stage| {
-                let sink = state.display_sink.as_ref();
-                let frame_done = &frame_done;
-                stage.windows.iter().filter(move |w| {
-                    if stage.display == DisplayState::Hidden || !w.mapped {
-                        return is_tick;
+            for window in state.stages.values().flat_map(|stage| &stage.windows) {
+                if let Some(surface) = window.toplevel.wl_surface() {
+                    send_frames_surface_tree(&surface, now_ms);
+                    for (popup, _) in PopupManager::popups_for_surface(&surface) {
+                        send_frames_surface_tree(popup.wl_surface(), now_ms);
                     }
-                    !sink.is_some_and(|sink| sink.is_frame_pending(&w.id))
-                        && (is_tick || frame_done.contains(&w.id))
-                }).filter_map(|w| w.toplevel.wl_surface())
-            }).collect();
-            for surf in surfaces {
-                send_frames_surface_tree(&surf, now_ms);
-                for (popup, _) in PopupManager::popups_for_surface(&surf) {
-                    send_frames_surface_tree(popup.wl_surface(), now_ms);
                 }
             }
         }

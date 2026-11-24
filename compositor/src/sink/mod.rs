@@ -96,8 +96,5 @@ pub trait DisplaySink {
     fn is_frame_pending(&self, _window_id: &str) -> bool {
         false
     }
-    fn take_frame_done_windows(&mut self) -> Vec<String> {
-        Vec::new()
-    }
     fn poll_events(&mut self) -> Vec<SinkInputEvent>;
 }

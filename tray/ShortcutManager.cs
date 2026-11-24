@@ -529,6 +529,49 @@ internal static class ShortcutManager
         }
     }
 
+    public static async Task<(bool Ok, string Message)> UninstallAppAsync(string distro, string appId)
+    {
+        var (code, stdout, stderr) = await RunWslAsync(
+            distro,
+            false,
+            180,
+            "/usr/local/bin/focusstage",
+            "--json",
+            "uninstall-app",
+            "--app-id",
+            appId);
+
+        if (string.IsNullOrWhiteSpace(stdout))
+        {
+            return (false, !string.IsNullOrWhiteSpace(stderr)
+                ? stderr
+                : $"focusstage uninstall-app exited {code} without output");
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(stdout);
+            var root = doc.RootElement;
+            var status = root.TryGetProperty("status", out var statusEl) && statusEl.ValueKind == JsonValueKind.String
+                ? statusEl.GetString() ?? ""
+                : "";
+            var message = root.TryGetProperty("message", out var messageEl) && messageEl.ValueKind == JsonValueKind.String
+                ? messageEl.GetString() ?? ""
+                : "";
+            var ok = code == 0 && string.Equals(status, "ok", StringComparison.OrdinalIgnoreCase);
+            if (ok)
+            {
+                return (true, string.IsNullOrWhiteSpace(message) ? "应用已卸载。" : message);
+            }
+            if (!string.IsNullOrWhiteSpace(message)) return (false, message);
+            return (false, string.IsNullOrWhiteSpace(stderr) ? $"卸载失败（退出码 {code}）" : stderr);
+        }
+        catch (JsonException ex)
+        {
+            return (false, string.IsNullOrWhiteSpace(stderr) ? $"无法解析卸载结果：{ex.Message}" : stderr);
+        }
+    }
+
     public static Task<(int ExitCode, string Stdout, string Stderr)> RunWslAsync(string distro, bool asRoot, params string[] args)
         => RunWslAsync(distro, asRoot, 15, args);
 

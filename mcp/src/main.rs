@@ -11,6 +11,8 @@ use focusstage_compositor::protocol::{
 };
 use focusstage_mcp::{apps::discover_desktop_apps, run_mcp_stdio};
 
+mod uninstall;
+
 #[derive(Debug, Parser)]
 #[command(name = "focusstage", about = "FocusStage CLI & MCP stdio bridge")]
 struct Cli {
@@ -70,6 +72,11 @@ enum Commands {
     },
     /// List discovered Linux GUI applications from .desktop entries
     ListApps,
+    /// Uninstall a Linux application or delete a downloaded installer
+    UninstallApp {
+        #[arg(long)]
+        app_id: String,
+    },
     /// Generate FocusStage wrapper .desktop entries for Linux GUI apps
     SyncApps {
         /// Remove previously generated focusstage-*.desktop wrappers
@@ -198,6 +205,10 @@ fn main() -> anyhow::Result<()> {
         return run_list_apps(cli.json);
     }
 
+    if let Commands::UninstallApp { app_id } = &cli.command {
+        return uninstall::run(app_id, cli.json);
+    }
+
     if let Commands::SyncApps { remove, out_dir } = cli.command {
         let target_dir = out_dir.unwrap_or_else(default_sync_apps_dir);
         return run_sync_apps(&target_dir, remove, cli.json);
@@ -269,7 +280,10 @@ fn main() -> anyhow::Result<()> {
             if !ok { std::process::exit(1); }
             return Ok(());
         }
-        Commands::ListApps | Commands::SyncApps { .. } | Commands::Settings { .. } => unreachable!(),
+        Commands::ListApps
+        | Commands::SyncApps { .. }
+        | Commands::Settings { .. }
+        | Commands::UninstallApp { .. } => unreachable!(),
         Commands::Close { stage_id } => ControlRequest::Close { stage_id },
         Commands::Acquire {
             stage_id,

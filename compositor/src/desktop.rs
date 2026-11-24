@@ -1,7 +1,38 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
 
 pub const WRAPPER_PREFIX: &str = "focusstage-";
+
+/// Resolve the Windows user profile that owns this WSL session (e.g. `/mnt/c/Users/HP`).
+///
+/// WSL does not tell Linux processes which Windows user started the distro, so ask
+/// `powershell.exe` instead of guessing a directory under `/mnt/c/Users`.
+pub fn windows_user_home() -> Option<PathBuf> {
+    static HOME: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(home) = HOME.get() {
+        return Some(home.clone());
+    }
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; [Environment]::GetFolderPath('UserProfile')",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let profile = String::from_utf8(output.stdout).ok()?;
+    let profile = profile.trim().trim_start_matches('\u{feff}');
+    let home = PathBuf::from(crate::protocol::windows_path_to_wsl(profile));
+    if !home.is_dir() {
+        return None;
+    }
+    Some(HOME.get_or_init(|| home).clone())
+}
 
 #[derive(Debug)]
 pub struct DesktopEntry {

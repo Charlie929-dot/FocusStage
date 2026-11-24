@@ -111,8 +111,20 @@ internal sealed class StageDto
     [JsonPropertyName("input_owner")]
     public InputOwnerDto InputOwner { get; set; } = new();
 
+    [JsonPropertyName("size")]
+    public int[]? Size { get; set; }
+
     [JsonPropertyName("frame_seq")]
     public ulong FrameSeq { get; set; }
+
+    [JsonPropertyName("has_surface")]
+    public bool HasSurface { get; set; }
+
+    [JsonPropertyName("scale")]
+    public double Scale { get; set; } = 1.0;
+
+    [JsonPropertyName("wm_class")]
+    public string? WmClass { get; set; }
 }
 
 internal sealed class InputOwnerDto
@@ -190,6 +202,21 @@ internal sealed class FocusStageTrayContext : ApplicationContext
 
     public bool DaemonAlive => _daemonAlive;
     public List<StageDto> CurrentStages => _stages;
+    public bool HotkeyRegistered => _hotkeyWindow.Registered;
+    public bool ClipboardSyncEnabled
+    {
+        get => _clipboardSyncEnabled;
+        set
+        {
+            if (_clipboardSyncEnabled == value) return;
+            _clipboardSyncEnabled = value;
+            BuildMenu();
+            if (_launcherForm is not null && !_launcherForm.IsDisposed)
+            {
+                _launcherForm.UpdateDaemonAndStages(_daemonAlive, _stages);
+            }
+        }
+    }
 
     public FocusStageTrayContext(string distro, bool startMinimized, EventWaitHandle showEvent)
     {
@@ -391,7 +418,14 @@ internal sealed class FocusStageTrayContext : ApplicationContext
             Checked = _clipboardSyncEnabled,
             CheckOnClick = true
         };
-        clipToggle.CheckedChanged += (_, _) => _clipboardSyncEnabled = clipToggle.Checked;
+        clipToggle.CheckedChanged += (_, _) =>
+        {
+            _clipboardSyncEnabled = clipToggle.Checked;
+            if (_launcherForm is not null && !_launcherForm.IsDisposed)
+            {
+                _launcherForm.UpdateDaemonAndStages(_daemonAlive, _stages);
+            }
+        };
         _menu.Items.Add(clipToggle);
 
         var daemonMenu = new ToolStripMenuItem("Daemon");
