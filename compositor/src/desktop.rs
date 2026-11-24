@@ -1,7 +1,38 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
 
 pub const WRAPPER_PREFIX: &str = "focusstage-";
+
+/// Resolve the Windows user profile that owns this WSL session (e.g. `/mnt/c/Users/HP`).
+///
+/// WSL does not tell Linux processes which Windows user started the distro, so ask
+/// `powershell.exe` instead of guessing a directory under `/mnt/c/Users`.
+pub fn windows_user_home() -> Option<PathBuf> {
+    static HOME: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(home) = HOME.get() {
+        return Some(home.clone());
+    }
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; [Environment]::GetFolderPath('UserProfile')",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let profile = String::from_utf8(output.stdout).ok()?;
+    let profile = profile.trim().trim_start_matches('\u{feff}');
+    let home = PathBuf::from(crate::protocol::windows_path_to_wsl(profile));
+    if !home.is_dir() {
+        return None;
+    }
+    Some(HOME.get_or_init(|| home).clone())
+}
 
 #[derive(Debug)]
 pub struct DesktopEntry {
@@ -104,7 +135,7 @@ pub fn parse(text: &str) -> Option<DesktopEntry> {
             .filter(|value| !value.is_empty())
             .map(|value| (*value).to_owned())
     };
-    if fields.get("TryExec").is_some_and(|value| !value.is_empty() && !try_exec_available(value)) {
+    if fields.get("TryExec").is_some_and(|value| !value.is_empty() && !command_available(value)) {
         return None;
     }
     let mut exec = split_exec(fields.get("Exec")?).into_iter();
@@ -130,7 +161,7 @@ pub fn parse(text: &str) -> Option<DesktopEntry> {
     })
 }
 
-fn try_exec_available(executable: &str) -> bool {
+pub fn command_available(executable: &str) -> bool {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -144,9 +175,24 @@ fn try_exec_available(executable: &str) -> bool {
     if path.is_absolute() {
         return is_executable(path);
     }
-    path.file_name() == Some(path.as_os_str()) && std::env::var_os("PATH").is_some_and(|search| {
-        std::env::split_paths(&search).any(|dir| is_executable(&dir.join(path)))
-    })
+    if path.file_name() != Some(path.as_os_str()) {
+        return false;
+    }
+    if std::env::var_os("PATH")
+        .is_some_and(|search| std::env::split_paths(&search).any(|dir| is_executable(&dir.join(path))))
+    {
+        return true;
+    }
+    let mut extra_dirs = vec![
+        PathBuf::from("/snap/bin"),
+        PathBuf::from("/var/lib/flatpak/exports/bin"),
+    ];
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        extra_dirs.push(PathBuf::from(home).join(".local/bin"));
+    }
+    extra_dirs
+        .into_iter()
+        .any(|dir| is_executable(&dir.join(path)))
 }
 
 fn split_exec(s: &str) -> Vec<String> {
@@ -259,6 +305,7 @@ pub fn discover(dirs: &[PathBuf]) -> BTreeMap<String, (PathBuf, DesktopEntry)> {
             if let Some(app) = std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|text| parse(&text))
+                .filter(|app| command_available(&app.cmd))
             {
                 apps.insert(id.to_owned(), (path, app));
             }
@@ -294,5 +341,42 @@ mod tests {
             ["--open-url", "editor://example?value=a&b='c'"]
         );
         assert!(parse(&format!("{text}Hidden=true\n")).is_none());
+    }
+
+    #[test]
+    fn discover_skips_entries_with_missing_or_non_executable_cmd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exec_file = dir.path().join("real-app");
+        std::fs::write(&exec_file, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exec_file, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let non_exec = dir.path().join("non-exec-app");
+        std::fs::write(&non_exec, b"data").unwrap();
+
+        std::fs::write(
+            dir.path().join("valid.desktop"),
+            format!("[Desktop Entry]\nType=Application\nName=Valid\nExec={} %U\n", exec_file.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("missing.desktop"),
+            format!(
+                "[Desktop Entry]\nType=Application\nName=Missing\nExec={}\n",
+                dir.path().join("does-not-exist").display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("nonexec.desktop"),
+            format!("[Desktop Entry]\nType=Application\nName=NonExec\nExec={}\n", non_exec.display()),
+        )
+        .unwrap();
+
+        let discovered = discover(&[dir.path().to_path_buf()]);
+        assert!(discovered.contains_key("valid"));
+        assert!(!discovered.contains_key("missing"));
+        assert!(!discovered.contains_key("nonexec"));
     }
 }

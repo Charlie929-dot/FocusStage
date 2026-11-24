@@ -484,6 +484,17 @@ fn sync_handlers(
         let content = format!("[Desktop Entry]\nType=Application\nName={name} (FocusStage)\nNoDisplay=true\nTerminal=false\nExec=/usr/local/bin/focusstage-open --handler {id} -- %U\nMimeType={mime_types};\n");
         write_atomic(&apps.join(filename), content.as_bytes())?;
     }
+    if let Ok(entries) = fs::read_dir(&apps) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with(HANDLER_PREFIX)
+                    && name.ends_with(".desktop")
+                    && !wrappers.contains_key(name)
+            }) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
     update_database(&apps)?;
 
     let defaults = associations(text);

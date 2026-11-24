@@ -40,23 +40,6 @@ pub(crate) fn resolve_app<'a>(
     }
 }
 
-fn detect_windows_user_dir_for_apps() -> Option<PathBuf> {
-    if let Ok(entries) = std::fs::read_dir("/mnt/c/Users") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let s = name.to_string_lossy();
-            if matches!(s.as_ref(), "Public" | "Default" | "Default User" | "All Users") {
-                continue;
-            }
-            let path = entry.path();
-            if path.join("Downloads").is_dir() && path.join("Desktop").is_dir() {
-                return Some(path);
-            }
-        }
-    }
-    None
-}
-
 pub fn discover_desktop_apps() -> Vec<DiscoveredDesktopApp> {
     let scan_dirs = desktop::launcher_application_dirs();
     let mut download_dirs = Vec::new();
@@ -65,7 +48,7 @@ pub fn discover_desktop_apps() -> Vec<DiscoveredDesktopApp> {
             download_dirs.push(PathBuf::from(&home).join("Downloads"));
         }
     }
-    if let Some(win_home) = detect_windows_user_dir_for_apps() {
+    if let Some(win_home) = desktop::windows_user_home() {
         download_dirs.push(win_home.join("Downloads"));
     }
 

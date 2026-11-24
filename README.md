@@ -29,18 +29,18 @@ Windows 11
   AI Agent ──MCP(stdio)──► wsl.exe -e focusstage mcp
   FocusStage.exe（UI 壳 + 原生宿主）
    · 图形化启动器：应用网格 / 文件夹 / 快捷方式同步 / 系统应用中心入口
-   · 内置系统软件（设置与舞台监视）：Stage 状态 / AI 租约 / 一键接管与显隐
-   · 托盘后台常驻：全局接管热键
+   · 设置与舞台监视（向内置系统软件演进）：Linux 默认应用与协议关联 / 守护进程管理 / Stage 状态、AI 租约与一键接管显隐
+   · 托盘后台常驻：全局接管热键 / 动态浏览器快速启动 / 剪贴板同步开关
    · --window-host：每个 Linux 顶层窗口对应一个无标题栏 Win32 HWND
              ▲ BGRA 帧（WSL 互操作 stdio）▼ 键鼠、窗口状态和 DPI
 WSL2
   focusstaged (Rust + Smithay)
     Stage Manager · Router(虚拟焦点+租约) · Offscreen Core
-    Clipboard · A11y(AT-SPI) · DisplaySink(NativeSink)
+    Clipboard · A11y(AT-SPI) · XDG 协议路由 & 图标主题 · DisplaySink(NativeSink)
   focusstage mcp (Rust)
     默认返回原图，支持坐标操作；传入 som: true 可开启 SoM 控件打标
         │
-        ├─ Chromium / Electron 应用 (Wayland)
+        ├─ Wayland / Chromium / Electron / Gecko 应用
         └─ X11 应用 (每个 Stage 一个 rootless Xwayland)
 ```
 
@@ -64,7 +64,7 @@ WSL2
 | **M1** | MCP 接入，AI 在后台并发操作多个 Stage | 已实现并验证 |
 | **M2** | 嵌套 WSLg 显示到桌面，打通「桌面 ↔ 后台 ↔ 原位恢复」 | 已实现（已转向原生宿主） |
 | **M3** | 剪贴板互通、中文输入（`text-input-v3` / Fcitx5）、高 DPI、文件拖放与启动器 | 已实现并验证 |
-| **M4** | 原生 Win32 无标题栏宿主、显示后端单轨化、通用进程生命周期与内置 Stage 系统控制界面 | 进行中（原生宿主和显示后端收敛已完成） |
+| **M4** | 原生 Win32 无标题栏宿主、显示后端单轨化、通用进程生命周期、XDG 互启与 MCP 工作流、内置 Stage 系统控制界面 | 进行中（仅剩内置 Stage 控制中心独立成形） |
 | M5 | 脱离 Windows 独立开机 | 远期 |
 
 ---
@@ -73,7 +73,7 @@ WSL2
 
 ### 1. 一键安装（推荐）
 
-在 Windows PowerShell 中运行安装器，会自动构建并安装 WSL2 端（`focusstaged` / `focusstage` / `focusstage-launch`）、发布 Windows 启动器与托盘程序 `FocusStage.exe` 到 `%LOCALAPPDATA%\FocusStage`，并同步所有 Linux 应用到 Windows 开始菜单及桌面入口：
+在 Windows PowerShell 中运行安装器，会自动构建并安装 WSL2 端（`focusstaged` / `focusstage` / `focusstage-launch` / `focusstage-open`）及所需 Linux 桌面组件（`policykit-1-gnome`、`gnome-keyring`、`xdg-desktop-portal-gtk`、`xwayland`、`fonts-noto-cjk` 等），发布 Windows 启动器与托盘程序 `FocusStage.exe` 到 `%LOCALAPPDATA%\FocusStage` 并校验登记原生窗口宿主，初始化 Linux 协议关联，同时同步所有 Linux 应用到 Windows 开始菜单及桌面入口：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/install.ps1
@@ -81,9 +81,9 @@ powershell -ExecutionPolicy Bypass -File scripts/install.ps1
 
 安装完成后：
 - 双击桌面或开始菜单中的 **FocusStage** 打开统一应用启动器（关闭窗口会自动缩回右下角托盘）。
-- 开始菜单 `Programs\FocusStage\` 下会自动生成全部 Linux 应用的独立快捷方式（带图标），可右键“固定到开始屏幕”或“固定到任务栏”。
-- 安装器会把 `focusstage` 注册到 Windows 用户的 Claude Code MCP 配置 `~/.claude.json`，使用 `-Distro` 指定的 WSL 发行版，默认是 Ubuntu。MCP 注册需要该发行版中的 `python3`。加 `-SkipMcpConfig` 可跳过注册。
-- 运行 `powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1` 会卸载 FocusStage 并移除其用户级 MCP 条目。
+- 开始菜单 `Programs\FocusStage\` 下会自动生成全部 Linux 应用的独立快捷方式（按 Linux 图标主题解析并带图标），可右键“固定到开始屏幕”或“固定到任务栏”。
+- 安装器会把 `focusstage` 注册到 Windows 用户的 Claude Code MCP 配置 `~/.claude.json`，使用 `-Distro` 指定的 WSL 发行版，默认是 `Ubuntu`。MCP 注册需要该发行版中的 `python3`。可选开关：`-SkipRustBuild`、`-NoLaunch`、`-SkipMcpConfig`。
+- 运行 `powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1` 会卸载 FocusStage、清理协议关联与快捷方式并移除其用户级 MCP 条目。
 
 ### 2. 手动构建与 CLI / MCP 用法
 
@@ -92,23 +92,32 @@ cargo build --workspace --release
 sudo install -m 755 target/release/focusstaged /usr/local/bin/focusstaged
 sudo install -m 755 target/release/focusstage /usr/local/bin/focusstage
 sudo install -m 755 scripts/focusstage-launch /usr/local/bin/focusstage-launch
+sudo install -m 755 scripts/focusstage-open /usr/local/bin/focusstage-open
 
-# 为每个 Linux 应用生成 FocusStage 桌面入口，使 Win11 开始菜单 / 任务栏固定直接走 FocusStage
+# 为每个 Linux 应用生成 FocusStage 桌面入口，并初始化用户级默认应用与协议关联
 sudo focusstage sync-apps
+focusstage settings init-defaults
 
-# 列出已发现的 Linux GUI 应用（含图标路径）
+# 列出已发现的 Linux GUI 应用（含按 Linux 图标主题解析的图标路径）
 focusstage --json list-apps
 
-# 启动不同类型 Stage（加 --ensure-daemon 自动拉起守护进程）
+# 卸载已发现的 Linux 应用（apt/snap/flatpak），或删除下载目录里的 .deb/.AppImage 安装包
+focusstage --json uninstall-app --app-id <focusstage-...>
+
+# 启动不同类型 Stage（--kind 支持 wayland / chromium / electron / gecko / x11；加 --ensure-daemon 自动拉起守护进程）
 focusstage launch --ensure-daemon foot
 focusstage launch --ensure-daemon --kind x11 xterm
 focusstage launch --ensure-daemon --kind chromium chromium
+
+# 通过 FocusStage 路由链接或查看当前 Linux 系统设置
+focusstage open --ensure-daemon https://example.com
+focusstage settings get
 
 # MCP 客户端入口（stdio）
 wsl.exe -d Ubuntu -e /usr/local/bin/focusstage mcp
 ```
 
-手动安装时，可以把以下配置保存为仓库根目录的 `.mcp.json`。使用其他 WSL 发行版时，把 `Ubuntu` 替换为对应名称。
+仓库根目录已提供项目级 `.mcp.json`；使用非 `Ubuntu` 的 WSL 发行版时，将其中的 `Ubuntu` 替换为对应名称即可。
 
 ```json
 {
@@ -140,7 +149,7 @@ dotnet run --project tray/FocusStageTray.csproj -c Release
 
 安装器会在所选 WSL 发行版中登记 Windows 宿主。`focusstaged` 启动时连接原生 Win32 宿主，宿主不可用或显式传入 `--headless` 时进入离屏模式。可用 `focusstaged --native-host <WSL 中的 FocusStage.exe 路径>` 测试开发版本。`focusstage --json ping` 的 `desktop_active` 表示原生宿主是否已连接。
 
-原生窗口保留 Linux 应用自己的标题控件，不叠加 Windows 标题栏。每个 Stage 可以有多个独立窗口，任务栏按 Stage 分组；关闭宿主窗口只向对应的 Linux 窗口发关闭请求，在内置系统控制面板（或托盘）中「关闭 Stage」仍是结束整个 Stage。跨显示器移动时，支持 `wp_fractional_scale_v1` 的 Wayland 客户端会收到该窗口的 DPI 更新；X11 客户端仍由 XWayland 路径缩放。
+原生窗口保留 Linux 应用自己的标题控件（支持 Wayland 客户端标题栏拖动与缩放，新窗口默认居中），不叠加 Windows 标题栏。每个 Stage 可以有多个独立窗口，任务栏按 Stage 分组；关闭宿主窗口只向对应的 Linux 窗口发关闭请求，在设置面板（或托盘菜单）中「关闭」仍是结束整个 Stage。跨显示器移动时，支持 `wp_fractional_scale_v1` 的 Wayland 客户端会收到该窗口的 DPI 更新；X11 客户端仍由 XWayland 路径缩放。托盘的「Quick Launch Stage」会按当前已安装的 Linux 浏览器动态生成快捷项，并支持保留带引号参数的自定义命令。
 
 启动器的 **设置 → Linux 系统设置** 可选择默认浏览器和终端、同步用户级协议关联。Linux 应用通过 `xdg-open`、`gio open` 或 `focusstage open --ensure-daemon <URI>` 打开链接时，会复用已有的 Human Stage，或者启动目标应用。目标 Stage 被 Agent 租用、冻结或无法唯一确定时会返回错误。Windows 默认浏览器选项只接收 HTTP(S)。需要处理 `vscode://` 等 Linux 应用回调时，请使用 Linux 浏览器。
 
@@ -156,10 +165,11 @@ Chromium、Electron 和 Gecko 使用各自的 WSL 用户配置目录，关闭并
 FocusStage/
 ├── README.md        # 项目概述与快速开始
 ├── DESIGN.md        # 架构设计与收敛路线
-├── compositor/      # [WSL2] focusstaged：Rust + Smithay 合成器、Router、Stage Manager、DisplaySink
+├── .mcp.json        # 项目级 MCP 配置示例
+├── compositor/      # [WSL2] focusstaged：Rust + Smithay 合成器、Router、Stage Manager、XDG/图标解析、DisplaySink
 ├── mcp/             # [WSL2] focusstage：CLI 与 MCP 服务（通过 wsl.exe stdio 对外）
-├── tray/            # [Win11] .NET 8 交互壳：图形化启动器、内置系统信息/控制界面、托盘热键与原生 Win32 宿主
-└── scripts/         # 安装 / 卸载与启动辅助脚本
+├── tray/            # [Win11] .NET 8 交互壳：图形化启动器、设置与 Stage 监视、托盘热键与原生 Win32 宿主
+└── scripts/         # 安装 / 卸载、MCP 注册与启动/协议打开辅助脚本
 ```
 
 ---

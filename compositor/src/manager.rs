@@ -535,8 +535,8 @@ fn apply_common_stage_env(cmd: &mut Command, wayland_socket: &str, x11_display: 
         cmd.env("XMODIFIERS", "@im=fcitx");
     }
 
-    // Redirect XDG User Dirs to Windows user directories when /mnt/c/Users/<user> exists
-    if let Some(win_home) = detect_windows_user_dir() {
+    // Redirect XDG User Dirs to the Windows user profile that owns this WSL session.
+    if let Some(win_home) = crate::desktop::windows_user_home() {
         for (var, sub) in [
             ("XDG_DESKTOP_DIR", "Desktop"),
             ("XDG_DOWNLOAD_DIR", "Downloads"),
@@ -566,23 +566,6 @@ fn apply_stage_opener_env(cmd: &mut Command, inherited: impl Fn(&str) -> Option<
             cmd.env(key, fallback);
         }
     }
-}
-
-fn detect_windows_user_dir() -> Option<PathBuf> {
-    if let Ok(entries) = std::fs::read_dir("/mnt/c/Users") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let s = name.to_string_lossy();
-            if matches!(s.as_ref(), "Public" | "Default" | "Default User" | "All Users") {
-                continue;
-            }
-            let path = entry.path();
-            if path.join("Downloads").is_dir() && path.join("Desktop").is_dir() {
-                return Some(path);
-            }
-        }
-    }
-    None
 }
 
 fn read_process(pid: u32) -> Option<(u32, bool)> {

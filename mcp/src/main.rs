@@ -11,6 +11,8 @@ use focusstage_compositor::protocol::{
 };
 use focusstage_mcp::{apps::discover_desktop_apps, run_mcp_stdio};
 
+mod uninstall;
+
 #[derive(Debug, Parser)]
 #[command(name = "focusstage", about = "FocusStage CLI & MCP stdio bridge")]
 struct Cli {
@@ -70,6 +72,11 @@ enum Commands {
     },
     /// List discovered Linux GUI applications from .desktop entries
     ListApps,
+    /// Uninstall a Linux application or delete a downloaded installer
+    UninstallApp {
+        #[arg(long)]
+        app_id: String,
+    },
     /// Generate FocusStage wrapper .desktop entries for Linux GUI apps
     SyncApps {
         /// Remove previously generated focusstage-*.desktop wrappers
@@ -198,6 +205,10 @@ fn main() -> anyhow::Result<()> {
         return run_list_apps(cli.json);
     }
 
+    if let Commands::UninstallApp { app_id } = &cli.command {
+        return uninstall::run(app_id, cli.json);
+    }
+
     if let Commands::SyncApps { remove, out_dir } = cli.command {
         let target_dir = out_dir.unwrap_or_else(default_sync_apps_dir);
         return run_sync_apps(&target_dir, remove, cli.json);
@@ -269,7 +280,10 @@ fn main() -> anyhow::Result<()> {
             if !ok { std::process::exit(1); }
             return Ok(());
         }
-        Commands::ListApps | Commands::SyncApps { .. } | Commands::Settings { .. } => unreachable!(),
+        Commands::ListApps
+        | Commands::SyncApps { .. }
+        | Commands::Settings { .. }
+        | Commands::UninstallApp { .. } => unreachable!(),
         Commands::Close { stage_id } => ControlRequest::Close { stage_id },
         Commands::Acquire {
             stage_id,
@@ -582,7 +596,10 @@ fn run_sync_apps(out_dir: &std::path::Path, remove: bool, json_mode: bool) -> an
             for entry in entries.flatten() {
                 let p = entry.path();
                 if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                    if name.starts_with("focusstage-") && name.ends_with(".desktop") {
+                    if name.starts_with("focusstage-")
+                        && !name.starts_with("focusstage-handler-")
+                        && name.ends_with(".desktop")
+                    {
                         std::fs::remove_file(&p)?;
                         removed.push(p.display().to_string());
                     }
@@ -603,13 +620,16 @@ fn run_sync_apps(out_dir: &std::path::Path, remove: bool, json_mode: bool) -> an
 
     std::fs::create_dir_all(out_dir)?;
     let mut created = Vec::new();
+    let mut kept = std::collections::HashSet::new();
     for app in discover_desktop_apps() {
         if app.source != "desktop" {
             continue;
         }
         let parsed = &app.parsed;
         let wrapper_id = &app.wrapper_id;
-        let wrapper_path = out_dir.join(format!("{wrapper_id}.desktop"));
+        let filename = format!("{wrapper_id}.desktop");
+        kept.insert(filename.clone());
+        let wrapper_path = out_dir.join(&filename);
         let mut exec_line = format!(
             "/usr/local/bin/focusstage-launch --wm-class {} {}",
             shell_quote_desktop(wrapper_id),
@@ -653,10 +673,28 @@ fn run_sync_apps(out_dir: &std::path::Path, remove: bool, json_mode: bool) -> an
         }));
     }
 
+    let mut removed = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(out_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                if name.starts_with("focusstage-")
+                    && !name.starts_with("focusstage-handler-")
+                    && name.ends_with(".desktop")
+                    && !kept.contains(name)
+                    && std::fs::remove_file(&p).is_ok()
+                {
+                    removed.push(p.display().to_string());
+                }
+            }
+        }
+    }
+
     let payload = serde_json::json!({
         "status": "ok",
         "count": created.len(),
         "entries": created,
+        "removed": removed,
     });
     println!(
         "{}",
