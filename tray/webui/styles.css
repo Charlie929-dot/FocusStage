@@ -431,6 +431,7 @@ select:focus-visible,
   font-size: var(--fz-sm);
   color: var(--ink-muted);
   letter-spacing: 0.005em;
+  transition: color 140ms ease;
 }
 
 .hint-rule {
@@ -439,6 +440,49 @@ select:focus-visible,
   border-radius: 2px;
   background: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
+  flex-shrink: 0;
+  transition: width 140ms ease, background-color 140ms ease, box-shadow 140ms ease;
+}
+
+.hint-kbd {
+  display: inline-block;
+  padding: 0 5px;
+  margin: 0 2px;
+  border-radius: 5px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-raised);
+  color: var(--ink-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--fz-xs);
+  font-weight: 600;
+  line-height: 1.5;
+  vertical-align: baseline;
+  transition: border-color 140ms ease, background-color 140ms ease, color 140ms ease;
+}
+
+.desktop-hint.is-drag-merge {
+  color: var(--accent);
+}
+
+.desktop-hint.is-drag-merge .hint-rule {
+  width: 28px;
+}
+
+.desktop-hint.is-drag-repel {
+  color: var(--emerald);
+  font-weight: 560;
+}
+
+.desktop-hint.is-drag-repel .hint-rule {
+  width: 28px;
+  background: var(--emerald);
+  box-shadow: 0 0 0 3px var(--emerald-soft);
+}
+
+.desktop-hint.is-drag-repel .hint-kbd {
+  border-color: var(--emerald-border);
+  background: var(--emerald-soft);
+  color: var(--emerald);
 }
 
 .apps-grid {
@@ -490,7 +534,18 @@ select:focus-visible,
   opacity: 0.42;
 }
 
-.grid-slot.is-drop-target {
+body.hide-grid .grid-slot {
+  border-color: transparent;
+  background: transparent;
+}
+
+body.hide-grid .apps-grid.is-dragging .grid-slot:not(.is-drop-target) {
+  border-color: var(--grid-line-strong);
+  background: var(--slot-bg);
+}
+
+.grid-slot.is-drop-target,
+body.hide-grid .apps-grid.is-dragging .grid-slot.is-drop-target {
   border-color: var(--accent);
   background: var(--accent-soft);
   box-shadow: 0 0 0 3px var(--accent-soft);
@@ -501,14 +556,17 @@ select:focus-visible,
   opacity: 1;
 }
 
-body.hide-grid .grid-slot {
-  border-color: transparent;
-  background: transparent;
+.grid-slot.is-repel-target,
+body.hide-grid .apps-grid.is-dragging .grid-slot.is-repel-target {
+  border-color: var(--emerald);
+  border-style: dashed;
+  background: var(--emerald-soft);
+  box-shadow: 0 0 0 3px var(--emerald-soft);
 }
 
-body.hide-grid .apps-grid.is-dragging .grid-slot {
-  border-color: var(--grid-line-strong);
-  background: var(--slot-bg);
+.grid-slot.is-repel-target::after {
+  color: var(--emerald);
+  opacity: 1;
 }
 
 .tile {
@@ -523,7 +581,7 @@ body.hide-grid .apps-grid.is-dragging .grid-slot {
   border-radius: var(--radius-md);
   border: 1px solid transparent;
   cursor: pointer;
-  transition: background-color 120ms ease, border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
+  transition: background-color 120ms ease, border-color 120ms ease, transform 220ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 120ms ease, opacity 120ms ease;
 }
 
 .tile[data-root-token] {
@@ -542,15 +600,15 @@ body.hide-grid .apps-grid.is-dragging .grid-slot {
 }
 
 .tile.is-dragging {
-  opacity: 0.42;
-  transform: scale(0.96);
+  pointer-events: none;
+  opacity: 0.36;
+  transform: scale(0.94);
 }
 
-.tile.is-avoiding {
+.tile.is-repelled {
+  pointer-events: none;
   z-index: 1;
-  background: var(--surface-glass);
-  border-color: var(--border);
-  transform: translate(var(--avoid-x, 0), var(--avoid-y, 0)) scale(0.9);
+  will-change: transform;
 }
 
 .tile.is-drop-merge,
@@ -558,6 +616,14 @@ body.hide-grid .apps-grid.is-dragging .grid-slot {
   background: var(--accent-soft);
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
+  transform: scale(1.04);
+}
+
+.tile.is-drop-merge .tile-icon-frame,
+.tile.is-drop-into-folder .folder-preview {
+  background: var(--surface-glass);
+  box-shadow: 0 0 0 2px var(--accent-border), var(--shadow-sm);
+  transform: scale(1.05);
 }
 
 .tile.is-drop-before::before,

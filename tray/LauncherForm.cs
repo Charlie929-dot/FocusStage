@@ -28,11 +28,12 @@ internal sealed class LauncherForm : Form
 
     private List<LinuxAppDto> _apps = new();
     private Dictionary<string, LinuxAppDto> _appById = new(StringComparer.Ordinal);
-    private LauncherLayout _layout = new();
+    private LauncherLayout _layout = LauncherLayout.LoadExistingReadOnly();
     private List<StageDto> _stages = new();
     private bool _daemonAlive;
 
     private bool _webViewReady;
+    private bool _appsLoaded;
     private bool _loadingApps;
     private string _lastAppsSignature = "";
     private string _lastStateSignature = "";
@@ -108,6 +109,7 @@ internal sealed class LauncherForm : Form
         {
             _daemonAlive = _ctx.DaemonAlive;
             _stages = _ctx.CurrentStages;
+            _layout = LauncherLayout.LoadExistingReadOnly();
             await InitializeWebViewAsync();
             _ = RefreshAppsAsync(forceRender: true);
             _autoDiscoverTimer.Start();
@@ -194,7 +196,7 @@ internal sealed class LauncherForm : Form
                 _webViewReady = true;
                 PushEvent("windowState", new { maximized = WindowState == FormWindowState.Maximized });
                 PushState(force: true);
-                if (_apps.Count > 0)
+                if (_appsLoaded)
                 {
                     PushApps("init");
                 }
@@ -324,6 +326,7 @@ internal sealed class LauncherForm : Form
                     daemonAlive = _daemonAlive,
                     stages = BuildStagePayloads(_stages),
                     apps = BuildAppPayloads(_apps),
+                    appsLoaded = _appsLoaded,
                     layout = BuildLayoutPayload(_layout),
                     startupEnabled = ShortcutManager.IsStartupEnabled(),
                     clipboardSyncEnabled = _ctx.ClipboardSyncEnabled,
@@ -355,6 +358,7 @@ internal sealed class LauncherForm : Form
                 return new
                 {
                     apps = BuildAppPayloads(_apps),
+                    appsLoaded = _appsLoaded,
                     layout = BuildLayoutPayload(_layout),
                     count = _apps.Count
                 };
@@ -441,6 +445,7 @@ internal sealed class LauncherForm : Form
                     return new { ok = false, message };
                 }
 
+                _layout.RemoveUninstalledApp(app.Id);
                 _assetServer.ClearIconCache();
                 await RefreshAppsAsync(forceRender: true);
                 var (syncOk, syncMessage, _) = await ShortcutManager.SyncAllAsync(
@@ -560,13 +565,13 @@ internal sealed class LauncherForm : Form
 
             case "layout.setRootPosition":
             {
-                _layout.SetRootPosition(Str("token"), Int("row"), Int("col"));
+                _layout.SetRootPosition(Str("token"), Int("row"), Int("col"), Bool("repel", false));
                 return new { layout = BuildLayoutPayload(_layout) };
             }
 
             case "layout.moveAppToRootAt":
             {
-                _layout.MoveAppToRootAt(Str("appId"), Int("row"), Int("col"));
+                _layout.MoveAppToRootAt(Str("appId"), Int("row"), Int("col"), Bool("repel", false));
                 return new { layout = BuildLayoutPayload(_layout) };
             }
 
@@ -718,15 +723,20 @@ internal sealed class LauncherForm : Form
             var sig = string.Join("|", apps.Select(a => $"{a.Id}:{a.DisplayName}:{a.Source}:{a.IconPath}"));
             bool listChanged = sig != _lastAppsSignature;
             _lastAppsSignature = sig;
+            bool wasLoaded = _appsLoaded;
+            _appsLoaded = true;
 
             _apps = apps;
             _appById = apps.ToDictionary(a => a.Id, StringComparer.Ordinal);
             _assetServer.UpdateApps(_appById);
-            _layout = LauncherLayout.LoadOrDefault(_apps);
-
-            if ((forceRender || listChanged) && _webViewReady)
+            if (_apps.Count > 0)
             {
-                PushApps(listChanged && !forceRender ? "auto" : "refresh");
+                _layout = LauncherLayout.LoadOrDefault(_apps);
+            }
+
+            if ((!wasLoaded || forceRender || listChanged) && _webViewReady)
+            {
+                PushApps(listChanged && !forceRender && wasLoaded ? "auto" : "refresh");
             }
         }
         finally
@@ -762,6 +772,7 @@ internal sealed class LauncherForm : Form
         PushEvent("apps", new
         {
             apps = BuildAppPayloads(_apps),
+            appsLoaded = _appsLoaded,
             layout = BuildLayoutPayload(_layout),
             reason
         });

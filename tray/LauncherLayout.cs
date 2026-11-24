@@ -137,6 +137,19 @@ internal sealed class LauncherFolder
 internal sealed class LauncherLayout
 {
     private const string FolderTokenPrefix = "folder:";
+    private static readonly object FileLock = new();
+    private static readonly JsonSerializerOptions WriteJsonOptions = new() { WriteIndented = true };
+
+    private enum ReadFileStatus
+    {
+        Missing,
+        Success,
+        Corrupt,
+        IoError
+    }
+
+    private bool _saveBlockedByIoError;
+    private bool _loadedFromCorruptPrimary;
 
     private static readonly HashSet<string> AllowedDockTargets = new(new[]
     {
@@ -177,6 +190,12 @@ internal sealed class LauncherLayout
     public static string LayoutFilePath =>
         Path.Combine(ShortcutManager.AppInstallDir, "layout.json");
 
+    public static string BackupFilePath =>
+        Path.Combine(ShortcutManager.AppInstallDir, "layout.json.bak");
+
+    private static string TempFilePath =>
+        Path.Combine(ShortcutManager.AppInstallDir, "layout.json.tmp");
+
     public static string FolderToken(string folderId) => FolderTokenPrefix + folderId;
 
     public static bool IsFolderToken(string token, out string folderId)
@@ -190,56 +209,320 @@ internal sealed class LauncherLayout
         return false;
     }
 
+    /// <summary>
+    /// Pre-loads existing layout.json (or layout.json.bak) without pruning or writing to disk.
+    /// Safe to call at startup before Linux apps have been scanned.
+    /// </summary>
+    public static LauncherLayout LoadExistingReadOnly()
+    {
+        lock (FileLock)
+        {
+            var primaryStatus = TryReadLayoutFile(LayoutFilePath, out var primary);
+            if (primaryStatus == ReadFileStatus.Success && primary is not null)
+            {
+                return primary;
+            }
+
+            var backupStatus = TryReadLayoutFile(BackupFilePath, out var backup);
+            if (backupStatus == ReadFileStatus.Success && backup is not null)
+            {
+                backup._saveBlockedByIoError = primaryStatus == ReadFileStatus.IoError;
+                backup._loadedFromCorruptPrimary = primaryStatus == ReadFileStatus.Corrupt;
+                return backup;
+            }
+
+            var fallback = new LauncherLayout
+            {
+                _saveBlockedByIoError = primaryStatus == ReadFileStatus.IoError,
+                _loadedFromCorruptPrimary = primaryStatus == ReadFileStatus.Corrupt
+            };
+            fallback.NormalizeLoaded();
+            return fallback;
+        }
+    }
+
     public static LauncherLayout LoadOrDefault(IReadOnlyList<LinuxAppDto> apps)
     {
-        LauncherLayout? loaded = null;
+        if (apps.Count == 0)
+        {
+            return LoadExistingReadOnly();
+        }
+
+        lock (FileLock)
+        {
+            var primaryStatus = TryReadLayoutFile(LayoutFilePath, out var primary);
+            if (primaryStatus == ReadFileStatus.Success && primary is not null)
+            {
+                if (primary.ReconcileWithApps(apps))
+                {
+                    primary.Save();
+                }
+                return primary;
+            }
+
+            if (primaryStatus == ReadFileStatus.IoError)
+            {
+                // Transient lock/access error on an existing layout.json: never overwrite it.
+                var backupStatus = TryReadLayoutFile(BackupFilePath, out var backup);
+                var safeLayout = (backupStatus == ReadFileStatus.Success && backup is not null)
+                    ? backup
+                    : BuildInitialPhoneLayout(apps);
+                safeLayout._saveBlockedByIoError = true;
+                safeLayout.ReconcileWithApps(apps);
+                return safeLayout;
+            }
+
+            if (primaryStatus == ReadFileStatus.Corrupt)
+            {
+                var backupStatus = TryReadLayoutFile(BackupFilePath, out var backup);
+                PreserveCorruptPrimaryLocked();
+
+                if (backupStatus == ReadFileStatus.Success && backup is not null)
+                {
+                    backup.ReconcileWithApps(apps);
+                    backup.Save();
+                    return backup;
+                }
+
+                var freshAfterCorrupt = BuildInitialPhoneLayout(apps);
+                freshAfterCorrupt.Save();
+                return freshAfterCorrupt;
+            }
+
+            // Primary missing: try recovering from layout.json.bak before creating defaults.
+            var missingFallbackStatus = TryReadLayoutFile(BackupFilePath, out var recoveredBackup);
+            if (missingFallbackStatus == ReadFileStatus.Success && recoveredBackup is not null)
+            {
+                recoveredBackup.ReconcileWithApps(apps);
+                recoveredBackup.Save();
+                return recoveredBackup;
+            }
+
+            var fresh = BuildInitialPhoneLayout(apps);
+            fresh.Save();
+            return fresh;
+        }
+    }
+
+    private static ReadFileStatus TryReadLayoutFile(string path, out LauncherLayout? layout)
+    {
+        layout = null;
+        if (!File.Exists(path))
+        {
+            return ReadFileStatus.Missing;
+        }
+
+        string? json = null;
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                using var fs = new FileStream(
+                    path,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete);
+                using var reader = new StreamReader(fs, System.Text.Encoding.UTF8);
+                json = reader.ReadToEnd();
+                break;
+            }
+            catch (FileNotFoundException)
+            {
+                return ReadFileStatus.Missing;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                return ReadFileStatus.Missing;
+            }
+            catch (IOException) when (attempt < 2)
+            {
+                Thread.Sleep(40 * (attempt + 1));
+            }
+            catch (UnauthorizedAccessException) when (attempt < 2)
+            {
+                Thread.Sleep(40 * (attempt + 1));
+            }
+            catch (IOException)
+            {
+                return ReadFileStatus.IoError;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return ReadFileStatus.IoError;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return ReadFileStatus.Corrupt;
+        }
+
         try
         {
-            if (File.Exists(LayoutFilePath))
+            var parsed = JsonSerializer.Deserialize<LauncherLayout>(json);
+            if (parsed is null)
             {
-                var json = File.ReadAllText(LayoutFilePath);
-                loaded = JsonSerializer.Deserialize<LauncherLayout>(json);
+                return ReadFileStatus.Corrupt;
             }
+            parsed.NormalizeLoaded();
+            layout = parsed;
+            return ReadFileStatus.Success;
+        }
+        catch (JsonException)
+        {
+            return ReadFileStatus.Corrupt;
+        }
+    }
+
+    private static void PreserveCorruptPrimaryLocked()
+    {
+        try
+        {
+            if (!File.Exists(LayoutFilePath)) return;
+            var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            var corruptPath = Path.Combine(ShortcutManager.AppInstallDir, $"layout.json.corrupt.{stamp}");
+            if (File.Exists(corruptPath))
+            {
+                corruptPath = Path.Combine(
+                    ShortcutManager.AppInstallDir,
+                    $"layout.json.corrupt.{stamp}-{Guid.NewGuid().ToString("N")[..4]}");
+            }
+            File.Move(LayoutFilePath, corruptPath);
         }
         catch
         {
-            loaded = null;
+            try
+            {
+                var fallbackCorrupt = Path.Combine(ShortcutManager.AppInstallDir, "layout.json.corrupt");
+                File.Copy(LayoutFilePath, fallbackCorrupt, overwrite: true);
+            }
+            catch
+            {
+                // Ignore if disk is read-only.
+            }
         }
+    }
 
-        if (loaded is null)
-        {
-            loaded = BuildInitialPhoneLayout(apps);
-            loaded.Save();
-            return loaded;
-        }
+    private void NormalizeLoaded()
+    {
+        Folders = (Folders ?? new())
+            .Where(f => f is not null)
+            .Select(f =>
+            {
+                f.Id = (f.Id ?? "").Trim();
+                f.Name = string.IsNullOrWhiteSpace(f.Name) ? "新建文件夹" : f.Name.Trim();
+                f.AppIds = (f.AppIds ?? new())
+                    .Where(id => !string.IsNullOrWhiteSpace(id))
+                    .Distinct(StringComparer.Ordinal)
+                    .ToList();
+                return f;
+            })
+            .Where(f => !string.IsNullOrWhiteSpace(f.Id))
+            .ToList();
 
-        loaded.Folders ??= new();
-        loaded.RootOrder ??= new();
-        loaded.Positions = loaded.Positions is null
+        RootOrder = (RootOrder ?? new())
+            .Where(t => !string.IsNullOrWhiteSpace(t))
+            .ToList();
+
+        Positions = Positions is null
             ? new Dictionary<string, LauncherGridPosition>(StringComparer.Ordinal)
-            : new Dictionary<string, LauncherGridPosition>(loaded.Positions, StringComparer.Ordinal);
-        loaded.DockItems ??= new();
-        loaded.Appearance ??= new();
-        loaded.Appearance.Normalize();
+            : new Dictionary<string, LauncherGridPosition>(Positions, StringComparer.Ordinal);
 
-        if (loaded.ReconcileWithApps(apps))
-        {
-            loaded.Save();
-        }
-        return loaded;
+        DockItems = (DockItems ?? new())
+            .Where(d => d is not null)
+            .ToList();
+
+        Appearance ??= new();
+        Appearance.Normalize();
     }
 
     public void Save()
     {
+        if (_saveBlockedByIoError)
+        {
+            return;
+        }
+
+        lock (FileLock)
+        {
+            try
+            {
+                Directory.CreateDirectory(ShortcutManager.AppInstallDir);
+                var json = JsonSerializer.Serialize(this, WriteJsonOptions);
+                var bytes = System.Text.Encoding.UTF8.GetBytes(json);
+
+                using (var fs = new FileStream(
+                    TempFilePath,
+                    FileMode.Create,
+                    FileAccess.Write,
+                    FileShare.None))
+                {
+                    fs.Write(bytes, 0, bytes.Length);
+                    fs.Flush(flushToDisk: true);
+                }
+
+                if (_loadedFromCorruptPrimary && File.Exists(LayoutFilePath))
+                {
+                    PreserveCorruptPrimaryLocked();
+                    _loadedFromCorruptPrimary = false;
+                }
+
+                if (File.Exists(LayoutFilePath))
+                {
+                    try
+                    {
+                        File.Replace(TempFilePath, LayoutFilePath, BackupFilePath, ignoreMetadataErrors: true);
+                    }
+                    catch (FileNotFoundException)
+                    {
+                        File.Move(TempFilePath, LayoutFilePath, overwrite: true);
+                        TryCopyBackupLocked();
+                    }
+                    catch (IOException)
+                    {
+                        File.Move(TempFilePath, LayoutFilePath, overwrite: true);
+                        TryCopyBackupLocked();
+                    }
+                }
+                else
+                {
+                    File.Move(TempFilePath, LayoutFilePath, overwrite: true);
+                    TryCopyBackupLocked();
+                }
+            }
+            catch
+            {
+                // Ignore persistence errors if disk is read-only.
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(TempFilePath))
+                    {
+                        File.Delete(TempFilePath);
+                    }
+                }
+                catch
+                {
+                    // Ignore temp cleanup errors.
+                }
+            }
+        }
+    }
+
+    private static void TryCopyBackupLocked()
+    {
         try
         {
-            Directory.CreateDirectory(ShortcutManager.AppInstallDir);
-            var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(LayoutFilePath, json);
+            if (File.Exists(LayoutFilePath))
+            {
+                File.Copy(LayoutFilePath, BackupFilePath, overwrite: true);
+            }
         }
         catch
         {
-            // Ignore persistence errors if disk is read-only.
+            // Best-effort backup copy.
         }
     }
 
@@ -296,26 +579,43 @@ internal sealed class LauncherLayout
     }
 
     /// <summary>
-    /// Ensures newly installed/downloaded apps appear automatically and uninstalled apps are cleaned up.
+    /// Non-destructively reconciles newly discovered apps into free grid cells without
+    /// purging existing custom folders, cell placements, or pinned dock items.
     /// Returns true if the layout changed.
     /// </summary>
     public bool ReconcileWithApps(IReadOnlyList<LinuxAppDto> apps)
     {
+        if (apps.Count == 0)
+        {
+            return false;
+        }
+
         bool changed = false;
-        var validIds = new HashSet<string>(apps.Select(a => a.Id), StringComparer.Ordinal);
         var folderIds = new HashSet<string>(Folders.Select(f => f.Id), StringComparer.Ordinal);
 
         foreach (var folder in Folders)
         {
-            int before = folder.AppIds.Count;
-            folder.AppIds = folder.AppIds.Where(validIds.Contains).Distinct(StringComparer.Ordinal).ToList();
-            if (folder.AppIds.Count != before) changed = true;
+            var cleaned = folder.AppIds
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            if (cleaned.Count != folder.AppIds.Count || !cleaned.SequenceEqual(folder.AppIds, StringComparer.Ordinal))
+            {
+                folder.AppIds = cleaned;
+                changed = true;
+            }
         }
 
-        var newRoot = new List<string>();
+        var newRoot = new List<string>(RootOrder.Count);
         var seenRoot = new HashSet<string>(StringComparer.Ordinal);
         foreach (var tok in RootOrder)
         {
+            if (string.IsNullOrWhiteSpace(tok))
+            {
+                changed = true;
+                continue;
+            }
+
             if (IsFolderToken(tok, out var fid))
             {
                 if (folderIds.Contains(fid) && seenRoot.Add(tok))
@@ -327,8 +627,9 @@ internal sealed class LauncherLayout
                     changed = true;
                 }
             }
-            else if (validIds.Contains(tok) && seenRoot.Add(tok))
+            else if (seenRoot.Add(tok))
             {
+                // Preserve saved app tokens even if temporarily absent from the latest scan.
                 newRoot.Add(tok);
             }
             else
@@ -336,15 +637,18 @@ internal sealed class LauncherLayout
                 changed = true;
             }
         }
-        RootOrder = newRoot;
+        if (newRoot.Count != RootOrder.Count || !newRoot.SequenceEqual(RootOrder, StringComparer.Ordinal))
+        {
+            RootOrder = newRoot;
+            changed = true;
+        }
 
         foreach (var folder in Folders)
         {
             var tok = FolderToken(folder.Id);
-            if (!seenRoot.Contains(tok))
+            if (seenRoot.Add(tok))
             {
                 RootOrder.Add(tok);
-                seenRoot.Add(tok);
                 changed = true;
             }
         }
@@ -361,16 +665,52 @@ internal sealed class LauncherLayout
 
         foreach (var app in apps)
         {
-            if (placed.Add(app.Id))
+            if (!string.IsNullOrWhiteSpace(app.Id) && placed.Add(app.Id))
             {
                 RootOrder.Add(app.Id);
                 changed = true;
             }
         }
 
-        changed |= PruneDockItems(validIds, folderIds);
+        changed |= PruneInvalidDockItemsNonDestructive(folderIds);
         changed |= EnsurePositions(Appearance.Columns);
         return changed;
+    }
+
+    /// <summary>
+    /// Explicitly cleans up a specific app from root, folders, positions, and dock after user uninstall.
+    /// </summary>
+    public void RemoveUninstalledApp(string appId)
+    {
+        if (string.IsNullOrWhiteSpace(appId)) return;
+
+        bool changed = false;
+        if (RootOrder.RemoveAll(t => string.Equals(t, appId, StringComparison.Ordinal)) > 0)
+        {
+            changed = true;
+        }
+        foreach (var folder in Folders)
+        {
+            if (folder.AppIds.RemoveAll(id => string.Equals(id, appId, StringComparison.Ordinal)) > 0)
+            {
+                changed = true;
+            }
+        }
+        if (Positions.Remove(appId))
+        {
+            changed = true;
+        }
+        if (DockItems.RemoveAll(item =>
+                string.Equals(item.Kind, "app", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(item.Target, appId, StringComparison.Ordinal)) > 0)
+        {
+            changed = true;
+        }
+
+        if (EnsurePositions(Appearance.Columns) || changed)
+        {
+            Save();
+        }
     }
 
     public LauncherFolder? FindFolder(string folderId) =>
@@ -378,24 +718,50 @@ internal sealed class LauncherLayout
 
     public LauncherFolder CreateFolder(string name, string? initialAppId = null)
     {
+        EnsurePositions(Appearance.Columns);
+
+        LauncherGridPosition? initialPos = null;
+        int insertIdx = -1;
+        if (!string.IsNullOrWhiteSpace(initialAppId))
+        {
+            if (Positions.TryGetValue(initialAppId, out var savedPos))
+            {
+                initialPos = new LauncherGridPosition { Row = savedPos.Row, Col = savedPos.Col };
+            }
+            insertIdx = RootOrder.IndexOf(initialAppId);
+        }
+
         var id = "f_" + Guid.NewGuid().ToString("N")[..8];
         var folder = new LauncherFolder
         {
             Id = id,
             Name = string.IsNullOrWhiteSpace(name) ? "新建文件夹" : name.Trim()
         };
-        Folders.Add(folder);
-        RootOrder.Add(FolderToken(id));
+        var folderToken = FolderToken(id);
 
         if (!string.IsNullOrWhiteSpace(initialAppId))
         {
-            MoveAppToFolder(initialAppId, id);
-            EnsurePositions(Appearance.Columns);
+            RemoveAppFromAllLocations(initialAppId);
+            Positions.Remove(initialAppId);
+            folder.AppIds.Add(initialAppId);
+        }
+
+        Folders.Add(folder);
+        if (insertIdx >= 0 && insertIdx <= RootOrder.Count)
+        {
+            RootOrder.Insert(insertIdx, folderToken);
         }
         else
         {
-            EnsurePositions(Appearance.Columns);
+            RootOrder.Add(folderToken);
         }
+
+        if (initialPos is not null)
+        {
+            Positions[folderToken] = initialPos;
+        }
+
+        EnsurePositions(Appearance.Columns);
         Save();
         return folder;
     }
@@ -412,18 +778,63 @@ internal sealed class LauncherLayout
     {
         var folder = FindFolder(folderId);
         if (folder is null) return;
+
+        EnsurePositions(Appearance.Columns);
+        int columns = Math.Clamp(Appearance.Columns, 6, 12);
         var tok = FolderToken(folderId);
+
+        LauncherGridPosition? folderPos = null;
+        if (Positions.TryGetValue(tok, out var savedPos))
+        {
+            folderPos = new LauncherGridPosition { Row = savedPos.Row, Col = savedPos.Col };
+        }
+
+        var existingRootSet = new HashSet<string>(RootOrder, StringComparer.Ordinal);
+        var unpackedApps = folder.AppIds
+            .Where(id => !string.IsNullOrWhiteSpace(id) && !existingRootSet.Contains(id))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
         int idx = RootOrder.IndexOf(tok);
         if (idx >= 0)
         {
             RootOrder.RemoveAt(idx);
-            RootOrder.InsertRange(idx, folder.AppIds);
+            RootOrder.InsertRange(idx, unpackedApps);
         }
         else
         {
-            RootOrder.AddRange(folder.AppIds);
+            RootOrder.AddRange(unpackedApps);
         }
+
+        Positions.Remove(tok);
         Folders.Remove(folder);
+        DockItems.RemoveAll(item =>
+            string.Equals(item.Kind, "folder", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(item.Target, folderId, StringComparison.Ordinal));
+
+        var occupied = new HashSet<(int Row, int Col)>();
+        foreach (var existingToken in RootOrder)
+        {
+            if (Positions.TryGetValue(existingToken, out var pos)
+                && pos.Row >= 0
+                && pos.Col >= 0
+                && pos.Col < columns)
+            {
+                occupied.Add((pos.Row, pos.Col));
+            }
+        }
+
+        int cursorRow = folderPos?.Row ?? 0;
+        int cursorCol = folderPos is not null ? Math.Clamp(folderPos.Col, 0, columns - 1) : 0;
+        foreach (var appId in unpackedApps)
+        {
+            var free = FindFirstFreeCellFrom(occupied, columns, cursorRow, cursorCol);
+            Positions[appId] = new LauncherGridPosition { Row = free.Row, Col = free.Col };
+            occupied.Add(free);
+            cursorRow = free.Row;
+            cursorCol = free.Col;
+        }
+
         EnsurePositions(Appearance.Columns);
         Save();
     }
@@ -434,6 +845,7 @@ internal sealed class LauncherLayout
         if (target is null) return;
 
         RemoveAppFromAllLocations(appId);
+        Positions.Remove(appId);
         if (!target.AppIds.Contains(appId))
         {
             target.AppIds.Add(appId);
@@ -445,34 +857,91 @@ internal sealed class LauncherLayout
     public void MoveAppToRoot(string appId)
     {
         RemoveAppFromAllLocations(appId);
+        Positions.Remove(appId);
         RootOrder.Add(appId);
         EnsurePositions(Appearance.Columns);
         Save();
     }
 
-    public void MoveAppToRootAt(string appId, int row, int col)
+    public void MoveAppToRootAt(string appId, int row, int col, bool repel = false)
     {
-        MoveAppToRoot(appId);
-        SetRootPosition(appId, row, col);
+        if (string.IsNullOrWhiteSpace(appId)) return;
+
+        EnsurePositions(Appearance.Columns);
+        int columns = Math.Clamp(Appearance.Columns, 6, 12);
+        row = Math.Max(0, row);
+        col = Math.Clamp(col, 0, columns - 1);
+
+        RemoveAppFromAllLocations(appId);
+        Positions.Remove(appId);
+        RootOrder.Add(appId);
+
+        if (repel)
+        {
+            ApplyRepelPlacement(Positions, columns, appId, row, col);
+        }
+        else
+        {
+            string? occupant = FindTokenAt(row, col, excludeToken: appId);
+            Positions[appId] = new LauncherGridPosition { Row = row, Col = col };
+            if (occupant is not null)
+            {
+                var occupied = BuildOccupiedSet(columns, excludeToken: occupant);
+                var free = FindFirstFreeCell(occupied, columns);
+                Positions[occupant] = new LauncherGridPosition { Row = free.Row, Col = free.Col };
+            }
+        }
+
+        EnsurePositions(columns);
+        Save();
     }
 
     public LauncherFolder MergeAppsIntoNewFolder(string sourceAppId, string targetAppId, string folderName = "新建文件夹")
     {
-        var targetFolder = CreateFolder(folderName);
-        int targetIdx = RootOrder.IndexOf(targetAppId);
-        if (targetIdx >= 0)
+        EnsurePositions(Appearance.Columns);
+
+        LauncherGridPosition? targetPos = null;
+        if (Positions.TryGetValue(targetAppId, out var savedTargetPos))
         {
-            RootOrder.Remove(FolderToken(targetFolder.Id));
-            RootOrder.Insert(targetIdx, FolderToken(targetFolder.Id));
+            targetPos = new LauncherGridPosition { Row = savedTargetPos.Row, Col = savedTargetPos.Col };
         }
+        int targetIdx = RootOrder.IndexOf(targetAppId);
+
+        var id = "f_" + Guid.NewGuid().ToString("N")[..8];
+        var targetFolder = new LauncherFolder
+        {
+            Id = id,
+            Name = string.IsNullOrWhiteSpace(folderName) ? "新建文件夹" : folderName.Trim()
+        };
+        var folderToken = FolderToken(id);
 
         RemoveAppFromAllLocations(targetAppId);
         RemoveAppFromAllLocations(sourceAppId);
+        Positions.Remove(targetAppId);
+        Positions.Remove(sourceAppId);
+
+        Folders.Add(targetFolder);
+        if (targetIdx >= 0)
+        {
+            int insertIdx = Math.Clamp(targetIdx, 0, RootOrder.Count);
+            RootOrder.Insert(insertIdx, folderToken);
+        }
+        else
+        {
+            RootOrder.Add(folderToken);
+        }
+
         targetFolder.AppIds.Add(targetAppId);
         if (sourceAppId != targetAppId)
         {
             targetFolder.AppIds.Add(sourceAppId);
         }
+
+        if (targetPos is not null)
+        {
+            Positions[folderToken] = targetPos;
+        }
+
         EnsurePositions(Appearance.Columns);
         Save();
         return targetFolder;
@@ -480,6 +949,7 @@ internal sealed class LauncherLayout
 
     public void AutoOrganize(IReadOnlyList<LinuxAppDto> apps)
     {
+        if (apps.Count == 0) return;
         var fresh = BuildInitialPhoneLayout(apps);
         Folders = fresh.Folders;
         RootOrder = fresh.RootOrder;
@@ -541,33 +1011,144 @@ internal sealed class LauncherLayout
         Save();
     }
 
-    public void SetRootPosition(string token, int row, int col)
+    public void SetRootPosition(string token, int row, int col, bool repel = false)
     {
         if (!RootOrder.Contains(token, StringComparer.Ordinal)) return;
         EnsurePositions(Appearance.Columns);
+        int columns = Math.Clamp(Appearance.Columns, 6, 12);
 
         row = Math.Max(0, row);
-        col = Math.Clamp(col, 0, Appearance.Columns - 1);
+        col = Math.Clamp(col, 0, columns - 1);
         var old = Positions[token];
         if (old.Row == row && old.Col == col) return;
 
-        string? occupant = null;
-        foreach (var pair in Positions)
+        if (repel)
         {
-            if (!string.Equals(pair.Key, token, StringComparison.Ordinal)
-                && pair.Value.Row == row && pair.Value.Col == col)
+            ApplyRepelPlacement(Positions, columns, token, row, col);
+        }
+        else
+        {
+            string? occupant = FindTokenAt(row, col, excludeToken: token);
+            Positions[token] = new LauncherGridPosition { Row = row, Col = col };
+            if (occupant is not null)
             {
-                occupant = pair.Key;
-                break;
+                Positions[occupant] = new LauncherGridPosition { Row = old.Row, Col = old.Col };
+            }
+        }
+        Save();
+    }
+
+    /// <summary>
+    /// Deterministic phone-style linear grid cell repulsion.
+    /// Must stay identical to computeRepelPositions() in tray/webui/app.js.
+    /// </summary>
+    private static void ApplyRepelPlacement(
+        Dictionary<string, LauncherGridPosition> positions,
+        int columns,
+        string dragToken,
+        int targetRow,
+        int targetCol)
+    {
+        int targetIdx = targetRow * columns + targetCol;
+        int? sourceIdx = null;
+        if (positions.TryGetValue(dragToken, out var oldPos))
+        {
+            sourceIdx = oldPos.Row * columns + oldPos.Col;
+            if (sourceIdx.Value == targetIdx) return;
+        }
+
+        var occupiedByIdx = new Dictionary<int, string>(positions.Count);
+        foreach (var pair in positions)
+        {
+            if (string.Equals(pair.Key, dragToken, StringComparison.Ordinal)) continue;
+            int idx = pair.Value.Row * columns + pair.Value.Col;
+            occupiedByIdx[idx] = pair.Key;
+        }
+
+        if (!occupiedByIdx.ContainsKey(targetIdx))
+        {
+            positions[dragToken] = new LauncherGridPosition { Row = targetRow, Col = targetCol };
+            return;
+        }
+
+        int dir = (sourceIdx.HasValue && targetIdx > sourceIdx.Value) ? -1 : 1;
+        int freeIdx = targetIdx + dir;
+        while (freeIdx >= 0 && occupiedByIdx.ContainsKey(freeIdx))
+        {
+            freeIdx += dir;
+        }
+
+        if (freeIdx < 0)
+        {
+            dir = 1;
+            freeIdx = targetIdx + 1;
+            while (occupiedByIdx.ContainsKey(freeIdx))
+            {
+                freeIdx++;
             }
         }
 
-        Positions[token] = new LauncherGridPosition { Row = row, Col = col };
-        if (occupant is not null)
+        if (dir < 0)
         {
-            Positions[occupant] = new LauncherGridPosition { Row = old.Row, Col = old.Col };
+            for (int idx = freeIdx + 1; idx <= targetIdx; idx++)
+            {
+                if (!occupiedByIdx.TryGetValue(idx, out var tok)) continue;
+                int nextIdx = idx - 1;
+                positions[tok] = new LauncherGridPosition
+                {
+                    Row = nextIdx / columns,
+                    Col = nextIdx % columns
+                };
+            }
         }
-        Save();
+        else
+        {
+            for (int idx = freeIdx - 1; idx >= targetIdx; idx--)
+            {
+                if (!occupiedByIdx.TryGetValue(idx, out var tok)) continue;
+                int nextIdx = idx + 1;
+                positions[tok] = new LauncherGridPosition
+                {
+                    Row = nextIdx / columns,
+                    Col = nextIdx % columns
+                };
+            }
+        }
+
+        positions[dragToken] = new LauncherGridPosition { Row = targetRow, Col = targetCol };
+    }
+
+    private string? FindTokenAt(int row, int col, string? excludeToken = null)
+    {
+        foreach (var pair in Positions)
+        {
+            if (excludeToken is not null && string.Equals(pair.Key, excludeToken, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            if (pair.Value.Row == row && pair.Value.Col == col)
+            {
+                return pair.Key;
+            }
+        }
+        return null;
+    }
+
+    private HashSet<(int Row, int Col)> BuildOccupiedSet(int columns, string? excludeToken = null)
+    {
+        var occupied = new HashSet<(int Row, int Col)>();
+        foreach (var pair in Positions)
+        {
+            if (excludeToken is not null && string.Equals(pair.Key, excludeToken, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            if (pair.Value.Row >= 0 && pair.Value.Col >= 0 && pair.Value.Col < columns)
+            {
+                occupied.Add((pair.Value.Row, pair.Value.Col));
+            }
+        }
+        return occupied;
     }
 
     public void SetDockItems(
@@ -575,6 +1156,11 @@ internal sealed class LauncherLayout
         IReadOnlyDictionary<string, LinuxAppDto> appLookup)
     {
         var folderIds = new HashSet<string>(Folders.Select(f => f.Id), StringComparer.Ordinal);
+        var existingPinnedApps = new HashSet<string>(
+            DockItems
+                .Where(d => string.Equals(d.Kind, "app", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(d.Target))
+                .Select(d => d.Target),
+            StringComparer.Ordinal);
         var seenTargets = new HashSet<string>(StringComparer.Ordinal);
         var seenIds = new HashSet<string>(StringComparer.Ordinal);
         var cleaned = new List<LauncherDockItem>();
@@ -583,7 +1169,7 @@ internal sealed class LauncherLayout
         {
             var kind = (source.Kind ?? "").Trim().ToLowerInvariant();
             var target = (source.Target ?? "").Trim();
-            if (!IsValidDockTarget(kind, target, appLookup, folderIds)) continue;
+            if (!IsValidDockTarget(kind, target, appLookup, folderIds, existingPinnedApps)) continue;
             if (!seenTargets.Add($"{kind}:{target}")) continue;
 
             var id = string.IsNullOrWhiteSpace(source.Id)
@@ -619,25 +1205,24 @@ internal sealed class LauncherLayout
         Save();
     }
 
-    private bool PruneDockItems(HashSet<string> validAppIds, HashSet<string> folderIds)
+    private bool PruneInvalidDockItemsNonDestructive(HashSet<string> folderIds)
     {
         var before = DockItems.Count;
         DockItems = DockItems
-            .Where(item => IsValidDockTarget(
-                (item.Kind ?? "").Trim().ToLowerInvariant(),
-                (item.Target ?? "").Trim(),
-                validAppIds,
-                folderIds))
+            .Where(item =>
+            {
+                var kind = (item.Kind ?? "").Trim().ToLowerInvariant();
+                var target = (item.Target ?? "").Trim();
+                if (kind == "app") return !string.IsNullOrWhiteSpace(target);
+                if (kind == "folder") return folderIds.Contains(target);
+                return IsValidSystemDockTarget(kind, target);
+            })
             .ToList();
         return DockItems.Count != before;
     }
 
-    private static bool IsValidDockTarget(
-        string kind,
-        string target,
-        IReadOnlyCollection<string> validAppIds)
+    private static bool IsValidSystemDockTarget(string kind, string target)
     {
-        if (kind == "app") return validAppIds.Contains(target);
         if (kind == "view" || kind == "action")
         {
             return AllowedDockTargets.Contains(target)
@@ -646,26 +1231,20 @@ internal sealed class LauncherLayout
         return false;
     }
 
-    private bool IsValidDockTarget(
-        string kind,
-        string target,
-        IReadOnlyDictionary<string, LinuxAppDto> appLookup,
-        HashSet<string> folderIds)
-    {
-        if (kind == "app") return appLookup.ContainsKey(target);
-        if (kind == "folder") return folderIds.Contains(target);
-        return IsValidDockTarget(kind, target, Array.Empty<string>()) || AllowedDockTargets.Contains(target);
-    }
-
     private static bool IsValidDockTarget(
         string kind,
         string target,
-        IReadOnlyCollection<string> validAppIds,
-        HashSet<string> folderIds)
+        IReadOnlyDictionary<string, LinuxAppDto> appLookup,
+        HashSet<string> folderIds,
+        HashSet<string> existingPinnedApps)
     {
-        if (kind == "app") return validAppIds.Contains(target);
+        if (kind == "app")
+        {
+            return !string.IsNullOrWhiteSpace(target)
+                   && (appLookup.ContainsKey(target) || existingPinnedApps.Contains(target));
+        }
         if (kind == "folder") return folderIds.Contains(target);
-        return IsValidDockTarget(kind, target, Array.Empty<string>());
+        return IsValidSystemDockTarget(kind, target);
     }
 
     private string InferDockLabel(
@@ -718,9 +1297,16 @@ internal sealed class LauncherLayout
     }
 
     private static (int Row, int Col) FindFirstFreeCell(HashSet<(int Row, int Col)> occupied, int columns)
+        => FindFirstFreeCellFrom(occupied, columns, 0, 0);
+
+    private static (int Row, int Col) FindFirstFreeCellFrom(
+        HashSet<(int Row, int Col)> occupied,
+        int columns,
+        int startRow,
+        int startCol)
     {
-        int row = 0;
-        int col = 0;
+        int row = Math.Max(0, startRow);
+        int col = Math.Clamp(startCol, 0, columns - 1);
         while (occupied.Contains((row, col)))
         {
             col++;
