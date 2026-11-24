@@ -37,7 +37,7 @@ internal static class NativeHost
     private sealed record Command(
         string Type, string WindowId = "", string StageId = "", string Title = "",
         WindowRect Rect = default, double Scale = 1, string? ParentWindowId = null,
-        int Direction = -1, bool Maximized = false, string Text = "",
+        int Direction = -1, bool Maximized = false, string? Text = null, string? ImagePngBase64 = null,
         int Width = 0, int Height = 0, ulong Seq = 0, string WmClass = "", string Url = "",
         string? IconPng = null, int? Lz4Bytes = null);
 
@@ -80,7 +80,15 @@ internal static class NativeHost
             try
             {
                 _dispatcher = new Dispatcher(ex => Stop(ex));
-                _dispatcher.ClipboardChanged += text => Emit(new { type = "host_clipboard_changed", text });
+                _dispatcher.ClipboardChanged += payload =>
+                {
+                    if (payload.ImagePng is not null)
+                        Emit(new { type = "host_clipboard_changed", image_png_base64 = Convert.ToBase64String(payload.ImagePng) });
+                    else if (payload.Text is not null)
+                        Emit(new { type = "host_clipboard_changed", text = payload.Text });
+                    else
+                        Emit(new { type = "host_clipboard_changed" });
+                };
             }
             catch
             {
@@ -94,6 +102,7 @@ internal static class NativeHost
             var primary = WorkAreaForMonitor(MonitorFromPoint(default, MonitorDefaultToPrimary));
             Emit(new { type = "ready", scale = GetDpiForSystem() / 96.0,
                 width = primary.Monitor.Width, height = primary.Monitor.Height, lz4 = true });
+            _dispatcher.SyncInitialClipboard();
 
             Task<bool> writer = Task.Factory.StartNew(() => WriteEvents(output), CancellationToken.None,
                 TaskCreationOptions.LongRunning, TaskScheduler.Default);
@@ -206,7 +215,25 @@ internal static class NativeHost
                     Emit(new { type = "frame_done", window_id = id, seq = command.Seq });
                     break;
                 case "clipboard":
-                    _dispatcher.SetClipboard(command.Text);
+                    if (command.ImagePngBase64 is not null)
+                    {
+                        try
+                        {
+                            _dispatcher.SetClipboardImage(Convert.FromBase64String(command.ImagePngBase64));
+                        }
+                        catch (FormatException ex)
+                        {
+                            Console.Error.WriteLine($"FocusStage window host: invalid clipboard PNG base64: {ex.Message}");
+                        }
+                    }
+                    else if (command.Text is not null)
+                    {
+                        _dispatcher.SetClipboard(command.Text);
+                    }
+                    else
+                    {
+                        _dispatcher.ClearClipboard();
+                    }
                     break;
                 case "open_url":
                     OpenWebUrl(command.Url);
@@ -388,7 +415,7 @@ internal static class NativeHost
         private bool _listening;
         private uint? _lastClipboardSequence;
 
-        internal event Action<string>? ClipboardChanged;
+        internal event Action<ClipboardPayload>? ClipboardChanged;
 
         internal Dispatcher(Action<Exception> failed)
         {
@@ -398,6 +425,16 @@ internal static class NativeHost
             _listening = AddClipboardFormatListener(_hwnd);
             if (!_listening)
                 Console.Error.WriteLine("FocusStage window host: unable to listen for clipboard changes.");
+        }
+
+        internal void SyncInitialClipboard()
+        {
+            if (TryReadClipboard(_hwnd, out uint sequence, out var payload))
+            {
+                _lastClipboardSequence = sequence;
+                if (!payload.IsEmpty)
+                    ClipboardChanged?.Invoke(payload);
+            }
         }
 
         internal void Post(Action action)
@@ -434,12 +471,11 @@ internal static class NativeHost
                     }
                     return;
                 case ClipboardUpdate:
-                    if (GetClipboardOwner() != _hwnd && TryReadClipboard(_hwnd, out uint sequence, out var text)
+                    if (GetClipboardOwner() != _hwnd && TryReadClipboard(_hwnd, out uint sequence, out var payload)
                         && sequence != _lastClipboardSequence)
                     {
                         _lastClipboardSequence = sequence;
-                        if (text is not null)
-                            ClipboardChanged?.Invoke(text);
+                        ClipboardChanged?.Invoke(payload);
                     }
                     return;
             }
@@ -448,8 +484,24 @@ internal static class NativeHost
 
         internal void SetClipboard(string text)
         {
-            if (!TryWriteClipboard(_hwnd, text))
+            if (TryWriteClipboard(_hwnd, text))
+                _lastClipboardSequence = GetClipboardSequenceNumber();
+            else
                 Console.Error.WriteLine("FocusStage window host: unable to write Windows clipboard text.");
+        }
+
+        internal void SetClipboardImage(byte[] pngBytes)
+        {
+            if (TryWriteClipboardImage(_hwnd, pngBytes))
+                _lastClipboardSequence = GetClipboardSequenceNumber();
+            else
+                Console.Error.WriteLine("FocusStage window host: unable to write Windows clipboard image.");
+        }
+
+        internal void ClearClipboard()
+        {
+            if (TryClearClipboard(_hwnd))
+                _lastClipboardSequence = GetClipboardSequenceNumber();
         }
 
         public void Dispose()

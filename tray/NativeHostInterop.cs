@@ -1,4 +1,6 @@
 using System.ComponentModel;
+using System.Drawing;
+using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -154,35 +156,64 @@ internal static class NativeHostInterop
         [PreserveSig] int SetValue(in PropertyKey key, in PropertyVariant value);
     }
 
+    private const uint CfDib = 8;
     private const uint CfUnicodeText = 13;
+    private const int MaxClipboardBytes = 32 * 1024 * 1024;
+    private static readonly uint CfPng = RegisterClipboardFormat("PNG");
 
-    internal static bool TryReadClipboard(nint hwnd, out uint sequence, out string? text)
+    internal readonly record struct ClipboardPayload(string? Text, byte[]? ImagePng)
+    {
+        internal bool IsEmpty => Text is null && ImagePng is null;
+    }
+
+    internal static bool TryReadClipboard(nint hwnd, out uint sequence, out ClipboardPayload payload)
     {
         sequence = 0;
-        text = null;
+        payload = default;
         if (!OpenClipboard(hwnd))
             return false;
         try
         {
-            if (!IsClipboardFormatAvailable(CfUnicodeText))
-            {
-                if (CountClipboardFormats() == 0)
-                    text = "";
-            }
-            else
+            if (IsClipboardFormatAvailable(CfUnicodeText))
             {
                 nint data = GetClipboardData(CfUnicodeText);
+                if (data == 0)
+                    return false;
                 nint pointer = GlobalLock(data);
                 if (pointer == 0)
                     return false;
                 try
                 {
-                    text = Marshal.PtrToStringUni(pointer);
+                    string? text = Marshal.PtrToStringUni(pointer);
+                    if (text is not null)
+                    {
+                        if (Encoding.UTF8.GetByteCount(text) > MaxClipboardBytes)
+                            return false;
+                        payload = new ClipboardPayload(text, null);
+                    }
                 }
                 finally
                 {
                     GlobalUnlock(data);
                 }
+            }
+            else if (CfPng != 0 && IsClipboardFormatAvailable(CfPng)
+                && TryReadClipboardBytes(CfPng, out byte[]? pngBytes)
+                && pngBytes is { Length: > 0 })
+            {
+                payload = new ClipboardPayload(null, pngBytes);
+            }
+            else if (IsClipboardFormatAvailable(CfDib)
+                && TryReadClipboardBytes(CfDib, out byte[]? dibBytes)
+                && dibBytes is not null
+                && TryConvertDibToPng(dibBytes, out byte[]? convertedPng)
+                && convertedPng is { Length: > 0 and <= MaxClipboardBytes })
+            {
+                payload = new ClipboardPayload(null, convertedPng);
+            }
+            else if (CountClipboardFormats() == 0)
+            {
+                payload = default;
             }
             sequence = GetClipboardSequenceNumber();
             return true;
@@ -190,6 +221,100 @@ internal static class NativeHostInterop
         finally
         {
             CloseClipboard();
+        }
+    }
+
+    private static bool TryReadClipboardBytes(uint format, out byte[]? bytes)
+    {
+        bytes = null;
+        nint data = GetClipboardData(format);
+        if (data == 0)
+            return false;
+        nuint size = GlobalSize(data);
+        if (size == 0 || size > MaxClipboardBytes)
+            return false;
+        nint pointer = GlobalLock(data);
+        if (pointer == 0)
+            return false;
+        try
+        {
+            bytes = new byte[(int)size];
+            Marshal.Copy(pointer, bytes, 0, bytes.Length);
+            return true;
+        }
+        finally
+        {
+            GlobalUnlock(data);
+        }
+    }
+
+    private static bool TryConvertDibToPng(byte[] dib, out byte[]? png)
+    {
+        png = null;
+        if (dib.Length < 40)
+            return false;
+        uint headerSize = BitConverter.ToUInt32(dib, 0);
+        if (headerSize < 40 || headerSize > dib.Length)
+            return false;
+        ushort bitCount = BitConverter.ToUInt16(dib, 14);
+        uint compression = BitConverter.ToUInt32(dib, 16);
+        uint clrUsed = BitConverter.ToUInt32(dib, 32);
+        uint maskBytes = (headerSize == 40 && compression == 3) ? 12u : 0u;
+        uint paletteColors = clrUsed != 0 ? clrUsed : (bitCount <= 8 ? (1u << bitCount) : 0u);
+        ulong offset = 14ul + headerSize + maskBytes + paletteColors * 4ul;
+        if (offset > (ulong)(14 + dib.Length))
+            return false;
+
+        try
+        {
+            using var bmpStream = new MemoryStream(14 + dib.Length);
+            Span<byte> fileHeader = stackalloc byte[14];
+            fileHeader[0] = (byte)'B';
+            fileHeader[1] = (byte)'M';
+            BitConverter.TryWriteBytes(fileHeader[2..6], checked((uint)(14 + dib.Length)));
+            fileHeader[6..10].Clear();
+            BitConverter.TryWriteBytes(fileHeader[10..14], (uint)offset);
+            bmpStream.Write(fileHeader);
+            bmpStream.Write(dib, 0, dib.Length);
+            bmpStream.Position = 0;
+
+            using var bitmap = new Bitmap(bmpStream);
+            using var pngStream = new MemoryStream();
+            bitmap.Save(pngStream, ImageFormat.Png);
+            png = pngStream.ToArray();
+            return true;
+        }
+        catch (Exception ex) when (ex is ArgumentException or ExternalException or IOException)
+        {
+            return false;
+        }
+    }
+
+    private static nint AllocateHGlobal(byte[] bytes)
+    {
+        const uint GmemMoveable = 0x0002;
+        nint data = GlobalAlloc(GmemMoveable, checked((nuint)bytes.Length));
+        if (data == 0)
+            return 0;
+        nint pointer = GlobalLock(data);
+        if (pointer == 0)
+        {
+            GlobalFree(data);
+            return 0;
+        }
+        try
+        {
+            Marshal.Copy(bytes, 0, pointer, bytes.Length);
+            return data;
+        }
+        catch
+        {
+            GlobalFree(data);
+            throw;
+        }
+        finally
+        {
+            GlobalUnlock(data);
         }
     }
 
@@ -231,6 +356,80 @@ internal static class NativeHostInterop
         {
             if (data != 0)
                 GlobalFree(data);
+        }
+    }
+
+    internal static bool TryWriteClipboardImage(nint hwnd, byte[] pngBytes)
+    {
+        if (pngBytes.Length == 0 || pngBytes.Length > MaxClipboardBytes)
+            return false;
+
+        byte[]? dibBytes = null;
+        try
+        {
+            using var ms = new MemoryStream(pngBytes);
+            using var bitmap = new Bitmap(ms);
+            using var bmpStream = new MemoryStream();
+            bitmap.Save(bmpStream, ImageFormat.Bmp);
+            if (bmpStream.Length > 14)
+                dibBytes = bmpStream.GetBuffer()[14..(int)bmpStream.Length];
+        }
+        catch (Exception ex) when (ex is ArgumentException or ExternalException or IOException)
+        {
+            // Fall back to writing raw PNG if GDI+ cannot decode the image.
+        }
+
+        nint pngHandle = CfPng != 0 ? AllocateHGlobal(pngBytes) : 0;
+        nint dibHandle = dibBytes is not null ? AllocateHGlobal(dibBytes) : 0;
+        if (pngHandle == 0 && dibHandle == 0)
+            return false;
+
+        try
+        {
+            if (!OpenClipboard(hwnd))
+                return false;
+            try
+            {
+                if (!EmptyClipboard())
+                    return false;
+                bool wroteAny = false;
+                if (pngHandle != 0 && SetClipboardData(CfPng, pngHandle) != 0)
+                {
+                    pngHandle = 0;
+                    wroteAny = true;
+                }
+                if (dibHandle != 0 && SetClipboardData(CfDib, dibHandle) != 0)
+                {
+                    dibHandle = 0;
+                    wroteAny = true;
+                }
+                return wroteAny;
+            }
+            finally
+            {
+                CloseClipboard();
+            }
+        }
+        finally
+        {
+            if (pngHandle != 0)
+                GlobalFree(pngHandle);
+            if (dibHandle != 0)
+                GlobalFree(dibHandle);
+        }
+    }
+
+    internal static bool TryClearClipboard(nint hwnd)
+    {
+        if (!OpenClipboard(hwnd))
+            return false;
+        try
+        {
+            return EmptyClipboard();
+        }
+        finally
+        {
+            CloseClipboard();
         }
     }
 
@@ -283,7 +482,9 @@ internal static class NativeHostInterop
     [DllImport("user32.dll")] internal static extern bool AddClipboardFormatListener(nint hwnd);
     [DllImport("user32.dll")] internal static extern bool RemoveClipboardFormatListener(nint hwnd);
     [DllImport("user32.dll")] internal static extern nint GetClipboardOwner();
-    [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll")] internal static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll", EntryPoint = "RegisterClipboardFormatW", CharSet = CharSet.Unicode)]
+    private static extern uint RegisterClipboardFormat(string format);
     [DllImport("user32.dll")] private static extern bool OpenClipboard(nint hwnd);
     [DllImport("user32.dll")] private static extern bool CloseClipboard();
     [DllImport("user32.dll")] private static extern bool EmptyClipboard();
@@ -293,6 +494,7 @@ internal static class NativeHostInterop
     [DllImport("user32.dll")] private static extern nint SetClipboardData(uint format, nint data);
     [DllImport("kernel32.dll")] private static extern nint GlobalAlloc(uint flags, nuint bytes);
     [DllImport("kernel32.dll")] private static extern nint GlobalFree(nint data);
+    [DllImport("kernel32.dll")] private static extern nuint GlobalSize(nint data);
     [DllImport("kernel32.dll")] private static extern nint GlobalLock(nint data);
     [DllImport("kernel32.dll")] private static extern bool GlobalUnlock(nint data);
     [DllImport("dwmapi.dll")] internal static extern int DwmExtendFrameIntoClientArea(nint hwnd, in Margins margins);

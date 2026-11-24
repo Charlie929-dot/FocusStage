@@ -740,6 +740,10 @@ internal sealed class FocusStageTrayContext : ApplicationContext
                         await RunFocusStageAsync("--json", "host-clipboard-sync", currentWin);
                     }
                 }
+                else
+                {
+                    _lastWinClipboard = "";
+                }
 
                 var (code, stdout) = await RunFocusStageAsync("--json", "host-clipboard-get");
                 if (code == 0 && !string.IsNullOrWhiteSpace(stdout))
