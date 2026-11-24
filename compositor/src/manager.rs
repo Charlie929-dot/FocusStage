@@ -99,9 +99,9 @@ impl FocusStageState {
             self.a11y.prepare_for_launch();
         }
 
-        // Snap wrappers can select X11 after we pass the default Wayland flags.
+        // Snap wrappers can select X11 even when the application requests Wayland.
         if kind == StageKind::X11
-            || (matches!(kind, StageKind::Electron | StageKind::Chromium) && is_snap_launcher(&app))
+            || (is_chromium(kind) && (chromium_platform(&args, is_wsl2()) != "wayland" || is_snap_launcher(&app)))
         {
             stage.pending_x11_launch = true;
             self.stages.insert(stage_id.clone(), stage);
@@ -165,6 +165,11 @@ impl FocusStageState {
         let window_id = stage.active_window().map(|window| window.id.clone());
         let pid = stage.pid;
         if opening_uri || !args.is_empty() {
+            if is_chromium(stage.kind) && explicit_chromium_platform(&args)
+                .is_some_and(|platform| platform != chromium_platform(&stage.args, is_wsl2()))
+            {
+                bail!("The running Stage uses a different Ozone platform; close it before changing the platform");
+            }
             prepare_handoff_args(stage, &mut args, cwd)?;
             let mut cmd = stage_command(&self.wayland_socket_name, stage, app, &args, stage.x11_display_number);
             if let Some(cwd) = cwd {
@@ -307,8 +312,41 @@ impl FocusStageState {
     }
 }
 
+fn is_chromium(kind: StageKind) -> bool {
+    matches!(kind, StageKind::Electron | StageKind::Chromium)
+}
+
 fn is_single_instance(kind: StageKind) -> bool {
-    matches!(kind, StageKind::Electron | StageKind::Chromium | StageKind::Gecko)
+    is_chromium(kind) || kind == StageKind::Gecko
+}
+
+fn explicit_chromium_platform(args: &[String]) -> Option<&str> {
+    args.iter().take_while(|arg| arg.as_str() != "--")
+        .filter_map(|arg| arg.strip_prefix("--ozone-platform="))
+        .last()
+}
+
+fn chromium_platform(args: &[String], wsl2: bool) -> &str {
+    explicit_chromium_platform(args).unwrap_or(if wsl2 { "x11" } else { "wayland" })
+}
+
+fn kernel_release() -> &'static str {
+    static RELEASE: OnceLock<String> = OnceLock::new();
+    RELEASE.get_or_init(|| std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .unwrap_or_default().to_ascii_lowercase())
+}
+
+fn is_wsl2() -> bool {
+    let release = kernel_release();
+    release.contains("wsl2") || release.contains("microsoft-standard")
+}
+
+pub(crate) fn wsl_gallium_driver() -> Option<OsString> {
+    if is_wsl2() && Path::new("/dev/dxg").exists() {
+        Some(std::env::var_os("GALLIUM_DRIVER").unwrap_or_else(|| "d3d12".into()))
+    } else {
+        None
+    }
 }
 
 fn profile_arguments(kind: StageKind, args: &[String]) -> anyhow::Result<Vec<&str>> {
@@ -461,7 +499,13 @@ fn stage_command(wayland_socket: &str, stage: &Stage, app: &str, args: &[String]
     apply_common_stage_env(&mut cmd, wayland_socket, x11_display);
     match stage.kind {
         StageKind::Chromium | StageKind::Electron => {
-            cmd.arg("--ozone-platform=wayland");
+            let platform = chromium_platform(&stage.args, is_wsl2());
+            if explicit_chromium_platform(args).is_none() {
+                cmd.arg(format!("--ozone-platform={platform}"));
+            }
+            if platform == "x11" {
+                cmd.env("GDK_BACKEND", "x11");
+            }
             cmd.arg("--enable-features=UseOzonePlatform");
             const FORCE_A11Y: &str = "--force-renderer-accessibility";
             if !args.iter().take_while(|arg| arg.as_str() != "--")
@@ -515,13 +559,12 @@ fn apply_common_stage_env(cmd: &mut Command, wayland_socket: &str, x11_display: 
     cmd.env("GTK_A11Y", "atspi");
     cmd.env("QT_ACCESSIBILITY", "1");
     cmd.env("ACCESSIBILITY_ENABLED", "1");
-    static IS_WSL: OnceLock<bool> = OnceLock::new();
-    if *IS_WSL.get_or_init(|| {
-        std::fs::read_to_string("/proc/sys/kernel/osrelease")
-            .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
-    }) {
+    if kernel_release().contains("microsoft") {
         // Launching a Linux desktop app here is intentional and stdin is closed.
         cmd.env("DONT_PROMPT_WSL_INSTALL", "1");
+    }
+    if let Some(driver) = wsl_gallium_driver() {
+        cmd.env("GALLIUM_DRIVER", driver);
     }
 
     // Chinese IME support (Fcitx5)
@@ -535,8 +578,8 @@ fn apply_common_stage_env(cmd: &mut Command, wayland_socket: &str, x11_display: 
         cmd.env("XMODIFIERS", "@im=fcitx");
     }
 
-    // Redirect XDG User Dirs to Windows user directories when /mnt/c/Users/<user> exists
-    if let Some(win_home) = detect_windows_user_dir() {
+    // Redirect XDG User Dirs to the Windows user profile that owns this WSL session.
+    if let Some(win_home) = crate::desktop::windows_user_home() {
         for (var, sub) in [
             ("XDG_DESKTOP_DIR", "Desktop"),
             ("XDG_DOWNLOAD_DIR", "Downloads"),
@@ -566,23 +609,6 @@ fn apply_stage_opener_env(cmd: &mut Command, inherited: impl Fn(&str) -> Option<
             cmd.env(key, fallback);
         }
     }
-}
-
-fn detect_windows_user_dir() -> Option<PathBuf> {
-    if let Ok(entries) = std::fs::read_dir("/mnt/c/Users") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let s = name.to_string_lossy();
-            if matches!(s.as_ref(), "Public" | "Default" | "Default User" | "All Users") {
-                continue;
-            }
-            let path = entry.path();
-            if path.join("Downloads").is_dir() && path.join("Desktop").is_dir() {
-                return Some(path);
-            }
-        }
-    }
-    None
 }
 
 fn read_process(pid: u32) -> Option<(u32, bool)> {

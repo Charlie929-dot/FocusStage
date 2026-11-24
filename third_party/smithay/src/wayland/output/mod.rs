@@ -161,6 +161,14 @@ impl Clone for OutputUserData {
 }
 
 impl Inner {
+    fn advertised_scale(&self, client_scale: f64) -> i32 {
+        let scale = match self.scale {
+            Scale::Fractional(scale) => scale,
+            _ => self.scale.integer_scale() as f64,
+        };
+        (scale / client_scale).ceil().max(1.) as i32
+    }
+
     fn send_geometry_to(&self, output: &WlOutput) {
         output.geometry(
             self.location.x,
@@ -248,8 +256,7 @@ impl Output {
                 inner.send_geometry_to(&output);
             }
             if (new_scale.is_some() || scale_changed) && output.version() >= 2 {
-                let scale = (inner.scale.integer_scale() as f64 / client_scale).max(1.).ceil() as i32;
-                output.scale(scale);
+                output.scale(inner.advertised_scale(client_scale));
             }
             if output.version() >= 2 {
                 output.done();

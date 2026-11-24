@@ -101,6 +101,9 @@ focusstage settings init-defaults
 # 列出已发现的 Linux GUI 应用（含按 Linux 图标主题解析的图标路径）
 focusstage --json list-apps
 
+# 卸载已发现的 Linux 应用（apt/snap/flatpak），或删除下载目录里的 .deb/.AppImage 安装包
+focusstage --json uninstall-app --app-id <focusstage-...>
+
 # 启动不同类型 Stage（--kind 支持 wayland / chromium / electron / gecko / x11；加 --ensure-daemon 自动拉起守护进程）
 focusstage launch --ensure-daemon foot
 focusstage launch --ensure-daemon --kind x11 xterm

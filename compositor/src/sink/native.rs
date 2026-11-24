@@ -1,5 +1,5 @@
 //! WSL interop transports a private duplex connection to a child Windows process.
-//! JSON lines carry metadata and input; frame payloads are raw, packed BGRA pixels.
+//! JSON lines carry metadata and input; frame payloads are packed BGRA, optionally LZ4-compressed.
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::os::fd::OwnedFd;
@@ -74,6 +74,8 @@ enum HostCommand<'a> {
         width: u32,
         height: u32,
         seq: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lz4_bytes: Option<usize>,
     },
 }
 
@@ -84,6 +86,8 @@ enum HostEvent {
         scale: f64,
         width: u32,
         height: u32,
+        #[serde(default)]
+        lz4: bool,
     },
     State {
         window_id: String,
@@ -202,9 +206,15 @@ impl HostEvent {
     }
 }
 
-struct Packet {
-    header: Vec<u8>,
-    pixels: Vec<u8>,
+enum Packet {
+    Control(Vec<u8>),
+    Frame {
+        window_id: String,
+        width: u32,
+        height: u32,
+        seq: u64,
+        pixels: Vec<u8>,
+    },
 }
 
 pub struct NativeSink {
@@ -213,7 +223,6 @@ pub struct NativeSink {
     events: Receiver<Option<HostEvent>>,
     wake: UnixStream,
     pending: HashMap<String, u64>,
-    frame_done: Vec<String>,
     recycled: Receiver<Vec<u8>>,
     seq: u64,
 }
@@ -243,7 +252,6 @@ impl NativeSink {
             events,
             wake,
             pending: HashMap::new(),
-            frame_done: Vec::new(),
             recycled,
             seq: 0,
         };
@@ -278,20 +286,13 @@ impl NativeSink {
                 let _ = notify.write_all(&[1]);
             })?;
 
-        let (rect, scale) = match sink.events.recv_timeout(Duration::from_secs(3))? {
-            Some(HostEvent::Ready {
-                scale,
-                width,
-                height,
-            }) if width > 0 && height > 0 && scale > 0.0 => (
-                SavedRect {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                },
-                scale,
-            ),
+        let (rect, scale, lz4) = match sink.events.recv_timeout(Duration::from_secs(3))? {
+            Some(HostEvent::Ready { scale, width, height, lz4 })
+                if width > 0 && height > 0 && scale > 0.0 => (
+                    SavedRect { x: 0, y: 0, width, height },
+                    scale,
+                    lz4,
+                ),
             _ => anyhow::bail!("Windows host did not send a ready event"),
         };
 
@@ -300,33 +301,49 @@ impl NativeSink {
             .name("focusstage-native-frames".into())
             .spawn(move || {
                 let mut input = BufWriter::new(input);
+                let mut compressed = Vec::new();
+                let mut header = Vec::new();
                 for packet in rx {
-                    let sent = input
-                        .write_all(&packet.header)
-                        .and_then(|()| input.write_all(&packet.pixels))
-                        .and_then(|()| input.flush());
+                    let sent = match packet {
+                        Packet::Control(header) => input.write_all(&header).and_then(|()| input.flush()),
+                        Packet::Frame { window_id, width, height, seq, pixels } => {
+                            let lz4_bytes = if lz4 && pixels.len() >= 256 * 1024 {
+                                compressed.resize(lz4_flex::block::get_maximum_output_size(pixels.len()), 0);
+                                lz4_flex::block::compress_into(&pixels, &mut compressed).ok()
+                                    .filter(|&len| len <= pixels.len() - pixels.len() / 8)
+                            } else {
+                                None
+                            };
+                            let payload = lz4_bytes.map_or(pixels.as_slice(), |len| &compressed[..len]);
+                            let command = HostCommand::Frame { window_id: &window_id, width, height, seq, lz4_bytes };
+                            header.clear();
+                            let sent = serde_json::to_writer(&mut header, &command)
+                                .map_err(io::Error::from)
+                                .and_then(|()| {
+                                    header.push(b'\n');
+                                    input.write_all(&header)?;
+                                    input.write_all(payload)?;
+                                    input.flush()
+                                });
+                            let _ = recycle.try_send(pixels);
+                            sent
+                        }
+                    };
                     if let Err(err) = sent {
                         warn!("Write Windows host: {err}");
                         break;
-                    }
-                    if !packet.pixels.is_empty() {
-                        let _ = recycle.try_send(packet.pixels);
                     }
                 }
             })?;
         Ok((sink, rect, scale))
     }
 
-    fn send(&self, command: HostCommand<'_>, pixels: Vec<u8>) -> bool {
+    fn command(&self, command: HostCommand<'_>) -> bool {
         let Ok(mut header) = serde_json::to_vec(&command) else {
             return false;
         };
         header.push(b'\n');
-        self.commands.send(Packet { header, pixels }).is_ok()
-    }
-
-    fn command(&self, command: HostCommand<'_>) {
-        self.send(command, Vec::new());
+        self.commands.send(Packet::Control(header)).is_ok()
     }
 }
 
@@ -380,15 +397,13 @@ impl DisplaySink for NativeSink {
 
     fn present_owned(&mut self, window_id: &str, width: u32, height: u32, bgra: Vec<u8>) {
         self.seq += 1;
-        if self.send(
-            HostCommand::Frame {
-                window_id,
-                width,
-                height,
-                seq: self.seq,
-            },
-            bgra,
-        ) {
+        if self.commands.send(Packet::Frame {
+            window_id: window_id.to_string(),
+            width,
+            height,
+            seq: self.seq,
+            pixels: bgra,
+        }).is_ok() {
             self.pending.insert(window_id.to_string(), self.seq);
         }
     }
@@ -435,7 +450,7 @@ impl DisplaySink for NativeSink {
     }
 
     fn open_web_url(&mut self, url: &str) -> bool {
-        crate::xdg::valid_web_url(url) && self.send(HostCommand::OpenUrl { url }, Vec::new())
+        crate::xdg::valid_web_url(url) && self.command(HostCommand::OpenUrl { url })
     }
 
     fn event_fd(&self) -> Option<OwnedFd> {
@@ -444,10 +459,6 @@ impl DisplaySink for NativeSink {
 
     fn is_frame_pending(&self, window_id: &str) -> bool {
         self.pending.contains_key(window_id)
-    }
-
-    fn take_frame_done_windows(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.frame_done)
     }
 
     fn poll_events(&mut self) -> Vec<SinkInputEvent> {
@@ -466,7 +477,6 @@ impl DisplaySink for NativeSink {
                 Some(HostEvent::FrameDone { window_id, seq }) => {
                     if self.pending.get(&window_id) == Some(&seq) {
                         self.pending.remove(&window_id);
-                        self.frame_done.push(window_id);
                     }
                 }
                 Some(event) => events.extend(event.into_sink_event()),

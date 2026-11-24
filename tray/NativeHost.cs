@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
+using K4os.Compression.LZ4;
 using static FocusStageTray.NativeHostInterop;
 
 namespace FocusStageTray;
@@ -38,7 +39,7 @@ internal static class NativeHost
         WindowRect Rect = default, double Scale = 1, string? ParentWindowId = null,
         int Direction = -1, bool Maximized = false, string Text = "",
         int Width = 0, int Height = 0, ulong Seq = 0, string WmClass = "", string Url = "",
-        string? IconPng = null);
+        string? IconPng = null, int? Lz4Bytes = null);
 
     private static void OpenWebUrl(string url)
     {
@@ -92,7 +93,7 @@ internal static class NativeHost
         {
             var primary = WorkAreaForMonitor(MonitorFromPoint(default, MonitorDefaultToPrimary));
             Emit(new { type = "ready", scale = GetDpiForSystem() / 96.0,
-                width = primary.Monitor.Width, height = primary.Monitor.Height });
+                width = primary.Monitor.Width, height = primary.Monitor.Height, lz4 = true });
 
             Task<bool> writer = Task.Factory.StartNew(() => WriteEvents(output), CancellationToken.None,
                 TaskCreationOptions.LongRunning, TaskScheduler.Default);
@@ -337,10 +338,27 @@ internal static class NativeHost
             byte[] pixels = ArrayPool<byte>.Shared.Rent(length);
             try
             {
-                int buffered = Math.Min(_end - _offset, length);
-                _buffer.AsSpan(_offset, buffered).CopyTo(pixels);
-                _offset += buffered;
-                input.ReadExactly(pixels.AsSpan(buffered, length - buffered));
+                if (command.Lz4Bytes is int compressedLength)
+                {
+                    if (compressedLength <= 0 || compressedLength >= length)
+                        throw new InvalidDataException("Invalid LZ4 frame length.");
+                    byte[] compressed = ArrayPool<byte>.Shared.Rent(compressedLength);
+                    try
+                    {
+                        var block = compressed.AsSpan(0, compressedLength);
+                        ReadPayload(block);
+                        if (LZ4Codec.Decode(block, pixels.AsSpan(0, length)) != length)
+                            throw new InvalidDataException("LZ4 frame did not decode to its declared dimensions.");
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(compressed);
+                    }
+                }
+                else
+                {
+                    ReadPayload(pixels.AsSpan(0, length));
+                }
                 return pixels;
             }
             catch
@@ -348,6 +366,14 @@ internal static class NativeHost
                 ArrayPool<byte>.Shared.Return(pixels);
                 throw;
             }
+        }
+
+        private void ReadPayload(Span<byte> payload)
+        {
+            int buffered = Math.Min(_end - _offset, payload.Length);
+            _buffer.AsSpan(_offset, buffered).CopyTo(payload);
+            _offset += buffered;
+            input.ReadExactly(payload[buffered..]);
         }
     }
 

@@ -81,7 +81,7 @@ where
         }
 
         if output.version() >= 2 {
-            output.scale(inner.scale.integer_scale());
+            output.scale(inner.advertised_scale(state.client_compositor_state(client).client_scale()));
             output.done();
         }
 

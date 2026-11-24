@@ -157,7 +157,9 @@ internal sealed class NativeHostRenderer(NativeHostRenderer.Factory factory) : I
         {
             // Use 96 DPI so draw coordinates and target/bitmap pixel sizes use the same units.
             var properties = new RenderTargetProperties(0, BgraOpaque, 96, 96, 0, 0);
-            var hwndProperties = new HwndTargetProperties(hwnd, size, 0);
+            // Let DWM pace desktop composition without blocking the window's input thread.
+            const int PresentImmediately = 2; // D2D1_PRESENT_OPTIONS_IMMEDIATELY
+            var hwndProperties = new HwndTargetProperties(hwnd, size, PresentImmediately);
             return _createTarget(_factory, in properties, in hwndProperties, out target);
         }
 
