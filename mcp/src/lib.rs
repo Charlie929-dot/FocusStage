@@ -88,6 +88,7 @@ impl McpState {
 }
 
 pub fn run_mcp_stdio(socket_path: PathBuf) -> anyhow::Result<()> {
+    focusstage_compositor::session_env::init_cli_environment(None);
     let client = ControlClient::new(socket_path);
     let state = McpState::default();
     let stdin = std::io::stdin();
@@ -221,13 +222,13 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
         },
         "stage_list_apps" => {
             let query = args.get("query").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
-            let apps: Vec<_> = apps::discover_desktop_apps().into_iter()
-                .filter(|app| app.is_launchable() && (app.wrapper_id.to_lowercase().contains(&query)
+            let apps: Vec<_> = apps::discover_desktop_apps_via_daemon(Some(client)).into_iter()
+                .filter(|app| app.is_launchable() && (app.id.to_lowercase().contains(&query)
                     || app.matches_name(|name| name.to_lowercase().contains(&query))))
                 .map(|app| json!({
-                    "id": app.wrapper_id,
-                    "name": app.parsed.name,
-                    "name_zh_cn": app.parsed.name_zh_cn,
+                    "id": app.id,
+                    "name": app.name,
+                    "name_zh_cn": app.name_zh_cn,
                 }))
                 .collect();
             text_ok(json!({ "count": apps.len(), "apps": apps }))
@@ -248,9 +249,9 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
             let (app, mut launch_args, wm_class) = match (app, app_id, app_name) {
                 (Some(app), None, None) if !app.trim().is_empty() => (app.to_owned(), Vec::new(), wm_class),
                 (None, Some(_), None) | (None, None, Some(_)) => {
-                    let catalog = apps::discover_desktop_apps();
+                    let catalog = apps::discover_desktop_apps_via_daemon(Some(client));
                     match apps::resolve_app(&catalog, app_id.map(str::trim), app_name.map(str::trim)) {
-                        Ok(entry) => (entry.parsed.cmd.clone(), entry.parsed.launch_args(), Some(entry.wrapper_id.clone())),
+                        Ok(entry) => (entry.cmd.clone(), entry.args.clone(), Some(entry.id.clone())),
                         Err(error) => return text_err(error),
                     }
                 }
@@ -1087,7 +1088,7 @@ fn mcp_tools_schema() -> Vec<Value> {
         }),
         json!({
             "name": "stage_acquire",
-            "description": "Acquire an exclusive AI control lease for a Stage. Preserves the Stage's current visibility by default (hidden stays hidden; visible stays visible with the AI takeover overlay unless hide: true is passed).",
+            "description": "Acquire an exclusive AI control lease for a Stage. Accepted observe, act, clipboard and file-drop requests using this lease refresh its idle timeout. Preserves Stage visibility unless hide is true.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1101,7 +1102,7 @@ fn mcp_tools_schema() -> Vec<Value> {
         }),
         json!({
             "name": "stage_renew",
-            "description": "Extend an active Stage lease TTL.",
+            "description": "Set the idle timeout for an active Stage lease and refresh its deadline.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1187,7 +1188,7 @@ fn mcp_tools_schema() -> Vec<Value> {
         }),
         json!({
             "name": "stage_release",
-            "description": "Release the Stage lease and optionally restore the window to its saved desktop position.",
+            "description": "Release the Stage lease and optionally restore the window to its saved desktop position. Recently ended leases can be released again. A late release can restore an expired lease's window only if no ownership or visibility change has superseded it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

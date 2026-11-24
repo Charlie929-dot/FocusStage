@@ -1,15 +1,17 @@
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use focusstage_compositor::control::ControlClient;
 use focusstage_compositor::desktop;
-use focusstage_compositor::icons::DesktopIcons;
-use focusstage_compositor::xdg::{self, SettingsAction};
 use focusstage_compositor::protocol::{
-    default_socket_path, Action, ControlRequest, ControlResponse, DisplayState, StageKind,
+    default_socket_path, windows_path_to_wsl, Action, ControlRequest, ControlResponse,
+    DesktopAppInfo, DisplayState, StageKind,
 };
-use focusstage_mcp::{apps::discover_desktop_apps, run_mcp_stdio};
+use focusstage_compositor::session_env;
+use focusstage_compositor::xdg::{self, SettingsAction};
+use focusstage_mcp::{apps::discover_desktop_apps_via_daemon, run_mcp_stdio};
 
 mod uninstall;
 
@@ -32,6 +34,12 @@ struct Cli {
 enum Commands {
     /// Run MCP server over stdio (for Claude Code / Cursor / AI agents)
     Mcp,
+    /// Ensure focusstaged is running and ready on the control socket
+    EnsureDaemon {
+        /// Native Windows host executable path (WSL or Windows path)
+        #[arg(long)]
+        native_host: Option<String>,
+    },
     /// Ping focusstaged
     Ping,
     /// List active Stages
@@ -85,6 +93,12 @@ enum Commands {
         /// Target applications directory (defaults to /usr/share/applications for root)
         #[arg(long)]
         out_dir: Option<PathBuf>,
+        /// Read discovered apps JSON ({"apps": [...]} or [...]) from stdin instead of scanning
+        #[arg(long, default_value_t = false)]
+        from_stdin: bool,
+        /// Scan using the specified Ubuntu user ID when invoked as root
+        #[arg(long)]
+        uid: Option<u32>,
     },
     /// Close a Stage
     Close { stage_id: String },
@@ -194,6 +208,7 @@ fn parse_kind(s: &str) -> anyhow::Result<StageKind> {
 }
 
 fn main() -> anyhow::Result<()> {
+    session_env::ensure_runtime_env_for_current_user();
     let cli = Cli::parse();
     let sock = cli.socket.unwrap_or_else(default_socket_path);
 
@@ -201,17 +216,34 @@ fn main() -> anyhow::Result<()> {
         return run_mcp_stdio(sock);
     }
 
+    if let Commands::EnsureDaemon { native_host } = cli.command {
+        let host_path = native_host
+            .as_deref()
+            .map(|p| PathBuf::from(windows_path_to_wsl(p)));
+        ensure_focusstaged_running(&sock, host_path.as_deref())?;
+        let resp = ControlClient::new(sock).call(&ControlRequest::Ping)?;
+        print_resp(&resp, cli.json);
+        return Ok(());
+    }
+
     if matches!(cli.command, Commands::ListApps) {
-        return run_list_apps(cli.json);
+        return run_list_apps(&sock, cli.json);
     }
 
     if let Commands::UninstallApp { app_id } = &cli.command {
-        return uninstall::run(app_id, cli.json);
+        session_env::init_cli_environment(None);
+        return uninstall::run(app_id, &sock, cli.json);
     }
 
-    if let Commands::SyncApps { remove, out_dir } = cli.command {
+    if let Commands::SyncApps {
+        remove,
+        out_dir,
+        from_stdin,
+        uid,
+    } = cli.command
+    {
         let target_dir = out_dir.unwrap_or_else(default_sync_apps_dir);
-        return run_sync_apps(&target_dir, remove, cli.json);
+        return run_sync_apps(&sock, &target_dir, remove, from_stdin, uid, cli.json);
     }
 
     if let Commands::Settings { action } = cli.command {
@@ -223,18 +255,52 @@ fn main() -> anyhow::Result<()> {
             SettingsCommand::SyncHandlers => SettingsAction::SyncHandlers,
             SettingsCommand::RemoveHandlers => SettingsAction::RemoveHandlers,
         };
-        let view = xdg::settings(action)?;
-        println!("{}", if cli.json { serde_json::to_string(&view)? } else { serde_json::to_string_pretty(&view)? });
+        let view = if !matches!(action, SettingsAction::RemoveHandlers) {
+            match ControlClient::new(&sock).call(&ControlRequest::Settings {
+                action: action.clone(),
+            }) {
+                Ok(ControlResponse::Settings { view }) => Some(view),
+                Ok(ControlResponse::Error { message, .. }) => anyhow::bail!("{message}"),
+                Ok(other) => anyhow::bail!("Unexpected response from focusstaged: {:?}", other),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let view = match view {
+            Some(v) => v,
+            None => {
+                session_env::init_cli_environment(None);
+                xdg::settings(action)?
+            }
+        };
+        println!(
+            "{}",
+            if cli.json {
+                serde_json::to_string(&view)?
+            } else {
+                serde_json::to_string_pretty(&view)?
+            }
+        );
         return Ok(());
     }
 
-    if matches!(cli.command, Commands::Launch { ensure_daemon: true, .. } | Commands::Open { ensure_daemon: true, .. }) {
-        ensure_focusstaged_running(&sock)?;
+    if matches!(
+        cli.command,
+        Commands::Launch {
+            ensure_daemon: true,
+            ..
+        } | Commands::Open {
+            ensure_daemon: true,
+            ..
+        }
+    ) {
+        ensure_focusstaged_running(&sock, None)?;
     }
 
     let client = ControlClient::new(sock);
     let req = match cli.command {
-        Commands::Mcp => unreachable!(),
+        Commands::Mcp | Commands::EnsureDaemon { .. } => unreachable!(),
         Commands::Ping => ControlRequest::Ping,
         Commands::List => ControlRequest::List,
         Commands::Launch {
@@ -407,7 +473,7 @@ fn print_resp(resp: &ControlResponse, json_mode: bool) {
     }
 }
 
-fn ensure_focusstaged_running(sock: &std::path::Path) -> anyhow::Result<()> {
+fn ensure_focusstaged_running(sock: &std::path::Path, native_host: Option<&Path>) -> anyhow::Result<()> {
     let client = ControlClient::new(sock.to_path_buf());
     if matches!(client.call(&ControlRequest::Ping), Ok(ControlResponse::Pong { .. })) {
         return Ok(());
@@ -431,19 +497,15 @@ fn ensure_focusstaged_running(sock: &std::path::Path) -> anyhow::Result<()> {
     {
         log_path
     } else {
-        PathBuf::from(format!("/tmp/focusstaged-{}.log", unsafe { libc::geteuid() }))
+        PathBuf::from(format!("/tmp/focusstaged-{}.log", session_env::current_uid()))
     };
 
-    let normalized_path = build_normalized_path();
-    let started_via_systemd = if std::path::Path::new("/run/systemd/system").exists()
-        && std::process::Command::new("systemctl")
-            .args(["--user", "status"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    {
+    let home = session_env::UserAccount::lookup(session_env::current_uid()).map(|a| a.home);
+    let normalized_path = session_env::build_normalized_path(
+        std::env::var("PATH").ok().as_deref(),
+        home.as_deref(),
+    );
+    let started_via_systemd = if session_env::systemd_user_available() {
         let mut sd = std::process::Command::new("systemd-run");
         sd.args(["--user", "--collect"])
             .args(["-E", &format!("PATH={normalized_path}")])
@@ -453,17 +515,22 @@ fn ensure_focusstaged_running(sock: &std::path::Path) -> anyhow::Result<()> {
                 "-p",
                 &format!("StandardError=append:{}", effective_log_path.display()),
             ]);
-        for key in ["DISPLAY", "WAYLAND_DISPLAY", "PULSE_SERVER", "WSL_INTEROP", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_DATA_DIRS"] {
-            if let Ok(val) = std::env::var(key) {
-                if !val.is_empty() {
-                    sd.args(["-E", &format!("{key}={val}")]);
+        for &key in session_env::caller_runtime_bridge_keys() {
+            if let Some(val) = session_env::os_var_nonempty(key) {
+                let val_str = val.to_string_lossy();
+                if key == "WAYLAND_DISPLAY" && val_str.starts_with("focusstage-") {
+                    continue;
                 }
+                sd.args(["-E", &format!("{key}={val_str}")]);
             }
         }
-        sd.arg(&exe)
-            .arg("--socket")
-            .arg(sock)
-            .stdin(std::process::Stdio::null())
+        sd.arg(&exe).arg("--socket").arg(sock);
+        if let Some(host) = native_host {
+            if !host.as_os_str().is_empty() {
+                sd.arg("--native-host").arg(host);
+            }
+        }
+        sd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         sd.status().is_ok_and(|s| s.success())
@@ -481,8 +548,13 @@ fn ensure_focusstaged_running(sock: &std::path::Path) -> anyhow::Result<()> {
         let mut cmd = std::process::Command::new(&exe);
         cmd.env("PATH", normalized_path)
             .arg("--socket")
-            .arg(sock)
-            .stdin(std::process::Stdio::null())
+            .arg(sock);
+        if let Some(host) = native_host {
+            if !host.as_os_str().is_empty() {
+                cmd.arg("--native-host").arg(host);
+            }
+        }
+        cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(log_file))
             .stderr(std::process::Stdio::from(log_err));
 
@@ -501,7 +573,7 @@ fn ensure_focusstaged_running(sock: &std::path::Path) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("Failed to start focusstaged: {e}"))?;
     }
 
-    for _ in 0..100 {
+    for _ in 0..200 {
         std::thread::sleep(std::time::Duration::from_millis(50));
         if matches!(client.call(&ControlRequest::Ping), Ok(ControlResponse::Pong { .. })) {
             return Ok(());
@@ -510,35 +582,8 @@ fn ensure_focusstaged_running(sock: &std::path::Path) -> anyhow::Result<()> {
     anyhow::bail!("Timed out waiting for focusstaged on {}", sock.display());
 }
 
-fn build_normalized_path() -> String {
-    let mut parts: Vec<String> = std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    let mut extras = vec![
-        "/usr/local/bin".to_string(),
-        "/usr/bin".to_string(),
-        "/bin".to_string(),
-        "/snap/bin".to_string(),
-        "/var/lib/flatpak/exports/bin".to_string(),
-    ];
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            extras.push(format!("{home}/.local/bin"));
-        }
-    }
-    for dir in extras {
-        if !parts.iter().any(|p| p == &dir) {
-            parts.push(dir);
-        }
-    }
-    parts.join(":")
-}
-
 fn default_sync_apps_dir() -> PathBuf {
-    if unsafe { libc::geteuid() } == 0 {
+    if session_env::current_uid() == 0 {
         PathBuf::from("/usr/share/applications")
     } else if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join(".local/share/applications")
@@ -547,49 +592,63 @@ fn default_sync_apps_dir() -> PathBuf {
     }
 }
 
-fn run_list_apps(json_mode: bool) -> anyhow::Result<()> {
-    let icons = DesktopIcons::new(&desktop::launcher_application_dirs());
-    let apps: Vec<_> = discover_desktop_apps()
-        .into_iter()
-        .map(|app| {
-            let args = app.parsed.launch_args();
-            let icon_path = app.parsed.icon.as_deref()
-                .and_then(|name| icons.resolve(name))
-                .and_then(|path| icons.windows_path(path));
-            serde_json::json!({
-                "id": app.wrapper_id,
-                "stem": app.stem,
-                "source": app.source,
-                "file_path": app.file_path,
-                "name": app.parsed.name,
-                "name_zh_cn": app.parsed.name_zh_cn,
-                "generic_name": app.parsed.generic_name,
-                "cmd": app.parsed.cmd,
-                "args": args,
-                "wm_class": app.wrapper_id,
-                "icon": app.parsed.icon,
-                "icon_path": icon_path,
-                "categories": app.parsed.categories,
-            })
-        })
-        .collect();
-    let payload = serde_json::json!({
-        "status": "apps",
-        "count": apps.len(),
-        "apps": apps,
-    });
-    println!(
-        "{}",
-        if json_mode {
-            serde_json::to_string(&payload)?
-        } else {
-            serde_json::to_string_pretty(&payload)?
+fn run_list_apps(sock: &Path, json_mode: bool) -> anyhow::Result<()> {
+    let client = ControlClient::new(sock.to_path_buf());
+    let resp = match client.call(&ControlRequest::ListApps) {
+        Ok(resp) => resp,
+        Err(_) => {
+            session_env::init_cli_environment(None);
+            let apps = desktop::discover_launcher_apps(true);
+            ControlResponse::Apps {
+                count: apps.len(),
+                apps,
+            }
         }
-    );
+    };
+    print_resp(&resp, json_mode);
+    if matches!(resp, ControlResponse::Error { .. }) {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
-fn run_sync_apps(out_dir: &std::path::Path, remove: bool, json_mode: bool) -> anyhow::Result<()> {
+fn parse_sync_apps_json(raw: &str) -> anyhow::Result<Vec<DesktopAppInfo>> {
+    #[derive(serde::Deserialize)]
+    struct AppsEnvelope {
+        apps: Vec<DesktopAppInfo>,
+    }
+    if let Ok(envelope) = serde_json::from_str::<AppsEnvelope>(raw) {
+        return Ok(envelope.apps);
+    }
+    Ok(serde_json::from_str::<Vec<DesktopAppInfo>>(raw)?)
+}
+
+fn resolve_sync_apps_uid(explicit_uid: Option<u32>) -> Option<u32> {
+    if explicit_uid.is_some() {
+        return explicit_uid;
+    }
+    if session_env::current_uid() == 0 {
+        for key in ["SUDO_UID", "PKEXEC_UID"] {
+            if let Ok(val) = std::env::var(key) {
+                if let Ok(uid) = val.trim().parse::<u32>() {
+                    if uid != 0 {
+                        return Some(uid);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn run_sync_apps(
+    sock: &Path,
+    out_dir: &std::path::Path,
+    remove: bool,
+    from_stdin: bool,
+    uid: Option<u32>,
+    json_mode: bool,
+) -> anyhow::Result<()> {
     if remove {
         let mut removed = Vec::new();
         if let Ok(entries) = std::fs::read_dir(out_dir) {
@@ -618,27 +677,42 @@ fn run_sync_apps(out_dir: &std::path::Path, remove: bool, json_mode: bool) -> an
         return Ok(());
     }
 
+    let discovered = if from_stdin {
+        let mut raw = String::new();
+        std::io::stdin().read_to_string(&mut raw)?;
+        parse_sync_apps_json(&raw)?
+    } else if let Some(target_uid) = resolve_sync_apps_uid(uid) {
+        session_env::init_cli_environment(Some(target_uid));
+        desktop::discover_launcher_apps(false)
+    } else {
+        let client = ControlClient::new(sock.to_path_buf());
+        if let Ok(ControlResponse::Apps { apps, .. }) = client.call(&ControlRequest::ListApps) {
+            apps
+        } else {
+            session_env::init_cli_environment(None);
+            discover_desktop_apps_via_daemon(None)
+        }
+    };
+
     std::fs::create_dir_all(out_dir)?;
     let mut created = Vec::new();
     let mut kept = std::collections::HashSet::new();
-    for app in discover_desktop_apps() {
+    for app in discovered {
         if app.source != "desktop" {
             continue;
         }
-        let parsed = &app.parsed;
-        let wrapper_id = &app.wrapper_id;
+        let wrapper_id = &app.id;
         let filename = format!("{wrapper_id}.desktop");
         kept.insert(filename.clone());
         let wrapper_path = out_dir.join(&filename);
         let mut exec_line = format!(
             "/usr/local/bin/focusstage-launch --wm-class {} {}",
             shell_quote_desktop(wrapper_id),
-            shell_quote_desktop(&parsed.cmd)
+            shell_quote_desktop(&app.cmd)
         );
-        let args = parsed.launch_args();
-        if !args.is_empty() {
+        if !app.args.is_empty() {
             exec_line.push_str(" --");
-            for a in &args {
+            for a in &app.args {
                 exec_line.push(' ');
                 exec_line.push_str(&shell_quote_desktop(a));
             }
@@ -647,19 +721,19 @@ fn run_sync_apps(out_dir: &std::path::Path, remove: bool, json_mode: bool) -> an
         let mut out = String::new();
         out.push_str("[Desktop Entry]\n");
         out.push_str("Type=Application\n");
-        out.push_str(&format!("Name={} (FocusStage)\n", parsed.name));
-        if let Some(ref zh) = parsed.name_zh_cn {
+        out.push_str(&format!("Name={} (FocusStage)\n", app.name));
+        if let Some(ref zh) = app.name_zh_cn {
             out.push_str(&format!("Name[zh_CN]={zh} (FocusStage)\n"));
         }
-        if let Some(ref g) = parsed.generic_name {
+        if let Some(ref g) = app.generic_name {
             out.push_str(&format!("GenericName={g}\n"));
         }
         out.push_str(&format!("Exec={exec_line}\n"));
-        if let Some(ref icon) = parsed.icon {
+        if let Some(ref icon) = app.icon {
             out.push_str(&format!("Icon={icon}\n"));
         }
         out.push_str("Terminal=false\n");
-        if let Some(ref cats) = parsed.categories {
+        if let Some(ref cats) = app.categories {
             out.push_str(&format!("Categories={cats}\n"));
         }
         out.push_str(&format!("StartupWMClass={wrapper_id}\n"));
@@ -667,9 +741,9 @@ fn run_sync_apps(out_dir: &std::path::Path, remove: bool, json_mode: bool) -> an
         std::fs::write(&wrapper_path, out)?;
         created.push(serde_json::json!({
             "id": wrapper_id,
-            "name": format!("{} (FocusStage)", parsed.name),
+            "name": format!("{} (FocusStage)", app.name),
             "path": wrapper_path.display().to_string(),
-            "cmd": parsed.cmd,
+            "cmd": app.cmd,
         }));
     }
 
@@ -761,5 +835,19 @@ Exec=/snap/bin/chromium
 
         let hidden = "[Desktop Entry]\nType=Application\nName=Helper\nExec=helper\nNoDisplay=true\n";
         assert!(desktop::parse(hidden).unwrap().no_display);
+    }
+
+    #[test]
+    fn parses_sync_apps_envelope_and_array() {
+        let envelope = r#"{"status":"apps","count":1,"apps":[{"id":"focusstage-foo","stem":"foo","source":"desktop","name":"Foo","cmd":"/usr/bin/foo","args":["--bar"],"wm_class":"focusstage-foo"}]}"#;
+        let parsed = super::parse_sync_apps_json(envelope).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "focusstage-foo");
+        assert_eq!(parsed[0].args, ["--bar"]);
+
+        let array = r#"[{"id":"focusstage-baz","stem":"baz","source":"appimage","name":"Baz","cmd":"/tmp/Baz.AppImage","wm_class":"focusstage-baz"}]"#;
+        let parsed_arr = super::parse_sync_apps_json(array).unwrap();
+        assert_eq!(parsed_arr.len(), 1);
+        assert_eq!(parsed_arr[0].source, "appimage");
     }
 }

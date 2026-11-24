@@ -13,6 +13,11 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($WslRepo)) {
     throw "Failed to resolve WSL path for $RepoRoot in distro '$Distro'."
 }
 $WslRepo = $WslRepo.Trim()
+$WslUid = wsl.exe -d $Distro -e /usr/bin/id -u
+if ($LASTEXITCODE -ne 0 -or $WslUid -notmatch '^[0-9]+$') {
+    throw "Failed to identify the Ubuntu user in '$Distro'."
+}
+$WslUid = $WslUid.Trim()
 $InstallDir = Join-Path $env:LOCALAPPDATA "FocusStage"
 
 Write-Host "[1/5] Stopping existing FocusStage processes..." -ForegroundColor Cyan
@@ -31,6 +36,7 @@ if (-not $SkipRustBuild) {
 }
 
 Write-Host "[3/5] Installing WSL binaries and desktop helpers..." -ForegroundColor Cyan
+$desktopPackages = 'python3 pkexec policykit-1-gnome gnome-keyring xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland xdg-utils desktop-file-utils'
 $installCmd = @(
     "install -m 755 '$WslRepo/target/release/focusstaged' /usr/local/bin/focusstaged",
     "install -m 755 '$WslRepo/target/release/focusstage' /usr/local/bin/focusstage",
@@ -38,8 +44,9 @@ $installCmd = @(
     "chmod 755 /usr/local/bin/focusstage-launch",
     "sed 's/\r`$//' '$WslRepo/scripts/focusstage-open' > /usr/local/bin/focusstage-open",
     "chmod 755 /usr/local/bin/focusstage-open",
-    "if command -v apt-get >/dev/null 2>&1 && ! dpkg -s policykit-1-gnome gnome-keyring xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland xdg-utils desktop-file-utils >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq policykit-1-gnome gnome-keyring xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland xdg-utils desktop-file-utils && fc-cache -f >/dev/null 2>&1; fi",
-    "/usr/local/bin/focusstage --json sync-apps >/dev/null"
+    "if command -v apt-get >/dev/null 2>&1 && ! dpkg -s $desktopPackages >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $desktopPackages && fc-cache -f >/dev/null 2>&1; fi",
+    "/usr/bin/python3 -I '$WslRepo/scripts/focusstage-auth' setup $WslUid",
+    "/usr/local/bin/focusstage --json sync-apps --uid $WslUid >/dev/null"
 ) -join " && "
 wsl.exe -d $Distro -u root -e bash -lc $installCmd
 if ($LASTEXITCODE -ne 0) {

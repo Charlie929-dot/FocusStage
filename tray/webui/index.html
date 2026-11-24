@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <div id="app" class="app-shell">
+  <div id="app" class="app-shell session-locked">
     <!-- Frameless Win11 titlebar -->
     <header class="titlebar" data-drag-region>
       <div class="titlebar-left" data-drag-region>
@@ -76,6 +76,23 @@
     </header>
 
     <main class="workspace">
+      <section class="launcher-lock" aria-labelledby="unlock-title">
+        <div class="launcher-lock-card">
+          <div class="launcher-lock-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none">
+              <rect x="5.5" y="10.5" width="13" height="10" rx="2.2" stroke="currentColor" stroke-width="1.6" />
+              <path d="M8 10.5V7a4 4 0 1 1 8 0v3.5M12 14.6v2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+            </svg>
+          </div>
+          <h1 id="unlock-title">解锁启动器</h1>
+          <p>验证身份后进入 Ubuntu 桌面会话。</p>
+          <div class="launcher-lock-actions">
+            <button type="button" class="btn btn-primary" id="btn-unlock">验证身份</button>
+            <button type="button" class="btn btn-ghost" id="btn-unlock-linux">使用 Linux 密码</button>
+          </div>
+          <div id="unlock-status" class="launcher-lock-status" role="status"></div>
+        </div>
+      </section>
       <!-- VIEW 1: Apps Desktop -->
       <section id="view-apps" class="view view-apps is-active" aria-label="应用桌面">
         <div id="apps-scroll" class="apps-scroll">

@@ -97,6 +97,7 @@ pub struct FocusStageState {
     pub stages: HashMap<String, Stage>,
     pub next_stage_seq: u64,
     pub next_lease_seq: u64,
+    pub(crate) ended_leases: std::collections::VecDeque<(String, crate::control::LeaseEnd)>,
     pub(crate) handoff_children: Vec<std::process::Child>,
 
     pub xwms: HashMap<XwmId, X11Wm>,
@@ -172,6 +173,7 @@ impl FocusStageState {
             stages: HashMap::new(),
             next_stage_seq: 0,
             next_lease_seq: 0,
+            ended_leases: Default::default(),
             handoff_children: Vec::new(),
             xwms: HashMap::new(),
             xwm_to_stage: HashMap::new(),
@@ -1710,10 +1712,113 @@ mod tests {
             },
         );
         log.lock().unwrap().overlays.clear();
+        state.send_stage_evdev_key(&sid, 29, true); // KEY_LEFTCTRL
+        state.send_stage_button(&sid, 50.0, 50.0, 0x110, true); // BTN_LEFT
+        assert!(state.stages[&sid].input.pressed_keys.contains(&29));
+        assert!(state.stages[&sid].input.pressed_buttons.contains(&0x110));
         state.stages.get_mut(&sid).unwrap().lease.as_mut().unwrap().expires_at =
             Instant::now() - Duration::from_secs(1);
         state.expire_leases();
         assert_eq!(state.stages[&sid].input_owner, InputOwner::Human);
+        assert!(state.stages[&sid].input.pressed_keys.is_empty());
+        assert!(state.stages[&sid].input.pressed_buttons.is_empty());
         assert!(!log.lock().unwrap().overlays.last().unwrap().active);
+    }
+
+    #[test]
+    fn lease_activity_and_late_release_follow_the_idle_deadline() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use crate::control::ControlServerMessage;
+        use crate::protocol::{ActStatus, Action, ControlRequest, ControlResponse, InputOwner};
+
+        let event_loop = EventLoop::try_new().unwrap();
+        let display = Display::<FocusStageState>::new().unwrap();
+        let mut state = FocusStageState::new(
+            &display.handle(), event_loop.handle(), "focusstage-lease-test".into(), 1.0, 60,
+            SavedRect { x: 0, y: 0, width: 640, height: 480 }, None,
+        );
+        let sid = "stage-1".to_string();
+        state.stages.insert(sid.clone(), Stage::new(
+            sid.clone(), "test".into(), Vec::new(), StageKind::Wayland,
+            640, 480, DisplayState::Desktop, 1.0,
+        ));
+        let dispatch = |state: &mut FocusStageState, request| {
+            let (reply_tx, rx) = mpsc::channel();
+            state.handle_control_message(ControlServerMessage { request, reply_tx, peer_pid: None });
+            rx
+        };
+        let send = |state: &mut FocusStageState, request| dispatch(state, request).try_recv().unwrap();
+        let acquire = |state: &mut FocusStageState| {
+            match send(state, ControlRequest::Acquire {
+                stage_id: sid.clone(), ttl_s: 60, hide: true, agent_name: None,
+            }) {
+                ControlResponse::Acquired { lease, .. } => lease,
+                other => panic!("expected a lease, got {other:?}"),
+            }
+        };
+        let release = |state: &mut FocusStageState, lease: &str| {
+            send(state, ControlRequest::Release { lease: lease.into(), show_on_desktop: true })
+        };
+        let set_deadline = |state: &mut FocusStageState, at| {
+            state.stages.get_mut(&sid).unwrap().lease.as_mut().unwrap().expires_at = at;
+        };
+        let observe = |lease| ControlRequest::Observe {
+            lease, stage_id: Some(sid.clone()), image: false, a11y: false,
+        };
+        let lease = acquire(&mut state);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        set_deadline(&mut state, deadline);
+        assert!(matches!(send(&mut state, observe(None)), ControlResponse::Observed { .. }));
+        assert_eq!(state.stages[&sid].lease.as_ref().unwrap().expires_at, deadline);
+        assert!(matches!(send(&mut state, observe(Some(lease.clone()))), ControlResponse::Observed { .. }));
+        assert!(state.stages[&sid].lease.as_ref().unwrap().expires_at > deadline);
+
+        assert!(matches!(send(&mut state, ControlRequest::Renew { lease: lease.clone(), ttl_s: 20 }),
+            ControlResponse::Acquired { expires_in_s: 20, .. }));
+        for request in [
+            ControlRequest::ClipboardGet { lease: Some(lease.clone()), stage_id: None },
+            ControlRequest::ClipboardSet { lease: Some(lease.clone()), stage_id: None, text: "test".into() },
+            ControlRequest::DropFilesLeased { lease: lease.clone(), paths: vec!["/tmp/test".into()], position: None },
+        ] {
+            let before = Instant::now();
+            set_deadline(&mut state, before + Duration::from_secs(5));
+            send(&mut state, request);
+            let after = Instant::now();
+            let expires_at = state.stages[&sid].lease.as_ref().unwrap().expires_at;
+            assert!((before + Duration::from_secs(20)..=after + Duration::from_secs(20)).contains(&expires_at));
+        }
+
+        set_deadline(&mut state, Instant::now() + Duration::from_secs(5));
+        let pending = dispatch(&mut state, ControlRequest::Act {
+            lease: lease.clone(), actions: vec![Action::Wait { ms: 100 }], based_on: None,
+            settle: Some(false), settle_ms: None,
+        });
+        assert!(state.stages[&sid].lease.as_ref().unwrap().expires_at > Instant::now() + Duration::from_secs(5));
+        set_deadline(&mut state, Instant::now());
+        state.tick_pending_act_jobs();
+        assert!(matches!(pending.try_recv().unwrap(), ControlResponse::ActResult {
+            act_status: ActStatus::Expired, executed_steps: 1, ..
+        }));
+        assert!(matches!(send(&mut state, ControlRequest::Renew { lease: lease.clone(), ttl_s: 60 }),
+            ControlResponse::Error { code, .. } if code == "expired"));
+        assert_eq!(state.stages[&sid].input_owner, InputOwner::Human);
+        assert_eq!(state.stages[&sid].display, DisplayState::Hidden);
+        assert!(matches!(release(&mut state, &lease), ControlResponse::Ok));
+        assert_eq!(state.stages[&sid].display, DisplayState::Desktop);
+
+        let replaced_lease = acquire(&mut state);
+        set_deadline(&mut state, Instant::now());
+        let new_lease = acquire(&mut state);
+        assert!(matches!(release(&mut state, &replaced_lease), ControlResponse::Ok));
+        assert!(matches!(release(&mut state, &lease), ControlResponse::Ok));
+        assert_eq!(state.stages[&sid].display, DisplayState::Hidden);
+        assert_eq!(state.stages[&sid].lease.as_ref().unwrap().lease_id, new_lease);
+        state.human_takeover(Some(&sid));
+        assert!(matches!(send(&mut state, observe(Some(new_lease.clone()))),
+            ControlResponse::Error { code, .. } if code == "preempted"));
+        assert!(matches!(release(&mut state, &new_lease), ControlResponse::Ok));
+        assert!(matches!(release(&mut state, "unknown"),
+            ControlResponse::Error { code, .. } if code == "invalid_lease"));
     }
 }

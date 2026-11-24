@@ -15,9 +15,45 @@ use crate::manager::HandoffWindows;
 use crate::protocol::{
     ActStatus, ControlRequest, ControlResponse, DisplayState, InputOwner, LaunchFrame,
 };
-use crate::router::{InputSource, PendingActJob, SettleState};
+use crate::router::{PendingActJob, SettleState};
 use crate::stage::{Lease, Stage, StageWindow};
 use crate::state::FocusStageState;
+
+const ENDED_LEASE_LIMIT: usize = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeaseEnd {
+    Expired,
+    Preempted,
+    Released,
+}
+
+impl LeaseEnd {
+    fn error(end: Option<Self>) -> ControlResponse {
+        let (code, message) = match end {
+            Some(Self::Expired) => ("expired", "Lease expired"),
+            Some(Self::Preempted) => ("preempted", "Lease was preempted"),
+            Some(Self::Released) => ("invalid_lease", "Lease was already released"),
+            None => ("invalid_lease", "Lease not found"),
+        };
+        ControlResponse::Error { code: code.into(), message: message.into() }
+    }
+
+    fn act_result(end: Option<Self>, executed_steps: usize, frame_seq: u64) -> ControlResponse {
+        let (act_status, message) = match end {
+            Some(Self::Expired) => (ActStatus::Expired, "Lease expired"),
+            Some(Self::Preempted) => (ActStatus::Preempted, "Lease was preempted"),
+            Some(Self::Released) => (ActStatus::Preempted, "Lease was already released"),
+            None => (ActStatus::Preempted, "Lease not found"),
+        };
+        ControlResponse::ActResult {
+            act_status,
+            executed_steps,
+            frame_seq,
+            message: Some(message.into()),
+        }
+    }
+}
 
 pub struct ControlServerMessage {
     pub request: ControlRequest,
@@ -109,6 +145,8 @@ fn handle_client(stream: UnixStream, tx: CalloopSender<ControlServerMessage>) {
             continue;
         }
         let resp = match serde_json::from_str::<ControlRequest>(trimmed) {
+            Ok(ControlRequest::ListApps) => handle_list_apps(),
+            Ok(ControlRequest::Settings { action }) => handle_settings(action),
             Ok(req) => {
                 let (reply_tx, reply_rx) = mpsc::channel();
                 if tx.send(ControlServerMessage { request: req, reply_tx, peer_pid }).is_err() {
@@ -139,6 +177,28 @@ fn handle_client(stream: UnixStream, tx: CalloopSender<ControlServerMessage>) {
                 break;
             }
         }
+    }
+}
+
+fn handle_list_apps() -> ControlResponse {
+    static APPS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = APPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let apps = crate::desktop::discover_launcher_apps(true);
+    ControlResponse::Apps {
+        count: apps.len(),
+        apps,
+    }
+}
+
+fn handle_settings(action: crate::xdg::SettingsAction) -> ControlResponse {
+    static SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SETTINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    match crate::xdg::settings(action) {
+        Ok(view) => ControlResponse::Settings { view },
+        Err(err) => ControlResponse::Error {
+            code: "settings_failed".to_string(),
+            message: err.to_string(),
+        },
     }
 }
 
@@ -276,14 +336,42 @@ impl FocusStageState {
             .collect();
 
         for sid in expired {
-            if let Some(stage) = self.stages.get_mut(&sid) {
-                info!("Lease expired on Stage {}, reverting to Human", sid);
-                stage.lease = None;
-                stage.input_owner = InputOwner::Human;
-                stage.input.reset_agent_pointer();
-            }
-            self.sync_stage_agent_overlay(&sid);
+            self.expire_stage_lease(&sid);
         }
+    }
+
+    fn expire_stage_lease(&mut self, stage_id: &str) {
+        info!("Lease expired on Stage {}, reverting to Human", stage_id);
+        self.end_stage_lease(stage_id, LeaseEnd::Expired);
+        self.sync_stage_agent_overlay(stage_id);
+    }
+
+    pub(crate) fn end_stage_lease(&mut self, stage_id: &str, end: LeaseEnd) {
+        self.release_all_stage_inputs(stage_id);
+        let stage = self.stages.get_mut(stage_id).unwrap();
+        let lease = stage.lease.take();
+        stage.expired_lease_for_restore = lease.as_ref()
+            .filter(|_| end == LeaseEnd::Expired)
+            .map(|lease| lease.lease_id.clone());
+        stage.input_owner = InputOwner::Human;
+        stage.input.reset_agent_pointer();
+        if let Some(lease) = lease {
+            self.record_ended_lease(lease, end);
+        }
+    }
+
+    pub(crate) fn record_ended_lease(&mut self, lease: Lease, end: LeaseEnd) {
+        if self.ended_leases.len() == ENDED_LEASE_LIMIT {
+            self.ended_leases.pop_front();
+        }
+        self.ended_leases.push_back((lease.lease_id, end));
+    }
+
+    pub(crate) fn act_lease_failure(
+        &mut self, lease_id: &str, executed_steps: usize, frame_seq: u64,
+    ) -> ControlResponse {
+        let end = self.active_lease_stage(lease_id).err().flatten();
+        LeaseEnd::act_result(end, executed_steps, frame_seq)
     }
 
     pub fn handle_control_message(&mut self, msg: ControlServerMessage) {
@@ -448,6 +536,12 @@ impl FocusStageState {
                 let response = self.handle_leased_drop(&lease, &paths, position);
                 let _ = reply_tx.send(response);
             }
+            ControlRequest::ListApps => {
+                let _ = reply_tx.send(handle_list_apps());
+            }
+            ControlRequest::Settings { action } => {
+                let _ = reply_tx.send(handle_settings(action));
+            }
             ControlRequest::Shutdown => {
                 self.should_quit = true;
                 let _ = reply_tx.send(ControlResponse::Ok);
@@ -456,17 +550,16 @@ impl FocusStageState {
     }
 
     fn handle_leased_drop(&mut self, lease: &str, paths: &[String], position: Option<[f64; 2]>) -> ControlResponse {
-        let Some(stage_id) = self.find_stage_by_lease(lease) else {
-            return ControlResponse::Error { code: "preempted".into(), message: "Lease not found or preempted".into() };
+        let stage_id = match self.active_lease_stage(lease) {
+            Ok(stage_id) => stage_id,
+            Err(end) => return LeaseEnd::error(end),
         };
-        if !self.is_input_allowed(&stage_id, InputSource::Agent, Some(lease)) {
-            return ControlResponse::Error { code: "expired".into(), message: "Lease expired or input owner changed".into() };
-        }
         if paths.is_empty() || paths.iter().any(|path| {
             path.contains('\0') || !Path::new(&crate::protocol::windows_path_to_wsl(path)).is_absolute()
         }) {
             return ControlResponse::Error { code: "bad_request".into(), message: "Expected one or more absolute Windows or WSL paths".into() };
         }
+        self.refresh_stage_lease(&stage_id);
         let point = position.map(|[x, y]| Point::from((x, y)));
         let response = self.handle_drop_files(&stage_id, paths, point);
         if matches!(response, ControlResponse::Ok) && point.is_some() {
@@ -482,15 +575,26 @@ impl FocusStageState {
         }
     }
 
-    fn find_stage_by_lease(&self, lease_id: &str) -> Option<String> {
-        self.stages.iter().find_map(|(id, s)| {
-            if let Some(ref l) = s.lease {
-                if l.lease_id == lease_id {
-                    return Some(id.clone());
-                }
+    fn active_lease_stage(&mut self, lease_id: &str) -> Result<String, Option<LeaseEnd>> {
+        let active = self.stages.iter().find_map(|(id, stage)| {
+            stage.lease.as_ref().filter(|lease| lease.lease_id == lease_id)
+                .map(|lease| (id.clone(), lease.is_expired()))
+        });
+        match active {
+            Some((id, false)) => Ok(id),
+            Some((id, true)) => {
+                self.expire_stage_lease(&id);
+                Err(Some(LeaseEnd::Expired))
             }
-            None
-        })
+            None => Err(self.ended_leases.iter().rev().find_map(|(id, end)| {
+                (id == lease_id).then_some(*end)
+            })),
+        }
+    }
+
+    // Call only after validating the active lease and accepting the request.
+    fn refresh_stage_lease(&mut self, stage_id: &str) {
+        self.stages.get_mut(stage_id).unwrap().lease.as_mut().unwrap().refresh();
     }
 
     fn handle_acquire(
@@ -507,7 +611,7 @@ impl FocusStageState {
             };
         };
 
-        if let Some(ref existing) = stage.lease {
+        if let Some(existing) = &stage.lease {
             if !existing.is_expired() {
                 return ControlResponse::Error {
                     code: "busy".to_string(),
@@ -517,24 +621,26 @@ impl FocusStageState {
                     ),
                 };
             }
+            self.expire_stage_lease(stage_id);
         }
 
         self.next_lease_seq += 1;
         let lease_id = format!("lease-{}-{}", stage_id, self.next_lease_seq);
-        let ttl = ttl_s.max(1).min(3600);
+        let ttl = Duration::from_secs(ttl_s.clamp(1, 3600));
 
-        if let Some(stage) = self.stages.get_mut(stage_id) {
-            stage.lease = Some(Lease {
-                lease_id: lease_id.clone(),
-                agent_name: agent_name.clone(),
-                expires_at: Instant::now() + Duration::from_secs(ttl),
-            });
-            stage.input_owner = InputOwner::Agent {
-                lease_id: lease_id.clone(),
-                agent_name,
-            };
-            stage.input.reset_agent_pointer();
-        }
+        let stage = self.stages.get_mut(stage_id).unwrap();
+        stage.expired_lease_for_restore = None;
+        stage.lease = Some(Lease {
+            lease_id: lease_id.clone(),
+            agent_name: agent_name.clone(),
+            ttl,
+            expires_at: Instant::now() + ttl,
+        });
+        stage.input_owner = InputOwner::Agent {
+            lease_id: lease_id.clone(),
+            agent_name,
+        };
+        stage.input.reset_agent_pointer();
 
         if hide {
             let _ = self.set_stage_display(stage_id, DisplayState::Hidden);
@@ -546,32 +652,38 @@ impl FocusStageState {
         ControlResponse::Acquired {
             lease: lease_id,
             stage_id: stage_id.to_string(),
-            expires_in_s: ttl,
+            expires_in_s: ttl.as_secs(),
         }
     }
 
     fn handle_renew(&mut self, lease_id: &str, ttl_s: u64) -> ControlResponse {
-        let Some(stage_id) = self.find_stage_by_lease(lease_id) else {
-            return ControlResponse::Error {
-                code: "invalid_lease".to_string(),
-                message: "Lease not found or preempted".to_string(),
-            };
+        let stage_id = match self.active_lease_stage(lease_id) {
+            Ok(stage_id) => stage_id,
+            Err(end) => return LeaseEnd::error(end),
         };
-        let ttl = ttl_s.max(1).min(3600);
-        if let Some(stage) = self.stages.get_mut(&stage_id) {
-            if let Some(ref mut l) = stage.lease {
-                l.expires_at = Instant::now() + Duration::from_secs(ttl);
-                return ControlResponse::Acquired {
-                    lease: lease_id.to_string(),
-                    stage_id,
-                    expires_in_s: ttl,
-                };
-            }
+        let ttl = ttl_s.clamp(1, 3600);
+        let lease = self.stages.get_mut(&stage_id).unwrap().lease.as_mut().unwrap();
+        lease.ttl = Duration::from_secs(ttl);
+        lease.refresh();
+        ControlResponse::Acquired {
+            lease: lease_id.to_string(),
+            stage_id,
+            expires_in_s: ttl,
         }
-        ControlResponse::Error {
-            code: "invalid_lease".to_string(),
-            message: "Lease invalid".to_string(),
+    }
+
+    fn resolve_stage_or_refresh_lease(
+        &mut self, lease: Option<&str>, stage_id: Option<&str>,
+    ) -> Result<String, ControlResponse> {
+        if let Some(lease) = lease {
+            let stage_id = self.active_lease_stage(lease).map_err(LeaseEnd::error)?;
+            self.refresh_stage_lease(&stage_id);
+            return Ok(stage_id);
         }
+        stage_id.map(str::to_owned).ok_or_else(|| ControlResponse::Error {
+            code: "bad_request".into(),
+            message: "Either lease or stage_id is required".into(),
+        })
     }
 
     fn handle_observe(
@@ -581,23 +693,9 @@ impl FocusStageState {
         image: bool,
         a11y: bool,
     ) -> ControlResponse {
-        let target_id = if let Some(l) = lease {
-            match self.find_stage_by_lease(l) {
-                Some(id) => id,
-                None => {
-                    return ControlResponse::Error {
-                        code: "preempted".to_string(),
-                        message: "Lease expired or preempted".to_string(),
-                    };
-                }
-            }
-        } else if let Some(sid) = stage_id {
-            sid.to_string()
-        } else {
-            return ControlResponse::Error {
-                code: "bad_request".to_string(),
-                message: "Either lease or stage_id is required".to_string(),
-            };
+        let target_id = match self.resolve_stage_or_refresh_lease(lease, stage_id) {
+            Ok(id) => id,
+            Err(error) => return error,
         };
 
         let Some(stage) = self.stages.get(&target_id) else {
@@ -660,26 +758,13 @@ impl FocusStageState {
         settle_timeout: Option<Duration>,
         reply_tx: mpsc::Sender<ControlResponse>,
     ) {
-        let Some(stage_id) = self.find_stage_by_lease(&lease_id) else {
-            let _ = reply_tx.send(ControlResponse::ActResult {
-                act_status: ActStatus::Preempted,
-                executed_steps: 0,
-                frame_seq: 0,
-                message: Some("Lease not found or preempted".to_string()),
-            });
-            return;
+        let stage_id = match self.active_lease_stage(&lease_id) {
+            Ok(stage_id) => stage_id,
+            Err(end) => {
+                let _ = reply_tx.send(LeaseEnd::act_result(end, 0, 0));
+                return;
+            }
         };
-
-        if !self.is_input_allowed(&stage_id, InputSource::Agent, Some(&lease_id)) {
-            let frame_seq = self.stages.get(&stage_id).map(|s| s.frame_seq).unwrap_or(0);
-            let _ = reply_tx.send(ControlResponse::ActResult {
-                act_status: ActStatus::Expired,
-                executed_steps: 0,
-                frame_seq,
-                message: Some("Lease expired or input owner changed".to_string()),
-            });
-            return;
-        }
 
         let current_seq = self.stages.get(&stage_id).map(|s| s.frame_seq).unwrap_or(0);
         if let Some(expected) = based_on {
@@ -697,6 +782,7 @@ impl FocusStageState {
             }
         }
 
+        self.refresh_stage_lease(&stage_id);
         let mut remaining: VecDeque<_> = actions.into();
         let mut executed_steps = 0usize;
 
@@ -758,18 +844,23 @@ impl FocusStageState {
     }
 
     fn handle_release(&mut self, lease_id: &str, show_on_desktop: bool) -> ControlResponse {
-        let Some(stage_id) = self.find_stage_by_lease(lease_id) else {
-            return ControlResponse::Error {
-                code: "invalid_lease".to_string(),
-                message: "Lease not found or already preempted".to_string(),
-            };
+        let stage_id = match self.active_lease_stage(lease_id) {
+            Ok(stage_id) => {
+                self.end_stage_lease(&stage_id, LeaseEnd::Released);
+                stage_id
+            }
+            Err(Some(LeaseEnd::Expired)) => {
+                let stage = self.stages.values_mut().find(|stage| {
+                    stage.input_owner == InputOwner::Human
+                        && stage.expired_lease_for_restore.as_deref() == Some(lease_id)
+                });
+                let Some(stage) = stage else { return ControlResponse::Ok; };
+                stage.expired_lease_for_restore = None;
+                stage.id.clone()
+            }
+            Err(Some(LeaseEnd::Released | LeaseEnd::Preempted)) => return ControlResponse::Ok,
+            Err(None) => return LeaseEnd::error(None),
         };
-        self.release_all_stage_inputs(&stage_id);
-        if let Some(stage) = self.stages.get_mut(&stage_id) {
-            stage.lease = None;
-            stage.input_owner = InputOwner::Human;
-            stage.input.reset_agent_pointer();
-        }
         if show_on_desktop {
             let _ = self.set_stage_display(&stage_id, DisplayState::Desktop);
         }
@@ -785,6 +876,7 @@ impl FocusStageState {
             };
         };
 
+        stage.expired_lease_for_restore = None;
         if stage.display == display {
             return ControlResponse::Ok;
         }
@@ -798,48 +890,36 @@ impl FocusStageState {
     }
 
     pub fn set_stage_frozen(&mut self, stage_id: &str, frozen: bool) -> ControlResponse {
-        let Some(stage) = self.stages.get_mut(stage_id) else {
+        let Some(stage) = self.stages.get(stage_id) else {
             return ControlResponse::Error {
                 code: "not_found".to_string(),
                 message: format!("Stage '{}' not found", stage_id),
             };
         };
+        if frozen && stage.lease.is_some() {
+            self.end_stage_lease(stage_id, LeaseEnd::Preempted);
+        }
+        let stage = self.stages.get_mut(stage_id).unwrap();
         if frozen {
-            stage.lease = None;
+            stage.expired_lease_for_restore = None;
             stage.input_owner = InputOwner::Frozen;
             stage.input.reset_agent_pointer();
+            self.ensure_virtual_focus(stage_id);
         } else if stage.input_owner == InputOwner::Frozen {
             stage.input_owner = InputOwner::Human;
-        }
-        if frozen {
-            self.ensure_virtual_focus(stage_id);
         }
         self.sync_stage_agent_overlay(stage_id);
         ControlResponse::Ok
     }
 
     fn handle_clipboard_get(
-        &self,
+        &mut self,
         lease: Option<&str>,
         stage_id: Option<&str>,
     ) -> ControlResponse {
-        let target_id = if let Some(l) = lease {
-            match self.find_stage_by_lease(l) {
-                Some(id) => id,
-                None => {
-                    return ControlResponse::Error {
-                        code: "preempted".to_string(),
-                        message: "Lease expired or preempted".to_string(),
-                    };
-                }
-            }
-        } else if let Some(sid) = stage_id {
-            sid.to_string()
-        } else {
-            return ControlResponse::Error {
-                code: "bad_request".to_string(),
-                message: "Either lease or stage_id is required".to_string(),
-            };
+        let target_id = match self.resolve_stage_or_refresh_lease(lease, stage_id) {
+            Ok(id) => id,
+            Err(error) => return error,
         };
 
         let Some(stage) = self.stages.get(&target_id) else {
@@ -861,23 +941,9 @@ impl FocusStageState {
         stage_id: Option<&str>,
         text: String,
     ) -> ControlResponse {
-        let target_id = if let Some(l) = lease {
-            match self.find_stage_by_lease(l) {
-                Some(id) => id,
-                None => {
-                    return ControlResponse::Error {
-                        code: "preempted".to_string(),
-                        message: "Lease expired or preempted".to_string(),
-                    };
-                }
-            }
-        } else if let Some(sid) = stage_id {
-            sid.to_string()
-        } else {
-            return ControlResponse::Error {
-                code: "bad_request".to_string(),
-                message: "Either lease or stage_id is required".to_string(),
-            };
+        let target_id = match self.resolve_stage_or_refresh_lease(lease, stage_id) {
+            Ok(id) => id,
+            Err(error) => return error,
         };
 
         if !self.stages.contains_key(&target_id) {

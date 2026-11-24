@@ -410,6 +410,63 @@ select:focus-visible,
   display: flex;
 }
 
+.launcher-lock {
+  display: none;
+  width: 100%;
+  height: 100%;
+  padding: 24px;
+  place-items: center;
+  overflow: auto;
+}
+
+.session-locked .launcher-lock { display: grid; }
+.session-locked .view,
+.session-locked .mode-switch,
+.session-locked .search-wrap,
+.session-locked #btn-appearance,
+.session-locked .titlebar-divider { display: none; }
+
+.launcher-lock-card {
+  width: min(100%, 360px);
+  padding: 30px 28px 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  text-align: center;
+}
+
+.launcher-lock-icon {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  margin: 0 auto 14px;
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.launcher-lock-icon svg { width: 25px; height: 25px; }
+.launcher-lock-card h1 {
+  margin: 0 0 6px;
+  font-family: var(--font-heading);
+  font-size: var(--fz-xl);
+}
+.launcher-lock-card p { margin: 0; color: var(--ink-secondary); }
+.launcher-lock-actions {
+  display: grid;
+  gap: 5px;
+  margin: 22px auto 0;
+  max-width: 224px;
+}
+.launcher-lock-status {
+  margin-top: 8px;
+  color: var(--ink-secondary);
+  font-size: var(--fz-sm);
+}
+.launcher-lock-status:empty { margin-top: 0; }
+
 /* ---------------- Apps Desktop ---------------- */
 
 .view-apps {

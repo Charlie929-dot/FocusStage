@@ -1,7 +1,7 @@
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::process::Child;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use smithay::input::keyboard::{xkb, Keycode, ModifiersState};
 use smithay::reexports::calloop::RegistrationToken;
@@ -20,12 +20,17 @@ use crate::protocol::{DisplayState, InputOwner, SavedRect, StageInfo, StageKind}
 pub struct Lease {
     pub lease_id: String,
     pub agent_name: Option<String>,
+    pub ttl: Duration,
     pub expires_at: Instant,
 }
 
 impl Lease {
     pub fn is_expired(&self) -> bool {
         Instant::now() >= self.expires_at
+    }
+
+    pub fn refresh(&mut self) {
+        self.expires_at = Instant::now() + self.ttl;
     }
 }
 
@@ -117,6 +122,8 @@ pub struct StageInputState {
     pub agent_pointer_visible: bool,
     /// Current AI virtual cursor visual action state ("idle" | "move" | "down" | "click" | "drag" | "scroll")
     pub agent_pointer_state: &'static str,
+    /// Tracks whether XWayland's active master-pointer slave is already the axis device (`xwayland-relative-pointer`).
+    pub x11_axis_primed: bool,
 }
 
 impl StageInputState {
@@ -151,6 +158,7 @@ impl StageInputState {
             custom_keymap_active: false,
             agent_pointer_visible: false,
             agent_pointer_state: "idle",
+            x11_axis_primed: false,
         }
     }
 
@@ -276,6 +284,7 @@ pub struct Stage {
     pub display: DisplayState,
     pub input_owner: InputOwner,
     pub lease: Option<Lease>,
+    pub(crate) expired_lease_for_restore: Option<String>,
 
     pub initial_rect: SavedRect,
     pub default_scale: f64,
@@ -387,6 +396,7 @@ impl Stage {
             display,
             input_owner: InputOwner::Human,
             lease: None,
+            expired_lease_for_restore: None,
             initial_rect: SavedRect { x: 100, y: 100, width, height },
             default_scale: scale,
             frame_seq: 0,

@@ -32,6 +32,10 @@ internal sealed class LauncherForm : Form
     private List<StageDto> _stages = new();
     private bool _daemonAlive;
 
+    private CancellationTokenSource? _launcherSession;
+    private UbuntuSessionAuthorization? _ubuntuAuthorization;
+    private bool _sessionUnlocked;
+    private bool _authenticating;
     private bool _webViewReady;
     private bool _appsLoaded;
     private bool _loadingApps;
@@ -138,6 +142,156 @@ internal sealed class LauncherForm : Form
         }
     }
 
+    protected override void OnVisibleChanged(EventArgs e)
+    {
+        if (Visible)
+        {
+            _launcherSession ??= new CancellationTokenSource();
+        }
+        else
+        {
+            EndLauncherSession();
+        }
+        base.OnVisibleChanged(e);
+        if (_webViewReady)
+        {
+            PushEvent("session", BuildSessionPayload());
+        }
+    }
+
+    private void EndLauncherSession()
+    {
+        var session = _launcherSession;
+        _launcherSession = null;
+        _sessionUnlocked = false;
+        _authenticating = false;
+        session?.Cancel();
+        _ubuntuAuthorization?.Dispose();
+        _ubuntuAuthorization = null;
+        session?.Dispose();
+    }
+
+    private object BuildSessionPayload(string? message = null) => new
+    {
+        visible = Visible,
+        unlocked = _sessionUnlocked,
+        message,
+    };
+
+    private async Task<object> UnlockLauncherAsync(bool useLinuxPassword)
+    {
+        if (_launcherSession is not { } session || !Visible || _sessionUnlocked || _authenticating)
+        {
+            return BuildSessionPayload();
+        }
+
+        _authenticating = true;
+        var cancellation = session.Token;
+        try
+        {
+            var uid = await UbuntuSessionAuthorization.GetDefaultUserIdAsync(_distro, cancellation);
+            var result = useLinuxPassword
+                ? LauncherAuthResult.HelloUnavailable
+                : await LauncherAuthentication.VerifyHelloAsync(Handle, cancellation);
+            if (result == LauncherAuthResult.HelloUnavailable)
+            {
+                if (uid != 0 && !_ctx.DaemonAlive)
+                {
+                    await _ctx.StartDaemonAsync();
+                }
+                result = await LauncherAuthentication.VerifyLinuxAsync(_distro, uid, cancellation);
+            }
+
+            if (_launcherSession != session || !Visible)
+            {
+                return BuildSessionPayload();
+            }
+            if (result == LauncherAuthResult.Verified)
+            {
+                UbuntuSessionAuthorization? authorization = null;
+                string? notice = null;
+                try
+                {
+                    authorization = await UbuntuSessionAuthorization.OpenAsync(_distro, uid, cancellation);
+                }
+                catch (InvalidOperationException)
+                {
+                    notice = "已解锁。Ubuntu 提权将按系统设置单独验证。";
+                }
+                catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
+                {
+                    notice = "已解锁。Ubuntu 提权将按系统设置单独验证。";
+                }
+
+                if (_launcherSession != session || !Visible)
+                {
+                    authorization?.Dispose();
+                    return BuildSessionPayload();
+                }
+                _ubuntuAuthorization = authorization;
+                _sessionUnlocked = true;
+                if (authorization is not null)
+                {
+                    _ = WatchUbuntuAuthorizationAsync(authorization, cancellation);
+                }
+                if (!_ctx.DaemonAlive)
+                {
+                    _ = StartDaemonAndRefreshAppsAsync();
+                }
+                return BuildSessionPayload(notice);
+            }
+            return BuildSessionPayload(result switch
+            {
+                LauncherAuthResult.Canceled => "验证已取消。请选择一种方式重试。",
+                LauncherAuthResult.LinuxUnavailable => "无法打开 Linux 认证窗口。请检查 WSLg 和 Polkit，或使用 Windows Hello。",
+                LauncherAuthResult.LinuxAccountUnavailable => "没有可用的 Ubuntu 密码验证账号。请使用 Windows Hello。",
+                _ => null,
+            });
+        }
+        catch (OperationCanceledException)
+        {
+            return BuildSessionPayload(cancellation.IsCancellationRequested ? null : "Ubuntu 授权超时，请重试。");
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BuildSessionPayload(ex.Message);
+        }
+        finally
+        {
+            if (_launcherSession == session)
+            {
+                _authenticating = false;
+            }
+        }
+    }
+
+    private async Task StartDaemonAndRefreshAppsAsync()
+    {
+        await _ctx.StartDaemonAsync();
+        if (Visible && !_loadingApps)
+        {
+            await RefreshAppsAsync(forceRender: false);
+        }
+    }
+
+    private async Task WatchUbuntuAuthorizationAsync(UbuntuSessionAuthorization authorization, CancellationToken cancellation)
+    {
+        try
+        {
+            await authorization.WaitForEndAsync(cancellation);
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            return;
+        }
+        if (_ubuntuAuthorization == authorization)
+        {
+            _ubuntuAuthorization = null;
+            authorization.Dispose();
+            PushEvent("session", BuildSessionPayload("Ubuntu 提权授权已结束。重新打开启动器可再次启用。"));
+        }
+    }
+
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
@@ -180,7 +334,7 @@ internal sealed class LauncherForm : Form
 
             core.NavigationStarting += (_, e) =>
             {
-                if (!e.Uri.StartsWith(LauncherAssetServer.VirtualOrigin, StringComparison.OrdinalIgnoreCase)
+                if (!string.Equals(e.Uri, $"{LauncherAssetServer.VirtualOrigin}/index.html", StringComparison.OrdinalIgnoreCase)
                     && !string.Equals(e.Uri, "about:blank", StringComparison.OrdinalIgnoreCase))
                 {
                     e.Cancel = true;
@@ -229,7 +383,10 @@ internal sealed class LauncherForm : Form
 
     private void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
-        _ = HandleWebMessageAsync(e.WebMessageAsJson);
+        if (string.Equals(e.Source, $"{LauncherAssetServer.VirtualOrigin}/index.html", StringComparison.OrdinalIgnoreCase))
+        {
+            _ = HandleWebMessageAsync(e.WebMessageAsJson);
+        }
     }
 
     private async Task HandleWebMessageAsync(string rawJson)
@@ -317,12 +474,22 @@ internal sealed class LauncherForm : Form
                    ?? new List<LauncherDockItem>();
         }
 
+        if (method is not ("app.init" or "session.unlock" or "window.drag" or "window.minimize"
+            or "window.toggleMaximize" or "window.hide") && (!_sessionUnlocked || !Visible))
+        {
+            throw new InvalidOperationException("请先验证身份。");
+        }
+
         switch (method)
         {
+            case "session.unlock":
+                return await UnlockLauncherAsync(Bool("linuxPassword"));
+
             case "app.init":
                 return new
                 {
                     distro = _distro,
+                    session = BuildSessionPayload(),
                     daemonAlive = _daemonAlive,
                     stages = BuildStagePayloads(_stages),
                     apps = BuildAppPayloads(_apps),
@@ -975,6 +1142,7 @@ internal sealed class LauncherForm : Form
     {
         if (disposing)
         {
+            EndLauncherSession();
             _autoDiscoverTimer.Stop();
             _autoDiscoverTimer.Dispose();
             _debounceTimer.Stop();

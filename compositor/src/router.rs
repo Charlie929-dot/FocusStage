@@ -376,6 +376,7 @@ impl FocusStageState {
         }
 
         if let Some(stage) = self.stages.get_mut(stage_id) {
+            stage.input.x11_axis_primed = false;
             stage.input.current_pointer_target = Some(new_target);
         }
         true
@@ -387,6 +388,7 @@ impl FocusStageState {
             return;
         }
         stage.input.pointer_window_id = None;
+        stage.input.x11_axis_primed = false;
         let Some(target) = stage.input.current_pointer_target.take().filter(|t| t.alive()) else { return; };
         let seat = self.seat.clone();
         let serial = SERIAL_COUNTER.next_serial();
@@ -535,15 +537,8 @@ impl FocusStageState {
         };
 
         for id in &ids {
-            // Release any held keys/buttons from AI before switching to Human.
-            self.release_all_stage_inputs(id);
-
-            if let Some(stage) = self.stages.get_mut(id) {
-                stage.lease = None;
-                stage.input_owner = InputOwner::Human;
-                stage.input.reset_agent_pointer();
-                self.set_stage_display(id, DisplayState::Desktop);
-            }
+            self.end_stage_lease(id, crate::control::LeaseEnd::Preempted);
+            self.set_stage_display(id, DisplayState::Desktop);
             self.sync_stage_agent_overlay(id);
         }
 
@@ -697,6 +692,9 @@ impl FocusStageState {
                         PointerTarget::motion(&hit_x11, &seat, self, &ev);
                         PointerTarget::frame(&hit_x11, &seat, self);
                     }
+                    if let Some(stage) = self.stages.get_mut(stage_id) {
+                        stage.input.x11_axis_primed = false;
+                    }
                 }
             }
         }
@@ -780,6 +778,9 @@ impl FocusStageState {
                 }
                 PointerTarget::button(&hit_x11, &seat, self, &ev);
                 PointerTarget::frame(&hit_x11, &seat, self);
+                if let Some(stage) = self.stages.get_mut(stage_id) {
+                    stage.input.x11_axis_primed = false;
+                }
             }
         }
     }
@@ -923,6 +924,27 @@ impl FocusStageState {
                             hit_x11 = ovr;
                             break;
                         }
+                    }
+                }
+                let has_scroll = dx.abs() > f64::EPSILON
+                    || dy.abs() > f64::EPSILON
+                    || v120.is_some_and(|(vx, vy)| vx != 0 || vy != 0);
+                // XWayland routes pointer motion via xwayland-pointer and axis via xwayland-relative-pointer.
+                // Switching active slave devices emits XI_DeviceChanged, which causes Chromium's DeviceDataManagerX11
+                // to reset scroll valuator baselines and swallow the first wheel event. Send a zero-delta axis_stop
+                // frame first so the baseline is primed before the real wheel delta arrives.
+                if has_scroll
+                    && hit_x11.wl_surface().is_some()
+                    && self.stages.get(stage_id).is_some_and(|s| !s.input.x11_axis_primed)
+                {
+                    let prime = AxisFrame::new(time)
+                        .source(resolved_source)
+                        .stop(Axis::Horizontal)
+                        .stop(Axis::Vertical);
+                    PointerTarget::axis(&hit_x11, &seat, self, prime);
+                    PointerTarget::frame(&hit_x11, &seat, self);
+                    if let Some(stage) = self.stages.get_mut(stage_id) {
+                        stage.input.x11_axis_primed = true;
                     }
                 }
                 PointerTarget::axis(&hit_x11, &seat, self, frame);
@@ -1239,12 +1261,8 @@ impl FocusStageState {
         for mut job in jobs {
             if !self.is_input_allowed(&job.stage_id, InputSource::Agent, Some(&job.lease_id)) {
                 let frame_seq = self.stages.get(&job.stage_id).map(|s| s.frame_seq).unwrap_or(0);
-                let _ = job.reply_tx.send(crate::protocol::ControlResponse::ActResult {
-                    act_status: ActStatus::Preempted,
-                    executed_steps: job.executed_steps,
-                    frame_seq,
-                    message: Some("Lease expired or preempted".to_string()),
-                });
+                let response = self.act_lease_failure(&job.lease_id, job.executed_steps, frame_seq);
+                let _ = job.reply_tx.send(response);
                 continue;
             }
 

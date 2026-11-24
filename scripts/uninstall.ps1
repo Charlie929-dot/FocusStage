@@ -10,6 +10,12 @@ $unregisterHost = 'focusstage shutdown >/dev/null 2>&1 || pkill -x focusstaged >
 $unregisterHostBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($unregisterHost))
 wsl.exe -d $Distro -e bash -lc "printf %s $unregisterHostBase64 | base64 -d | bash"
 
+Write-Host "Removing FocusStage session authorization..." -ForegroundColor Cyan
+wsl.exe -d $Distro -u root -e sh -c 'if test -f /usr/local/libexec/focusstage-auth; then /usr/bin/python3 -I /usr/local/libexec/focusstage-auth remove; fi'
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to remove FocusStage session authorization from '$Distro'."
+}
+
 Write-Host "Removing FocusStage desktop wrappers..." -ForegroundColor Cyan
 wsl.exe -d $Distro -u root -e bash -lc "/usr/local/bin/focusstage sync-apps --remove >/dev/null 2>&1 || true; rm -f /usr/local/bin/focusstaged /usr/local/bin/focusstage /usr/local/bin/focusstage-launch /usr/local/bin/focusstage-open"
 

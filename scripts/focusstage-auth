@@ -1,0 +1,237 @@
+#!/usr/bin/python3 -I
+"""Ubuntu session authentication shared by sudo and Polkit."""
+
+import fcntl
+import os
+from pathlib import Path
+import pwd
+import grp
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+
+HELPER = Path('/usr/local/libexec/focusstage-auth')
+GRANTS = Path('/run/focusstage-auth')
+SUDO = Path('/etc/sudoers.d/99-focusstage-session')
+RULE = Path('/etc/polkit-1/rules.d/zz-focusstage-session.rules')
+ACTION = Path('/usr/share/polkit-1/actions/io.focusstage.launcher.verify.policy')
+PAM = [Path('/etc/pam.d/sudo'), Path('/etc/pam.d/sudo-i')]
+PAM_LINE = f'auth sufficient pam_exec.so quiet /usr/bin/python3 -I {HELPER} check-sudo\n'
+CONFIG_HEADER = '# Managed by FocusStage\n'
+AUTH_REQUIRED = {'auth_self', 'auth_self_keep', 'auth_admin', 'auth_admin_keep'}
+
+VERIFY_POLICY = '''<?xml version="1.0" encoding="UTF-8"?>
+<!-- Managed by FocusStage -->
+<policyconfig>
+  <vendor>FocusStage</vendor>
+  <action id="io.focusstage.launcher.verify">
+    <description>Unlock the FocusStage launcher</description>
+    <description xml:lang="zh_CN">解锁 FocusStage 启动器</description>
+    <message>Verify your identity to unlock FocusStage</message>
+    <message xml:lang="zh_CN">验证身份以解锁 FocusStage 启动器</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/focusstage-auth</annotate>
+  </action>
+</policyconfig>
+'''
+
+POLKIT_RULE = '''// Managed by FocusStage
+polkit.addRule(function(action, subject) {
+    if (action.id === "io.focusstage.launcher.verify") return;
+    if (!(subject.isInGroup("sudo") || subject.isInGroup("admin"))) return;
+    var scope = subject.local ? (subject.active ? "active" : "inactive") : "any";
+    try {
+        var result = polkit.spawn(["/usr/bin/python3", "-I", "/usr/local/libexec/focusstage-auth",
+            "check-polkit", subject.user, action.id, scope]);
+        if (result === "verified") return polkit.Result.YES;
+    } catch (error) {
+        // If the helper failed, Polkit continues its normal authorization check.
+    }
+});
+'''
+
+
+def admin_user(uid):
+    user = pwd.getpwuid(uid)
+    groups = {grp.getgrgid(gid).gr_name for gid in os.getgrouplist(user.pw_name, user.pw_gid)}
+    if uid == 0 or not groups.intersection({'sudo', 'admin'}):
+        raise ValueError('FocusStage session authorization requires an Ubuntu administrator account')
+    return user
+
+
+def has_grant(uid):
+    if uid == 0:
+        return False
+    try:
+        with (GRANTS / str(uid)).open('rb') as lock:
+            try:
+                fcntl.lockf(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+    except FileNotFoundError:
+        pass
+    return False
+
+
+def sudo_policy(user):
+    return CONFIG_HEADER + f'Defaults:{user.pw_name} timestamp_timeout=0, noninteractive_auth\n'
+
+
+def hold(uid):
+    user = admin_user(uid)
+    if (SUDO.read_text() != sudo_policy(user) or RULE.read_text() != POLKIT_RULE
+            or ACTION.read_text() != VERIFY_POLICY or PAM_LINE not in PAM[0].read_text()):
+        raise ValueError('Ubuntu session authorization is not installed for this user')
+    GRANTS.mkdir(mode=0o755, exist_ok=True)
+    fd = os.open(GRANTS / str(uid), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, 'wb') as lock:
+        os.fchmod(fd, 0o644)
+        # A POSIX write lock requires write access to the root-owned file.
+        fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        print('FocusStageAuthorizationReady', flush=True)
+        # Closing the Windows pipe releases the kernel lock, even after an unexpected process exit.
+        sys.stdin.buffer.read(1)
+
+
+def check_sudo():
+    if os.environ.get('PAM_TYPE') != 'auth' or os.environ.get('PAM_SERVICE') not in ('sudo', 'sudo-i'):
+        return False
+    user = os.environ.get('PAM_USER')
+    if not user or user != os.environ.get('PAM_RUSER'):
+        return False
+    return has_grant(pwd.getpwnam(user).pw_uid)
+
+
+def check_polkit(user, action_id, scope):
+    if scope not in ('active', 'inactive', 'any') or not has_grant(pwd.getpwnam(user).pw_uid):
+        return
+    # Only reuse authentication for actions whose default rule calls for it. Site rules run first.
+    for policy in Path('/usr/share/polkit-1/actions').glob('*.policy'):
+        try:
+            root = ET.parse(policy).getroot()
+        except (OSError, ET.ParseError):
+            continue
+        for action in root.iter('action'):
+            if action.get('id') == action_id:
+                default = action.findtext(f'defaults/allow_{scope}', '').strip()
+                if default in AUTH_REQUIRED:
+                    print('verified', end='')
+                return
+
+
+def replace(path, contents, mode):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile('w', dir=path.parent, prefix='.focusstage-', delete=False) as out:
+        temporary = Path(out.name)
+        os.fchmod(out.fileno(), mode)
+        out.write(contents)
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def configured_admin():
+    try:
+        config = SUDO.read_text()
+    except FileNotFoundError:
+        return None
+    match = re.fullmatch(re.escape(CONFIG_HEADER) + r'Defaults:([a-zA-Z0-9_.-]+) timestamp_timeout=0, noninteractive_auth\n', config)
+    if not match:
+        return None
+    try:
+        return admin_user(pwd.getpwnam(match[1]).pw_uid)
+    except (KeyError, ValueError):
+        return None
+
+
+def setup(uid):
+    user = admin_user(uid) if uid != 0 else configured_admin()
+    if user is None:
+        replace(HELPER, Path(__file__).read_text(), 0o755)
+        return
+    if not re.fullmatch(r'[a-zA-Z0-9_.-]+', user.pw_name):
+        raise ValueError('Unsupported account name in sudoers')
+    pam_changes = []
+    for path in PAM:
+        if path != PAM[0] and not path.exists():
+            continue
+        path = path.resolve()
+        original = path.read_text()
+        if PAM_LINE not in original:
+            line = '@include common-auth\n'
+            if original.count(line) != 1:
+                raise ValueError(f'Cannot locate common-auth in {path}')
+            pam_changes.append((path, original.replace(line, PAM_LINE + line), stat.S_IMODE(path.stat().st_mode)))
+
+    config = sudo_policy(user)
+    if SUDO.exists() and not SUDO.read_text().startswith(CONFIG_HEADER):
+        raise ValueError(f'{SUDO} is not managed by FocusStage')
+    if RULE.exists() and not RULE.read_text().startswith('// Managed by FocusStage\n'):
+        raise ValueError(f'{RULE} is not managed by FocusStage')
+    if ACTION.exists() and '<!-- Managed by FocusStage -->' not in ACTION.read_text():
+        raise ValueError(f'{ACTION} is not managed by FocusStage')
+    with tempfile.NamedTemporaryFile('w') as candidate:
+        candidate.write(config)
+        candidate.flush()
+        subprocess.run(['/usr/sbin/visudo', '-c', '-q', '-f', candidate.name], check=True)
+    replace(HELPER, Path(__file__).read_text(), 0o755)
+    replace(SUDO, config, 0o440)
+    for path, contents, mode in pam_changes:
+        replace(path, contents, mode)
+    replace(ACTION, VERIFY_POLICY, 0o644)
+    replace(RULE, POLKIT_RULE, 0o644)
+
+
+def remove():
+    for path in PAM:
+        if path.exists():
+            original = path.read_text()
+            if PAM_LINE in original:
+                replace(path.resolve(), original.replace(PAM_LINE, ''), stat.S_IMODE(path.stat().st_mode))
+    for path, header in ((SUDO, CONFIG_HEADER), (RULE, '// Managed by FocusStage\n')):
+        if path.exists() and path.read_text().startswith(header):
+            path.unlink()
+    if ACTION.exists() and '<!-- Managed by FocusStage -->' in ACTION.read_text():
+        ACTION.unlink()
+    HELPER.unlink(missing_ok=True)
+
+
+def main(args):
+    if args == ['check-sudo']:
+        return 0 if check_sudo() else 1
+    if len(args) == 4 and args[0] == 'check-polkit':
+        check_polkit(*args[1:])
+        return 0
+    if os.geteuid() == 0:
+        if args == ['verification-user']:
+            user = configured_admin()
+            if user is None:
+                return 1
+            print(user.pw_name)
+            return 0
+        if args == ['verify']:
+            print('FocusStageVerified')
+            return 0
+        if len(args) == 2 and args[0] in ('setup', 'hold'):
+            (setup if args[0] == 'setup' else hold)(int(args[1]))
+            return 0
+        if args == ['remove']:
+            remove()
+            return 0
+    return 1
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        print(f'FocusStage authorization: {exc}', file=sys.stderr)
+        sys.exit(1)

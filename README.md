@@ -80,7 +80,8 @@ powershell -ExecutionPolicy Bypass -File scripts/install.ps1
 ```
 
 安装完成后：
-- 双击桌面或开始菜单中的 **FocusStage** 打开统一应用启动器（关闭窗口会自动缩回右下角托盘）。
+- 双击桌面或开始菜单中的 **FocusStage** 打开统一应用启动器。启动器优先使用 Windows Hello，也可通过 Ubuntu 管理员密码验证。验证后会进入 WSL 默认账号的桌面会话。`root` 直接使用现有权限，有复用授权的普通管理员可在启动器打开期间免重复执行 `sudo` 和标准 Polkit 验证。最小化会保留授权，关闭到托盘会撤销。已启动的提权进程会继续运行。
+- 安装器为 WSL 默认的非 `root` 管理员接入 PAM 和 Polkit，并关闭该账号的 `sudo` 密码缓存。若 WSL 默认账号是 `root`，Linux 密码备选会使用此前配置的非 `root` 管理员。没有这个账号时可用 Windows Hello。卸载 FocusStage 时会移除授权设置。
 - 开始菜单 `Programs\FocusStage\` 下会自动生成全部 Linux 应用的独立快捷方式（按 Linux 图标主题解析并带图标），可右键“固定到开始屏幕”或“固定到任务栏”。
 - 安装器会把 `focusstage` 注册到 Windows 用户的 Claude Code MCP 配置 `~/.claude.json`，使用 `-Distro` 指定的 WSL 发行版，默认是 `Ubuntu`。MCP 注册需要该发行版中的 `python3`。可选开关：`-SkipRustBuild`、`-NoLaunch`、`-SkipMcpConfig`。
 - 运行 `powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1` 会卸载 FocusStage、清理协议关联与快捷方式并移除其用户级 MCP 条目。

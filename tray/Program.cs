@@ -655,25 +655,21 @@ internal sealed class FocusStageTrayContext : ApplicationContext
     {
         try
         {
-            var psi = new ProcessStartInfo("wsl.exe")
+            var installedHost = Path.Combine(ShortcutManager.AppInstallDir, "FocusStage.exe");
+            var executable = File.Exists(installedHost) ? installedHost : Application.ExecutablePath;
+            var (hostCode, nativeHost, _) = await ShortcutManager.RunWslAsync(_distro, false,
+                "/usr/bin/wslpath", "-u", executable.Replace('\\', '/'));
+            var daemonArgs = new List<string> { "--json", "ensure-daemon" };
+            var hostArg = hostCode == 0 && !string.IsNullOrWhiteSpace(nativeHost) ? nativeHost : executable;
+            if (!string.IsNullOrWhiteSpace(hostArg))
             {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                StandardOutputEncoding = Encoding.UTF8,
-                StandardErrorEncoding = Encoding.UTF8
-            };
-            psi.ArgumentList.Add("-d");
-            psi.ArgumentList.Add(_distro);
-            psi.ArgumentList.Add("-e");
-            psi.ArgumentList.Add("bash");
-            psi.ArgumentList.Add("-lc");
-            psi.ArgumentList.Add("if ! focusstage --json ping >/dev/null 2>&1; then LOG=/run/user/$(id -u)/focusstaged.log; if command -v systemd-run >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then systemd-run --user --collect -E DISPLAY -E WAYLAND_DISPLAY -E PULSE_SERVER -E WSL_INTEROP -E XDG_CONFIG_HOME -E PATH -p \"StandardOutput=append:$LOG\" -p \"StandardError=append:$LOG\" focusstaged >/dev/null 2>&1; else setsid -f focusstaged >\"$LOG\" 2>&1 </dev/null; fi; fi; sleep 0.6; focusstage --json ping");
-            using var proc = Process.Start(psi);
-            if (proc is not null)
+                daemonArgs.Add("--native-host");
+                daemonArgs.Add(hostArg);
+            }
+            var (code, _, stderr) = await RunFocusStageFullAsync(15, daemonArgs.ToArray());
+            if (code != 0 && !string.IsNullOrWhiteSpace(stderr))
             {
-                await proc.WaitForExitAsync();
+                _notifyIcon.ShowBalloonTip(3000, "FocusStage", $"启动 focusstaged 失败: {stderr}", ToolTipIcon.Error);
             }
         }
         catch (Exception ex)
@@ -778,7 +774,10 @@ internal sealed class FocusStageTrayContext : ApplicationContext
         return (code, stdout);
     }
 
-    private async Task<(int ExitCode, string Stdout, string Stderr)> RunFocusStageFullAsync(params string[] args)
+    private Task<(int ExitCode, string Stdout, string Stderr)> RunFocusStageFullAsync(params string[] args)
+        => RunFocusStageFullAsync(8, args);
+
+    private async Task<(int ExitCode, string Stdout, string Stderr)> RunFocusStageFullAsync(int timeoutSeconds, params string[] args)
     {
         try
         {
@@ -805,7 +804,7 @@ internal sealed class FocusStageTrayContext : ApplicationContext
 
             var outTask = proc.StandardOutput.ReadToEndAsync();
             var errTask = proc.StandardError.ReadToEndAsync();
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
             await proc.WaitForExitAsync(cts.Token);
             var stdout = await outTask;
             var stderr = await errTask;

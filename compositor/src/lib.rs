@@ -8,6 +8,7 @@ pub mod manager;
 pub mod offscreen;
 pub mod protocol;
 pub mod router;
+pub mod session_env;
 pub mod sink;
 pub mod stage;
 pub mod state;

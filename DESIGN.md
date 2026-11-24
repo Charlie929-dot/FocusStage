@@ -259,7 +259,7 @@ stage_launch(app_id | app_name | app, args?, kind?, cwd?, width?, height?, show_
     → { stage_id, pid, status: ready | timeout | readiness_unavailable, ready?, launcher_exit?, observe_message?, ... } + PNG (when ready & observe)
     # 异步并行等待首帧就绪，不阻塞其他 Stage 的 MCP 请求
 
-stage_acquire(stage_id, ttl_s?=60, hide?=true, agent_name?)
+stage_acquire(stage_id, ttl_s?=60, hide?=false, agent_name?)
     → { lease, stage_id, expires_in_s }   # 同一 Stage 同时只有一个租约
 
 stage_renew(lease, ttl_s?=60)
@@ -290,7 +290,7 @@ stage_close(stage_id)
 ### 5.2 语义约定
 
 - **坐标**：一律使用 Stage 主窗口左上角为原点的逻辑像素，与桌面位置、DPI 无关；
-- **租约**：`acquire` 失败时返回当前持有者；租约到期未续自动释放；
+- **租约**：租约的 TTL 是空闲时长。通过租约校验并被接受的观察、动作、剪贴板和文件投递请求会重置空闲时间，`stage_renew` 可以修改 TTL。到期后自动归还控制权并松开按键和鼠标按钮。近期结束的租约可以重复释放。到期后首次释放仍可恢复窗口，但以同一 Stage 上后来发生的接管、重新申请、冻结或显隐操作为准。
 - **人永远优先**：用户接管后租约立即作废，之后的 `act` 返回 `preempted`，正在执行的动作序列中止；
 - **过期检测**：`act` 可携带 `based_on`，如果 Stage 画面在该帧之后已发生变化，返回 `stale`，避免 AI 对着旧画面点错；
 - **原子性**：一次 `act` 中的动作按顺序执行，任一步失败即中止，并返回已执行的步数。

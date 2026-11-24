@@ -57,24 +57,26 @@ struct Preferences {
     terminal: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Choice {
-    id: String,
-    name: String,
+    pub id: String,
+    pub name: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettingsView {
-    browser: String,
-    browsers: Vec<Choice>,
-    terminal: Option<String>,
-    terminals: Vec<Choice>,
-    protocols: BTreeMap<String, String>,
-    xdg_open_installed: bool,
-    portal_active: bool,
-    mimeapps_synced: bool,
+    pub browser: String,
+    pub browsers: Vec<Choice>,
+    pub terminal: Option<String>,
+    pub terminals: Vec<Choice>,
+    pub protocols: BTreeMap<String, String>,
+    pub xdg_open_installed: bool,
+    pub portal_active: bool,
+    pub mimeapps_synced: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", content = "id", rename_all = "snake_case")]
 pub enum SettingsAction {
     Get,
     InitDefaults,

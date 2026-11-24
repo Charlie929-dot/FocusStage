@@ -17,6 +17,7 @@ use focusstage_compositor::control::{local_peer_pid, spawn_control_server};
 use focusstage_compositor::offscreen::send_frames_surface_tree;
 use focusstage_compositor::protocol::{default_socket_path, DisplayState, SavedRect};
 use focusstage_compositor::router::InputSource;
+use focusstage_compositor::session_env;
 use focusstage_compositor::sink::native::NativeSink;
 use focusstage_compositor::sink::{DisplaySink, SinkInputEvent};
 use focusstage_compositor::stage::ClipboardContent;
@@ -50,52 +51,8 @@ struct Args {
     native_host: Option<PathBuf>,
 }
 
-fn normalize_process_path() {
-    let mut parts: Vec<String> = std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    let mut extras = vec![
-        "/usr/local/bin".to_string(),
-        "/usr/bin".to_string(),
-        "/bin".to_string(),
-        "/snap/bin".to_string(),
-        "/var/lib/flatpak/exports/bin".to_string(),
-    ];
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            extras.push(format!("{home}/.local/bin"));
-        }
-    }
-    for dir in extras {
-        if !parts.iter().any(|p| p == &dir) {
-            parts.push(dir);
-        }
-    }
-    std::env::set_var("PATH", parts.join(":"));
-}
-
 fn ensure_desktop_session_helpers() {
     use std::process::{Command, Stdio};
-
-    // Export WSLg display and desktop variables to systemd --user / D-Bus activation so
-    // xdg-desktop-portal-gtk, gnome-keyring.portal, and session helpers see them.
-    let _ = Command::new("systemctl")
-        .args([
-            "--user",
-            "import-environment",
-            "DISPLAY",
-            "WAYLAND_DISPLAY",
-            "PULSE_SERVER",
-            "XDG_DATA_DIRS",
-            "XDG_CURRENT_DESKTOP",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 
     let already_running = Command::new("pgrep")
         .args(["-u", &unsafe { libc::geteuid() }.to_string(), "-f", "polkit-.*authentication-agent|lxpolkit"])
@@ -200,7 +157,7 @@ fn connect_desktop(args: &Args) -> (Option<Box<dyn DisplaySink>>, SavedRect, f64
 }
 
 fn main() -> anyhow::Result<()> {
-    normalize_process_path();
+    session_env::init_daemon_environment();
     if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     } else {
@@ -211,14 +168,10 @@ fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let control_socket = args.socket.clone().unwrap_or_else(default_socket_path);
-    // Child processes that call focusstage-open must return to this daemon.
+    // Child processes and D-Bus activated helpers (focusstage-open) must return to this daemon.
     std::env::set_var("FOCUSSTAGE_SOCKET", &control_socket);
-    // Provide a standard GNOME desktop identity when unset so xdg-open avoids WSL fallback,
-    // portals match gtk/gnome-keyring backends, and Chromium/Electron use libsecret.
-    if std::env::var_os("XDG_CURRENT_DESKTOP").is_none_or(|v| v.is_empty()) {
-        std::env::set_var("XDG_CURRENT_DESKTOP", "GNOME");
-    }
     if !args.headless {
+        session_env::sync_desktop_session_environment();
         ensure_desktop_session_helpers();
     }
     let (display_sink, monitor, scale) = connect_desktop(&args);

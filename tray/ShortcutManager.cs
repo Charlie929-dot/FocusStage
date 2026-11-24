@@ -50,6 +50,7 @@ internal sealed class LinuxAppDto
     [JsonPropertyName("categories")]
     public string? Categories { get; set; }
 
+    [JsonIgnore]
     public string DisplayName => !string.IsNullOrWhiteSpace(NameZhCn) ? NameZhCn! : Name;
 }
 
@@ -80,9 +81,11 @@ internal static class ShortcutManager
 
     public static string GetFocusStageExePath()
     {
+        var running = Environment.ProcessPath ?? Application.ExecutablePath;
+        var installPrefix = AppInstallDir + Path.DirectorySeparatorChar;
+        if (running.StartsWith(installPrefix, StringComparison.OrdinalIgnoreCase)) return running;
         var installed = Path.Combine(AppInstallDir, "FocusStage.exe");
-        if (File.Exists(installed)) return installed;
-        return Environment.ProcessPath ?? Application.ExecutablePath;
+        return File.Exists(installed) ? installed : running;
     }
 
     public static string EnsureAppBrandIcon()
@@ -254,19 +257,22 @@ internal static class ShortcutManager
 
     public static async Task<(bool Ok, string Message, int Count)> SyncAllAsync(string distro, bool createDesktopForLauncher = true, bool createStartupTray = true)
     {
-        // 1. Sync the Linux desktop entries used for app identity and icon lookup.
-        var (syncCode, syncOut, syncErr) = await RunWslAsync(distro, true, "/usr/local/bin/focusstage", "--json", "sync-apps");
-        if (syncCode != 0)
-        {
-            // Fallback to user dir if root isn't available
-            await RunWslAsync(distro, false, "focusstage", "--json", "sync-apps");
-        }
-
-        // 2. Query discovered apps with resolved icon paths
+        // 1. Query discovered apps in the Ubuntu user session (via focusstaged if running).
         var (appsOk, apps, appsErr) = await FetchLinuxAppsAsync(distro);
         if (!appsOk)
         {
-            return (false, string.IsNullOrWhiteSpace(appsErr) ? syncErr : appsErr, 0);
+            return (false, appsErr, 0);
+        }
+
+        // 2. Sync Linux .desktop wrappers from that exact user catalog without re-scanning as root.
+        var appsJson = JsonSerializer.Serialize(new { apps });
+        var (syncCode, _, _) = await RunWslWithStdinAsync(
+            distro, true, 30, appsJson, "/usr/local/bin/focusstage", "--json", "sync-apps", "--from-stdin");
+        if (syncCode != 0)
+        {
+            // Fallback to user dir if root isn't available
+            await RunWslWithStdinAsync(
+                distro, false, 30, appsJson, "focusstage", "--json", "sync-apps", "--from-stdin");
         }
 
         var brandIco = EnsureAppBrandIcon();
@@ -575,7 +581,18 @@ internal static class ShortcutManager
     public static Task<(int ExitCode, string Stdout, string Stderr)> RunWslAsync(string distro, bool asRoot, params string[] args)
         => RunWslAsync(distro, asRoot, 15, args);
 
-    public static async Task<(int ExitCode, string Stdout, string Stderr)> RunWslAsync(string distro, bool asRoot, int timeoutSeconds, params string[] args)
+    public static Task<(int ExitCode, string Stdout, string Stderr)> RunWslAsync(string distro, bool asRoot, int timeoutSeconds, params string[] args)
+        => RunWslAsync(distro, asRoot ? "root" : null, timeoutSeconds, args);
+
+    public static Task<(int ExitCode, string Stdout, string Stderr)> RunWslWithStdinAsync(
+        string distro, bool asRoot, int timeoutSeconds, string stdinContent, params string[] args)
+        => RunWslWithStdinAsync(distro, asRoot ? "root" : null, timeoutSeconds, stdinContent, args);
+
+    public static Task<(int ExitCode, string Stdout, string Stderr)> RunWslAsync(string distro, string? user, int timeoutSeconds, params string[] args)
+        => RunWslWithStdinAsync(distro, user, timeoutSeconds, null, args);
+
+    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunWslWithStdinAsync(
+        string distro, string? user, int timeoutSeconds, string? stdinContent, params string[] args)
     {
         try
         {
@@ -588,12 +605,17 @@ internal static class ShortcutManager
                 StandardOutputEncoding = Encoding.UTF8,
                 StandardErrorEncoding = Encoding.UTF8
             };
+            if (stdinContent is not null)
+            {
+                psi.RedirectStandardInput = true;
+                psi.StandardInputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+            }
             psi.ArgumentList.Add("-d");
             psi.ArgumentList.Add(distro);
-            if (asRoot)
+            if (user is not null)
             {
                 psi.ArgumentList.Add("-u");
-                psi.ArgumentList.Add("root");
+                psi.ArgumentList.Add(user);
             }
             psi.ArgumentList.Add("-e");
             foreach (var a in args)
@@ -603,6 +625,12 @@ internal static class ShortcutManager
 
             using var proc = Process.Start(psi);
             if (proc is null) return (-1, "", "Failed to start wsl.exe");
+
+            if (stdinContent is not null)
+            {
+                await proc.StandardInput.WriteAsync(stdinContent);
+                proc.StandardInput.Close();
+            }
 
             var outTask = proc.StandardOutput.ReadToEndAsync();
             var errTask = proc.StandardError.ReadToEndAsync();

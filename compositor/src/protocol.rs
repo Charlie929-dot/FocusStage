@@ -67,6 +67,40 @@ pub struct StageInfo {
     pub wm_class: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopAppInfo {
+    pub id: String,
+    pub stem: String,
+    pub source: String,
+    #[serde(default)]
+    pub file_path: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub name_zh_cn: Option<String>,
+    #[serde(default)]
+    pub generic_name: Option<String>,
+    pub cmd: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub wm_class: String,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub icon_path: Option<String>,
+    #[serde(default)]
+    pub categories: Option<String>,
+}
+
+impl DesktopAppInfo {
+    pub fn is_launchable(&self) -> bool {
+        matches!(self.source.as_str(), "desktop" | "appimage")
+    }
+
+    pub fn matches_name(&self, matches: impl Fn(&str) -> bool) -> bool {
+        matches(&self.name) || self.name_zh_cn.as_deref().is_some_and(matches)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct A11yBounds {
     pub x: i32,
@@ -274,6 +308,10 @@ pub enum ControlRequest {
         #[serde(default)]
         position: Option<[f64; 2]>,
     },
+    ListApps,
+    Settings {
+        action: crate::xdg::SettingsAction,
+    },
     Shutdown,
 }
 
@@ -361,6 +399,13 @@ pub enum ControlResponse {
     Clipboard {
         text: Option<String>,
         seq: u64,
+    },
+    Apps {
+        count: usize,
+        apps: Vec<DesktopAppInfo>,
+    },
+    Settings {
+        view: crate::xdg::SettingsView,
     },
 }
 
@@ -478,6 +523,44 @@ mod tests {
             }
             other => panic!("unexpected parsed request: {:?}", other),
         }
+    }
+
+    #[test]
+    fn session_protocol_roundtrip() {
+        let req = ControlRequest::Settings {
+            action: crate::xdg::SettingsAction::SetBrowser("firefox".into()),
+        };
+        let raw = serde_json::to_string(&req).unwrap();
+        let parsed: ControlRequest = serde_json::from_str(&raw).unwrap();
+        assert!(matches!(
+            parsed,
+            ControlRequest::Settings {
+                action: crate::xdg::SettingsAction::SetBrowser(ref id)
+            } if id == "firefox"
+        ));
+
+        let resp = ControlResponse::Apps {
+            count: 1,
+            apps: vec![DesktopAppInfo {
+                id: "focusstage-code".into(),
+                stem: "code".into(),
+                source: "desktop".into(),
+                file_path: Some("/usr/share/applications/code.desktop".into()),
+                name: "VS Code".into(),
+                name_zh_cn: None,
+                generic_name: None,
+                cmd: "/usr/bin/code".into(),
+                args: vec!["--new-window".into()],
+                wm_class: "focusstage-code".into(),
+                icon: Some("vscode".into()),
+                icon_path: None,
+                categories: Some("Development;".into()),
+            }],
+        };
+        let resp_json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(resp_json["status"], "apps");
+        assert_eq!(resp_json["count"], 1);
+        assert_eq!(resp_json["apps"][0]["id"], "focusstage-code");
     }
 }
 

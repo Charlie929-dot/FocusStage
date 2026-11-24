@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use focusstage_compositor::control::ControlClient;
 use focusstage_compositor::desktop::WRAPPER_PREFIX;
-use focusstage_mcp::apps::{discover_desktop_apps, DiscoveredDesktopApp};
+use focusstage_compositor::protocol::DesktopAppInfo;
+use focusstage_mcp::apps::discover_desktop_apps_via_daemon;
 use serde_json::json;
 
 #[derive(Debug)]
@@ -26,8 +28,8 @@ struct Outcome {
     removed: Vec<String>,
 }
 
-pub fn run(app_id: &str, json_mode: bool) -> anyhow::Result<()> {
-    let payload = match uninstall(app_id) {
+pub fn run(app_id: &str, sock: &Path, json_mode: bool) -> anyhow::Result<()> {
+    let payload = match uninstall(app_id, sock) {
         Ok(outcome) => json!({
             "status": "ok",
             "app_id": app_id,
@@ -56,11 +58,12 @@ pub fn run(app_id: &str, json_mode: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn uninstall(app_id: &str) -> Result<Outcome, UninstallError> {
-    let apps = discover_desktop_apps();
+fn uninstall(app_id: &str, sock: &Path) -> Result<Outcome, UninstallError> {
+    let client = ControlClient::new(sock.to_path_buf());
+    let apps = discover_desktop_apps_via_daemon(Some(&client));
     let app = apps
         .iter()
-        .find(|candidate| candidate.wrapper_id == app_id)
+        .find(|candidate| candidate.id == app_id)
         .ok_or_else(|| {
             UninstallError::new("not_found", format!("Application {app_id} not found"))
         })?;
@@ -68,7 +71,7 @@ fn uninstall(app_id: &str) -> Result<Outcome, UninstallError> {
         .file_path
         .as_deref()
         .ok_or_else(|| UninstallError::new("unsupported", "Application has no source file"))?;
-    match app.source {
+    match app.source.as_str() {
         "deb" => delete_installer(path),
         "appimage" => delete_appimage(path),
         "desktop" => uninstall_desktop_app(app, path),
@@ -99,14 +102,14 @@ fn delete_appimage(path: &str) -> Result<Outcome, UninstallError> {
 }
 
 fn uninstall_desktop_app(
-    app: &DiscoveredDesktopApp,
+    app: &DesktopAppInfo,
     path: &str,
 ) -> Result<Outcome, UninstallError> {
     let (action, mut removed) = if let Some(managed) = remove_managed_package(path)? {
         managed
-    } else if app.parsed.cmd.to_ascii_lowercase().ends_with(".appimage") {
+    } else if app.cmd.to_ascii_lowercase().ends_with(".appimage") {
         let mut files = Vec::new();
-        remove_appimage_files(&app.parsed.cmd, &mut files)?;
+        remove_appimage_files(&app.cmd, &mut files)?;
         remove_file(path)?;
         files.push(path.to_string());
         ("delete-appimage", files)
@@ -136,7 +139,7 @@ fn uninstall_desktop_app(
 
     Ok(Outcome {
         action,
-        message: format!("已卸载 {}", app.parsed.name),
+        message: format!("已卸载 {}", app.name),
         removed,
     })
 }

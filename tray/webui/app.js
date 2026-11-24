@@ -177,6 +177,9 @@
     iconMaximize: $('icon-maximize'),
     iconRestore: $('icon-restore'),
     btnClose: $('btn-close'),
+    btnUnlock: $('btn-unlock'),
+    btnUnlockLinux: $('btn-unlock-linux'),
+    unlockStatus: $('unlock-status'),
 
     viewApps: $('view-apps'),
     viewControl: $('view-control'),
@@ -303,6 +306,52 @@
     els.iconRestore.classList.toggle('is-hidden', !state.maximized);
     els.btnMaximize.title = state.maximized ? '还原' : '最大化';
   }
+
+  let launcherVisible = false;
+  let launcherUnlocked = false;
+  let unlockAttempt = null;
+
+  function applyLauncherSession(session) {
+    if (!session) return;
+    const opened = session.visible && !launcherVisible;
+    launcherVisible = session.visible;
+    launcherUnlocked = session.unlocked;
+    $('app').classList.toggle('session-locked', !launcherUnlocked);
+    if (!launcherVisible) {
+      unlockAttempt = null;
+      closeContextMenu();
+      closeModal();
+      closeFolder();
+    }
+    els.unlockStatus.textContent = launcherUnlocked ? '' : session.message || '';
+    if (launcherUnlocked && session.message) showToast(session.message);
+    els.btnUnlock.disabled = els.btnUnlockLinux.disabled = Boolean(unlockAttempt);
+    if (opened && !launcherUnlocked) requestLauncherUnlock(false);
+  }
+
+  async function requestLauncherUnlock(linuxPassword) {
+    if (!launcherVisible || launcherUnlocked || unlockAttempt) return;
+    const attempt = {};
+    unlockAttempt = attempt;
+    els.unlockStatus.textContent = '请在系统窗口中完成验证。';
+    els.btnUnlock.disabled = els.btnUnlockLinux.disabled = true;
+    try {
+      const session = await bridge.invoke('session.unlock', { linuxPassword });
+      if (unlockAttempt !== attempt) return;
+      unlockAttempt = null;
+      applyLauncherSession(session);
+      if (!launcherUnlocked && launcherVisible) els.btnUnlock.focus();
+    } catch {
+      if (unlockAttempt !== attempt) return;
+      unlockAttempt = null;
+      els.btnUnlock.disabled = els.btnUnlockLinux.disabled = false;
+      els.unlockStatus.textContent = '无法完成验证。请重试或切换验证方式。';
+      els.btnUnlock.focus();
+    }
+  }
+
+  els.btnUnlock.addEventListener('click', () => requestLauncherUnlock(false));
+  els.btnUnlockLinux.addEventListener('click', () => requestLauncherUnlock(true));
 
   // ---------------- Appearance Helpers ----------------
   function themeById(id) {
@@ -3040,6 +3089,7 @@
 
   // ---------------- Global Keyboard Shortcuts ----------------
   document.addEventListener('keydown', (e) => {
+    if (!launcherUnlocked) return;
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
       e.preventDefault();
       closeContextMenu();
@@ -3082,6 +3132,7 @@
   }
 
   // ---------------- Host Events & Bootstrap ----------------
+  bridge.on('session', applyLauncherSession);
   bridge.on('state', applyStatePayload);
   bridge.on('apps', (payload) => {
     applyAppsPayload(payload);
@@ -3108,6 +3159,7 @@
         updateMaximizedUi(init.maximized);
         applyStatePayload(init);
         applyAppsPayload(init);
+        applyLauncherSession(init.session);
       }
     } catch (err) {
       showToast(`初始化失败：${err.message}`, 'error');

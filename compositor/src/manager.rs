@@ -217,6 +217,11 @@ impl FocusStageState {
             .remove(stage_id)
             .ok_or_else(|| format!("Stage '{}' not found", stage_id))?;
 
+        if let Some(lease) = stage.lease.take() {
+            use crate::control::LeaseEnd;
+            let end = if lease.is_expired() { LeaseEnd::Expired } else { LeaseEnd::Preempted };
+            self.record_ended_lease(lease, end);
+        }
         terminate_stage_processes(&stage);
         if let Some(ref mut child) = stage.child {
             let _ = child.kill();

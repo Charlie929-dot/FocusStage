@@ -314,6 +314,109 @@ pub fn discover(dirs: &[PathBuf]) -> BTreeMap<String, (PathBuf, DesktopEntry)> {
     apps
 }
 
+pub fn discover_launcher_apps(resolve_icons: bool) -> Vec<crate::protocol::DesktopAppInfo> {
+    let scan_dirs = launcher_application_dirs();
+    let icons = resolve_icons.then(|| crate::icons::DesktopIcons::new(&scan_dirs));
+    let mut download_dirs = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            download_dirs.push(PathBuf::from(&home).join("Downloads"));
+        }
+    }
+    if let Some(win_home) = windows_user_home() {
+        download_dirs.push(win_home.join("Downloads"));
+    }
+
+    let mut apps = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    for (stem, (path, parsed)) in discover(&scan_dirs) {
+        seen_ids.insert(stem.clone());
+        if parsed.no_display {
+            continue;
+        }
+        let wrapper_id = format!("{WRAPPER_PREFIX}{stem}");
+        let icon_path = icons
+            .as_ref()
+            .zip(parsed.icon.as_deref())
+            .and_then(|(resolver, name)| resolver.resolve(name))
+            .and_then(|p| icons.as_ref().unwrap().windows_path(p))
+            .map(|p| p.display().to_string());
+        let args = parsed.launch_args();
+        apps.push(crate::protocol::DesktopAppInfo {
+            id: wrapper_id.clone(),
+            stem,
+            source: "desktop".to_string(),
+            file_path: Some(path.display().to_string()),
+            name: parsed.name,
+            name_zh_cn: parsed.name_zh_cn,
+            generic_name: parsed.generic_name,
+            cmd: parsed.cmd,
+            args,
+            wm_class: wrapper_id,
+            icon: parsed.icon,
+            icon_path,
+            categories: parsed.categories,
+        });
+    }
+
+    for dir in &download_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let lower = fname.to_ascii_lowercase();
+            let (source, ext_len) = if lower.ends_with(".appimage") {
+                ("appimage", ".appimage".len())
+            } else if lower.ends_with(".deb") {
+                ("deb", ".deb".len())
+            } else {
+                continue;
+            };
+            let raw_stem = &fname[..fname.len() - ext_len];
+            let safe_stem: String = raw_stem
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+                .collect();
+            let id_key = format!("{source}-{safe_stem}");
+            if !seen_ids.insert(id_key.clone()) {
+                continue;
+            }
+            let full = path.display().to_string();
+            let wrapper_id = format!("{WRAPPER_PREFIX}{id_key}");
+            apps.push(crate::protocol::DesktopAppInfo {
+                id: wrapper_id.clone(),
+                stem: id_key,
+                source: source.to_string(),
+                file_path: Some(full.clone()),
+                name: raw_stem.to_string(),
+                name_zh_cn: None,
+                generic_name: Some(if source == "appimage" {
+                    "便携应用 (AppImage)".to_string()
+                } else {
+                    "安装包 (.deb)".to_string()
+                }),
+                cmd: full,
+                args: Vec::new(),
+                wm_class: wrapper_id,
+                icon: None,
+                icon_path: None,
+                categories: Some("Downloads;".to_string()),
+            });
+        }
+    }
+
+    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    apps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
