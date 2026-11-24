@@ -151,6 +151,10 @@
     linuxSettings: null,
     linuxSettingsBusy: false,
     dragPayload: null,
+    dragRepelActive: false,
+    lastDragCell: null,
+    lastPreviewKey: '',
+    basePlacements: [],
     dropTarget: null,
     dropMode: null,
     appsLoaded: false
@@ -180,6 +184,7 @@
     appsGrid: $('apps-grid'),
     appsEmpty: $('apps-empty'),
     desktopHint: $('desktop-hint'),
+    desktopHintText: $('desktop-hint-text'),
     dockContainer: $('dock-container'),
     dock: $('dock'),
 
@@ -495,7 +500,7 @@
   function applyAppsPayload(payload) {
     state.apps = Array.isArray(payload.apps) ? payload.apps : [];
     state.appById = new Map(state.apps.map((a) => [a.id, a]));
-    state.appsLoaded = true;
+    state.appsLoaded = payload.appsLoaded !== undefined ? Boolean(payload.appsLoaded) : true;
     setLayout(payload.layout || state.layout);
     renderLayoutViews();
     if (state.activeView === 'control' && state.activeTab === 'stages') renderStages();
@@ -691,16 +696,28 @@
     }
 
     els.desktopHint.classList.remove('is-hidden');
+    updateDesktopHint();
     els.appsGrid.classList.add('desktop-grid');
 
     const columns = appearance.columns;
     const placements = calculatePlacements();
-    const maxRow = placements.reduce((max, p) => Math.max(max, p.row), 0);
+    state.basePlacements = placements;
+
+    let maxVisibleRow = 0;
+    for (const p of placements) {
+      const visible = isFolderToken(p.token)
+        ? Boolean(findFolder(folderIdFromToken(p.token)))
+        : state.appById.has(p.token);
+      if (visible && p.row > maxVisibleRow) maxVisibleRow = p.row;
+    }
+
     const cellHeight = 98 * (appearance.tileScale / 100);
     const availableHeight = els.appsScroll.clientHeight || 520;
     const visibleRows = Math.max(4, Math.ceil((availableHeight - 94) / cellHeight));
-    const rows = Math.max(5, visibleRows, maxRow + 2);
+    const rows = Math.max(5, visibleRows, maxVisibleRow + 2);
     els.appsGrid.style.setProperty('--grid-rows', String(rows));
+    els.appsGrid.dataset.cols = String(columns);
+    els.appsGrid.dataset.rows = String(rows);
 
     const slotFrag = document.createDocumentFragment();
     for (let row = 0; row < rows; row += 1) {
@@ -828,16 +845,27 @@
           fromFolderId: inFolderId,
           fromRoot: context === 'root'
         };
+        state.dragRepelActive = Boolean(e.ctrlKey);
+        state.lastDragCell = null;
+        state.lastPreviewKey = '';
         tile.classList.add('is-dragging');
-        if (context === 'root') els.appsGrid.classList.add('is-dragging');
+        if (context === 'root') {
+          els.appsGrid.classList.add('is-dragging');
+          els.appsGrid.classList.toggle('is-repel-mode', state.dragRepelActive);
+          els.appsGrid.classList.toggle('is-merge-mode', !state.dragRepelActive);
+          updateDesktopHint(state.dragRepelActive ? 'repel' : 'move', state.dragRepelActive, null);
+        }
         e.dataTransfer.effectAllowed = 'move';
         e.dataTransfer.setData('text/plain', app.id);
       });
       tile.addEventListener('dragend', () => {
         tile.classList.remove('is-dragging');
-        els.appsGrid.classList.remove('is-dragging');
+        els.appsGrid.classList.remove('is-dragging', 'is-repel-mode', 'is-merge-mode');
         clearDropVisuals();
         state.dragPayload = null;
+        state.dragRepelActive = false;
+        state.lastDragCell = null;
+        updateDesktopHint();
       });
     }
 
@@ -883,11 +911,12 @@
     tile.dataset.kind = 'folder';
     tile.dataset.id = folder.id;
     tile.dataset.token = token;
-    tile.title = `${folder.name} (${folder.appIds.length} 个应用)`;
+    const visibleApps = folder.appIds.map((id) => state.appById.get(id)).filter(Boolean);
+    tile.title = `${folder.name} (${visibleApps.length} 个应用)`;
 
     const preview = document.createElement('div');
     preview.className = 'folder-preview';
-    const previewApps = folder.appIds.slice(0, 4).map((id) => state.appById.get(id)).filter(Boolean);
+    const previewApps = visibleApps.slice(0, 4);
     for (let i = 0; i < 4; i += 1) {
       if (previewApps[i]) {
         const img = document.createElement('img');
@@ -935,20 +964,68 @@
           fromFolderId: null,
           fromRoot: true
         };
+        state.dragRepelActive = Boolean(e.ctrlKey);
+        state.lastDragCell = null;
+        state.lastPreviewKey = '';
         tile.classList.add('is-dragging');
         els.appsGrid.classList.add('is-dragging');
+        els.appsGrid.classList.toggle('is-repel-mode', state.dragRepelActive);
+        els.appsGrid.classList.toggle('is-merge-mode', !state.dragRepelActive);
+        updateDesktopHint(state.dragRepelActive ? 'repel' : 'move', state.dragRepelActive, null);
         e.dataTransfer.effectAllowed = 'move';
         e.dataTransfer.setData('text/plain', token);
       });
       tile.addEventListener('dragend', () => {
         tile.classList.remove('is-dragging');
-        els.appsGrid.classList.remove('is-dragging');
+        els.appsGrid.classList.remove('is-dragging', 'is-repel-mode', 'is-merge-mode');
         clearDropVisuals();
         state.dragPayload = null;
+        state.dragRepelActive = false;
+        state.lastDragCell = null;
+        updateDesktopHint();
       });
     }
 
     return tile;
+  }
+
+  const DEFAULT_DESKTOP_HINT_HTML =
+    '拖到图标上合并文件夹 · 按住 <kbd class="hint-kbd">Ctrl</kbd> 拖动挤开周围图标 · 拖到快捷栏固定';
+
+  function updateDesktopHint(mode = null, repel = false, targetTile = null) {
+    if (!els.desktopHint || !els.desktopHintText) return;
+    if (!mode || !state.dragPayload) {
+      els.desktopHint.classList.remove('is-drag-merge', 'is-drag-repel');
+      els.desktopHintText.innerHTML = DEFAULT_DESKTOP_HINT_HTML;
+      return;
+    }
+
+    els.desktopHint.classList.toggle('is-drag-repel', Boolean(repel));
+    els.desktopHint.classList.toggle('is-drag-merge', !repel);
+
+    if (mode === 'dock') {
+      els.desktopHintText.textContent = '固定到快捷栏：松开即可添加快捷入口';
+      return;
+    }
+    if (repel || mode === 'repel') {
+      els.desktopHintText.innerHTML =
+        '挤开排列模式（已按住 <kbd class="hint-kbd">Ctrl</kbd>）：松开后将占位图标顺延挤开到相邻格子';
+      return;
+    }
+    if (mode === 'merge' && targetTile) {
+      const name = targetTile.querySelector('.tile-title')?.textContent?.trim() || '目标应用';
+      els.desktopHintText.innerHTML =
+        `合并模式：松开即可与「${escapeHtml(name)}」合并为文件夹 · 按住 <kbd class="hint-kbd">Ctrl</kbd> 改为挤开`;
+      return;
+    }
+    if (mode === 'into-folder' && targetTile) {
+      const name = targetTile.querySelector('.tile-title')?.textContent?.trim() || '文件夹';
+      els.desktopHintText.innerHTML =
+        `移入模式：松开即可移入「${escapeHtml(name)}」 · 按住 <kbd class="hint-kbd">Ctrl</kbd> 改为挤开`;
+      return;
+    }
+    els.desktopHintText.innerHTML =
+      '拖动中：拖到图标上可合并为文件夹 · 按住 <kbd class="hint-kbd">Ctrl</kbd> 可挤开周围图标';
   }
 
   function clearDropIndicators(except = null) {
@@ -959,46 +1036,155 @@
 
   function clearGridDropIndicators() {
     clearDropIndicators();
-    document.querySelectorAll('.grid-slot.is-drop-target').forEach((el) => el.classList.remove('is-drop-target'));
+    document.querySelectorAll('.grid-slot.is-drop-target, .grid-slot.is-repel-target').forEach((el) => {
+      el.classList.remove('is-drop-target', 'is-repel-target');
+    });
   }
 
   function setDockDropActive(active) {
     els.dock.classList.toggle('is-drop-target', active);
   }
 
-  function clearAvoidance() {
-    document.querySelectorAll('.tile.is-avoiding').forEach((el) => {
-      el.classList.remove('is-avoiding');
-      el.style.removeProperty('--avoid-x');
-      el.style.removeProperty('--avoid-y');
+  function clearRepelPreview() {
+    els.appsGrid.querySelectorAll('.tile.is-repelled').forEach((el) => {
+      el.classList.remove('is-repelled');
+      el.style.removeProperty('transform');
     });
   }
 
-  function applyAvoidance(cell) {
-    clearAvoidance();
-    const payload = state.dragPayload;
-    if (!cell || !payload || state.searchQuery.trim()) return;
-    const tiles = Array.from(els.appsGrid.querySelectorAll('.tile[data-root-token]'));
+  // Deterministic phone-style linear grid cell repulsion.
+  // Must stay identical to LauncherLayout.ApplyRepelPlacement() in C#.
+  function computeRepelPositions(basePlacements, columns, dragToken, targetRow, targetCol) {
+    const cols = Math.max(6, Math.min(12, columns));
+    const row = Math.max(0, targetRow);
+    const col = Math.max(0, Math.min(cols - 1, targetCol));
+    const targetIdx = row * cols + col;
+
+    const positions = new Map();
+    let sourceIdx = null;
+    for (const p of basePlacements) {
+      positions.set(p.token, { row: p.row, col: p.col });
+      if (p.token === dragToken) {
+        sourceIdx = p.row * cols + p.col;
+      }
+    }
+
+    if (sourceIdx === targetIdx) {
+      return positions;
+    }
+
+    const occupiedByIdx = new Map();
+    for (const [tok, pos] of positions.entries()) {
+      if (tok === dragToken) continue;
+      occupiedByIdx.set(pos.row * cols + pos.col, tok);
+    }
+
+    if (!occupiedByIdx.has(targetIdx)) {
+      positions.set(dragToken, { row, col });
+      return positions;
+    }
+
+    let dir = (sourceIdx !== null && targetIdx > sourceIdx) ? -1 : 1;
+    let freeIdx = targetIdx + dir;
+    while (freeIdx >= 0 && occupiedByIdx.has(freeIdx)) {
+      freeIdx += dir;
+    }
+
+    if (freeIdx < 0) {
+      dir = 1;
+      freeIdx = targetIdx + 1;
+      while (occupiedByIdx.has(freeIdx)) {
+        freeIdx += 1;
+      }
+    }
+
+    if (dir < 0) {
+      for (let idx = freeIdx + 1; idx <= targetIdx; idx += 1) {
+        const tok = occupiedByIdx.get(idx);
+        if (!tok) continue;
+        const nextIdx = idx - 1;
+        positions.set(tok, { row: Math.floor(nextIdx / cols), col: nextIdx % cols });
+      }
+    } else {
+      for (let idx = freeIdx - 1; idx >= targetIdx; idx -= 1) {
+        const tok = occupiedByIdx.get(idx);
+        if (!tok) continue;
+        const nextIdx = idx + 1;
+        positions.set(tok, { row: Math.floor(nextIdx / cols), col: nextIdx % cols });
+      }
+    }
+
+    positions.set(dragToken, { row, col });
+    return positions;
+  }
+
+  function getGridMetrics() {
+    const columns = Number(els.appsGrid.dataset.cols) || state.layout.appearance.columns;
+    const rows = Number(els.appsGrid.dataset.rows) || 5;
+    const slot00 = getSlot(0, 0);
+    if (!slot00) return null;
+    const rect00 = slot00.getBoundingClientRect();
+    const slot01 = columns > 1 ? getSlot(0, 1) : null;
+    const slot10 = rows > 1 ? getSlot(1, 0) : null;
+    const colStep = slot01 ? slot01.getBoundingClientRect().left - rect00.left : rect00.width + 6;
+    const rowStep = slot10 ? slot10.getBoundingClientRect().top - rect00.top : rect00.height + 6;
+    if (colStep <= 0 || rowStep <= 0) return null;
+    const gapX = Math.max(0, colStep - rect00.width);
+    const gapY = Math.max(0, rowStep - rect00.height);
+    return { columns, rows, rect00, colStep, rowStep, gapX, gapY };
+  }
+
+  function applyRepelPreview(dragToken, targetRow, targetCol) {
+    const metrics = getGridMetrics();
+    if (!metrics) return;
+
+    const nextMap = computeRepelPositions(
+      state.basePlacements,
+      metrics.columns,
+      dragToken,
+      targetRow,
+      targetCol
+    );
+
+    const tiles = els.appsGrid.querySelectorAll('.tile[data-root-token]');
     for (const tile of tiles) {
-      if (tile.dataset.token === payload.token || tile === cell.element) continue;
-      const row = Number(tile.dataset.row);
-      const col = Number(tile.dataset.col);
-      if (!Number.isInteger(row) || !Number.isInteger(col)) continue;
-      const dx = col - cell.col;
-      const dy = row - cell.row;
-      if (Math.max(Math.abs(dx), Math.abs(dy)) !== 1) continue;
-      tile.style.setProperty('--avoid-x', `${dx * 14}px`);
-      tile.style.setProperty('--avoid-y', `${dy * 14}px`);
-      tile.classList.add('is-avoiding');
+      const tok = tile.dataset.token;
+      if (tok === dragToken) continue;
+      const curRow = Number(tile.dataset.row);
+      const curCol = Number(tile.dataset.col);
+      const next = nextMap.get(tok);
+      if (!next || (next.row === curRow && next.col === curCol)) {
+        tile.classList.remove('is-repelled');
+        tile.style.removeProperty('transform');
+        continue;
+      }
+
+      const fromSlot = getSlot(curRow, curCol);
+      const toSlot = getSlot(next.row, next.col);
+      let dx;
+      let dy;
+      if (fromSlot && toSlot) {
+        const fromRect = fromSlot.getBoundingClientRect();
+        const toRect = toSlot.getBoundingClientRect();
+        dx = toRect.left - fromRect.left;
+        dy = toRect.top - fromRect.top;
+      } else {
+        dx = (next.col - curCol) * metrics.colStep;
+        dy = (next.row - curRow) * metrics.rowStep;
+      }
+
+      tile.style.transform = `translate3d(${Math.round(dx)}px, ${Math.round(dy)}px, 0)`;
+      tile.classList.add('is-repelled');
     }
   }
 
   function clearDropVisuals() {
     clearGridDropIndicators();
     setDockDropActive(false);
-    clearAvoidance();
+    clearRepelPreview();
     state.dropTarget = null;
     state.dropMode = null;
+    state.lastPreviewKey = '';
   }
 
   function handleDockDragOver(e) {
@@ -1008,14 +1194,21 @@
     e.stopPropagation();
     e.dataTransfer.dropEffect = 'move';
     clearGridDropIndicators();
-    clearAvoidance();
+    clearRepelPreview();
     setDockDropActive(true);
     state.dropTarget = null;
     state.dropMode = 'dock';
+    state.lastPreviewKey = '';
+    updateDesktopHint('dock', false, null);
   }
 
   function handleDockDragLeave(e) {
-    if (!els.dock.contains(e.relatedTarget)) setDockDropActive(false);
+    if (!els.dock.contains(e.relatedTarget)) {
+      setDockDropActive(false);
+      if (state.dragPayload) {
+        updateDesktopHint(state.dragRepelActive ? 'repel' : 'move', state.dragRepelActive, null);
+      }
+    }
   }
 
   async function handleDockDrop(e) {
@@ -1023,93 +1216,157 @@
     if (!payload || (payload.kind !== 'app' && payload.kind !== 'folder')) return;
     e.preventDefault();
     e.stopPropagation();
-    els.appsGrid.classList.remove('is-dragging');
+    els.appsGrid.classList.remove('is-dragging', 'is-repel-mode', 'is-merge-mode');
     clearDropVisuals();
+    state.dragPayload = null;
+    state.dragRepelActive = false;
+    state.lastDragCell = null;
+    updateDesktopHint();
     if (payload.kind === 'app') await pinDockItem('app', payload.appId);
     else await pinDockItem('folder', payload.folderId);
   }
 
   function resolveDropCell(e) {
+    const metrics = getGridMetrics();
+    if (metrics) {
+      const gridRect = els.appsGrid.getBoundingClientRect();
+      if (
+        e.clientX >= gridRect.left - 2 &&
+        e.clientX <= gridRect.right + 2 &&
+        e.clientY >= gridRect.top - 2 &&
+        e.clientY <= gridRect.bottom + 2
+      ) {
+        const col = Math.max(
+          0,
+          Math.min(
+            metrics.columns - 1,
+            Math.floor((e.clientX - metrics.rect00.left + metrics.gapX / 2) / metrics.colStep)
+          )
+        );
+        const row = Math.max(
+          0,
+          Math.min(
+            metrics.rows - 1,
+            Math.floor((e.clientY - metrics.rect00.top + metrics.gapY / 2) / metrics.rowStep)
+          )
+        );
+        const tile = els.appsGrid.querySelector(`.tile[data-root-token][data-row='${row}'][data-col='${col}']`);
+        return { row, col, tile };
+      }
+    }
+
     const el = e.target.closest('.grid-slot, .tile[data-root-token]');
     if (!el) return null;
     const row = Number(el.dataset.row);
     const col = Number(el.dataset.col);
     if (!Number.isInteger(row) || !Number.isInteger(col)) return null;
-    return { row, col, tile: el.classList.contains('tile') ? el : null, element: el };
+    const tile = els.appsGrid.querySelector(`.tile[data-root-token][data-row='${row}'][data-col='${col}']`);
+    return { row, col, tile };
   }
 
-  function isCenterDrop(e, tile) {
-    if (!tile) return false;
-    const rect = tile.getBoundingClientRect();
-    const relX = (e.clientX - rect.left) / rect.width;
-    const relY = (e.clientY - rect.top) / rect.height;
-    return relX > 0.28 && relX < 0.72 && relY > 0.2 && relY < 0.8;
+  function updateGridDragPreview(cell, isRepel) {
+    const payload = state.dragPayload;
+    if (!payload || !cell || state.searchQuery.trim()) return;
+
+    const isSelf = Boolean(cell.tile && cell.tile.dataset.token === payload.token);
+    let mode;
+    if (isRepel) {
+      mode = 'repel';
+    } else if (!isSelf && payload.kind === 'app' && cell.tile && cell.tile.dataset.kind === 'folder') {
+      mode = 'into-folder';
+    } else if (!isSelf && payload.kind === 'app' && cell.tile && cell.tile.dataset.kind === 'app') {
+      mode = 'merge';
+    } else {
+      mode = 'move';
+    }
+
+    const targetToken = cell.tile?.dataset.token || '';
+    const previewKey = `${cell.row}:${cell.col}:${mode}:${isRepel ? 1 : 0}:${targetToken}`;
+    if (state.lastPreviewKey === previewKey) return;
+    state.lastPreviewKey = previewKey;
+
+    setDockDropActive(false);
+    clearGridDropIndicators();
+    els.appsGrid.classList.toggle('is-repel-mode', isRepel);
+    els.appsGrid.classList.toggle('is-merge-mode', !isRepel);
+
+    if (mode === 'repel') {
+      const slot = getSlot(cell.row, cell.col);
+      if (slot) slot.classList.add('is-drop-target', 'is-repel-target');
+      applyRepelPreview(payload.token, cell.row, cell.col);
+    } else if (mode === 'into-folder' && cell.tile) {
+      clearRepelPreview();
+      cell.tile.classList.add('is-drop-into-folder');
+    } else if (mode === 'merge' && cell.tile) {
+      clearRepelPreview();
+      cell.tile.classList.add('is-drop-merge');
+    } else {
+      clearRepelPreview();
+      const slot = getSlot(cell.row, cell.col);
+      if (slot) slot.classList.add('is-drop-target');
+    }
+
+    state.dropMode = mode;
+    state.dropTarget = { row: cell.row, col: cell.col, token: targetToken || null };
+    updateDesktopHint(mode, isRepel, cell.tile);
   }
 
   function handleGridDragOver(e) {
     const payload = state.dragPayload;
+    if (!payload || state.searchQuery.trim()) return;
     const cell = resolveDropCell(e);
-    if (!payload || !cell || state.searchQuery.trim()) return;
+    if (!cell) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
-    clearDropVisuals();
-
-    const canMerge = payload.kind === 'app'
-      && payload.fromFolderId === null
-      && payload.fromRoot
-      && cell.tile
-      && cell.tile.dataset.token !== payload.token
-      && isCenterDrop(e, cell.tile);
-
-    if (canMerge && cell.tile.dataset.kind === 'folder') {
-      state.dropMode = 'into-folder';
-      cell.tile.classList.add('is-drop-into-folder');
-    } else if (canMerge && cell.tile.dataset.kind === 'app') {
-      state.dropMode = 'merge';
-      cell.tile.classList.add('is-drop-merge');
-    } else {
-      state.dropMode = 'move';
-      const slot = getSlot(cell.row, cell.col);
-      if (slot) slot.classList.add('is-drop-target');
-      else cell.tile?.classList.add('is-drop-into-folder');
-    }
-    state.dropTarget = { row: cell.row, col: cell.col, token: cell.tile?.dataset.token || null };
-    applyAvoidance(cell);
+    const isRepel = Boolean(e.ctrlKey);
+    state.dragRepelActive = isRepel;
+    state.lastDragCell = cell;
+    updateGridDragPreview(cell, isRepel);
   }
 
   async function handleGridDrop(e) {
     const payload = state.dragPayload;
-    const cell = resolveDropCell(e);
-    if (!payload || !cell || state.searchQuery.trim()) return;
+    if (!payload || state.searchQuery.trim()) return;
+    const cell = resolveDropCell(e) || state.lastDragCell;
+    if (!cell) return;
     e.preventDefault();
     e.stopPropagation();
 
-    const mode = state.dropMode || 'move';
+    const isRepel = Boolean(e.ctrlKey);
     const targetTile = cell.tile;
     const targetToken = targetTile?.dataset.token || null;
     const targetId = targetTile?.dataset.id || null;
-    clearDropVisuals();
-    els.appsGrid.classList.remove('is-dragging');
 
-    if (mode === 'merge' && targetTile && targetTile.dataset.kind === 'app' && payload.kind === 'app') {
-      await handleMergeApps(payload.appId, targetId);
-      return;
-    }
-    if (mode === 'into-folder' && targetTile && targetTile.dataset.kind === 'folder' && payload.kind === 'app') {
-      await handleMoveAppToFolder(payload.appId, targetId);
-      return;
-    }
+    clearDropVisuals();
+    els.appsGrid.classList.remove('is-dragging', 'is-repel-mode', 'is-merge-mode');
+    state.dragPayload = null;
+    state.dragRepelActive = false;
+    state.lastDragCell = null;
+    updateDesktopHint();
+
     if (targetToken === payload.token) return;
-    await handleRootPlacement(payload, cell.row, cell.col);
+
+    if (!isRepel && payload.kind === 'app' && targetTile) {
+      if (targetTile.dataset.kind === 'app') {
+        await handleMergeApps(payload.appId, targetId);
+        return;
+      }
+      if (targetTile.dataset.kind === 'folder') {
+        await handleMoveAppToFolder(payload.appId, targetId);
+        return;
+      }
+    }
+
+    await handleRootPlacement(payload, cell.row, cell.col, isRepel);
   }
 
-  async function handleRootPlacement(payload, row, col) {
+  async function handleRootPlacement(payload, row, col, repel = false) {
     try {
       let res;
       if (payload.kind === 'app' && payload.fromFolderId) {
-        res = await bridge.invoke('layout.moveAppToRootAt', { appId: payload.appId, row, col });
+        res = await bridge.invoke('layout.moveAppToRootAt', { appId: payload.appId, row, col, repel });
       } else if (payload.fromRoot) {
-        res = await bridge.invoke('layout.setRootPosition', { token: payload.token, row, col });
+        res = await bridge.invoke('layout.setRootPosition', { token: payload.token, row, col, repel });
       } else {
         return;
       }
@@ -1122,7 +1379,37 @@
   els.appsGrid.addEventListener('dragover', handleGridDragOver);
   els.appsGrid.addEventListener('drop', handleGridDrop);
   els.appsGrid.addEventListener('dragleave', (e) => {
-    if (!els.appsGrid.contains(e.relatedTarget)) clearDropVisuals();
+    if (!els.appsGrid.contains(e.relatedTarget)) {
+      clearDropVisuals();
+      state.lastDragCell = null;
+      if (state.dragPayload) {
+        updateDesktopHint(state.dragRepelActive ? 'repel' : 'move', state.dragRepelActive, null);
+      }
+    }
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key !== 'Control' || !state.dragPayload || state.dragRepelActive) return;
+    state.dragRepelActive = true;
+    if (state.lastDragCell && state.dropMode !== 'dock') {
+      updateGridDragPreview(state.lastDragCell, true);
+    } else if (state.dropMode !== 'dock') {
+      els.appsGrid.classList.add('is-repel-mode');
+      els.appsGrid.classList.remove('is-merge-mode');
+      updateDesktopHint('repel', true, null);
+    }
+  });
+
+  window.addEventListener('keyup', (e) => {
+    if (e.key !== 'Control' || !state.dragPayload || !state.dragRepelActive) return;
+    state.dragRepelActive = false;
+    if (state.lastDragCell && state.dropMode !== 'dock') {
+      updateGridDragPreview(state.lastDragCell, false);
+    } else if (state.dropMode !== 'dock') {
+      els.appsGrid.classList.remove('is-repel-mode');
+      els.appsGrid.classList.add('is-merge-mode');
+      updateDesktopHint('move', false, null);
+    }
   });
 
   els.dock.addEventListener('dragover', handleDockDragOver);
@@ -1157,10 +1444,11 @@
       closeFolder();
       return;
     }
+    const visibleApps = folder.appIds.map((id) => state.appById.get(id)).filter(Boolean);
     els.folderModalTitle.textContent = folder.name;
-    els.folderModalCount.textContent = String(folder.appIds.length);
+    els.folderModalCount.textContent = String(visibleApps.length);
     els.folderGrid.innerHTML = '';
-    if (folder.appIds.length === 0) {
+    if (visibleApps.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'muted-text';
       empty.style.gridColumn = '1 / -1';
@@ -1170,9 +1458,8 @@
       return;
     }
     const frag = document.createDocumentFragment();
-    for (const appId of folder.appIds) {
-      const app = state.appById.get(appId);
-      if (app) frag.appendChild(createAppTile(app, folder.id, 'folder'));
+    for (const app of visibleApps) {
+      frag.appendChild(createAppTile(app, folder.id, 'folder'));
     }
     els.folderGrid.appendChild(frag);
   }
