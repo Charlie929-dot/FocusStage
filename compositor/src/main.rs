@@ -443,9 +443,10 @@ fn dispatch_sink_events(state: &mut FocusStageState) -> bool {
                 }
             }
             SinkInputEvent::Key { window_id, evdev_keycode, pressed } => {
-                if let Some(stage_id) = human_input_stage(state, &window_id) {
-                    state.send_sink_key(&stage_id, &window_id, evdev_keycode, pressed);
-                }
+                state.handle_sink_key(&window_id, evdev_keycode, pressed);
+            }
+            SinkInputEvent::CancelTakeover { window_id } => {
+                state.handle_sink_cancel_takeover(&window_id);
             }
             SinkInputEvent::WindowChanged { window_id, state: host_state } => {
                 state.update_window_from_sink(&window_id, host_state);

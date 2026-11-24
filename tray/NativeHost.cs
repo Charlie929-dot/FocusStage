@@ -34,12 +34,22 @@ internal static class NativeHost
 
     internal readonly record struct WindowRect(int X, int Y, int Width, int Height);
 
+    internal readonly record struct AgentOverlayState(
+        bool Active,
+        string? AgentName,
+        double PointerX,
+        double PointerY,
+        bool PointerVisible,
+        string PointerState);
+
     private sealed record Command(
         string Type, string WindowId = "", string StageId = "", string Title = "",
         WindowRect Rect = default, double Scale = 1, string? ParentWindowId = null,
         int Direction = -1, bool Maximized = false, string? Text = null, string? ImagePngBase64 = null,
         int Width = 0, int Height = 0, ulong Seq = 0, string WmClass = "", string Url = "",
-        string? IconPng = null, int? Lz4Bytes = null);
+        string? IconPng = null, int? Lz4Bytes = null,
+        bool Active = false, string? AgentName = null, double PointerX = 0, double PointerY = 0,
+        bool PointerVisible = false, string PointerState = "idle");
 
     private static void OpenWebUrl(string url)
     {
@@ -240,6 +250,15 @@ internal static class NativeHost
                     break;
                 case "activate":
                     window?.Activate();
+                    break;
+                case "agent_overlay":
+                    window?.SetAgentOverlay(new AgentOverlayState(
+                        command.Active,
+                        command.AgentName,
+                        command.PointerX,
+                        command.PointerY,
+                        command.PointerVisible,
+                        string.IsNullOrEmpty(command.PointerState) ? "idle" : command.PointerState));
                     break;
                 case "destroy" when window is not null:
                     _windows.Remove(id);

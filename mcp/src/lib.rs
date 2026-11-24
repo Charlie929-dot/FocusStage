@@ -271,7 +271,11 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
             let width = args.get("width").and_then(|v| v.as_u64()).map(|n| n as u32);
             let height = args.get("height").and_then(|v| v.as_u64()).map(|n| n as u32);
-            let show_on_desktop = args.get("show_on_desktop").and_then(|v| v.as_bool());
+            let show_on_desktop = Some(
+                args.get("show_on_desktop")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            );
             let cwd = args.get("cwd").and_then(|v| v.as_str()).map(String::from);
 
             let req = ControlRequest::Launch {
@@ -320,7 +324,7 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
                 None => return text_err("Missing 'stage_id'"),
             };
             let ttl_s = args.get("ttl_s").and_then(|v| v.as_u64()).unwrap_or(60);
-            let hide = args.get("hide").and_then(|v| v.as_bool()).unwrap_or(true);
+            let hide = args.get("hide").and_then(|v| v.as_bool()).unwrap_or(false);
             let agent_name = args
                 .get("agent_name")
                 .and_then(|v| v.as_str())
@@ -1062,7 +1066,7 @@ fn mcp_tools_schema() -> Vec<Value> {
         }),
         json!({
             "name": "stage_launch",
-            "description": "Open a FocusStage app. Prefer app_id from stage_list_apps or an exact app_name; provide exactly one of app_id, app_name, and app. Wait for a window with a committed frame and return a screenshot by default. On timeout or startup failure, return the status without a blank image.",
+            "description": "Open a FocusStage app hidden in the background by default (set show_on_desktop: true to display on desktop). Prefer app_id from stage_list_apps or an exact app_name; provide exactly one of app_id, app_name, and app. Wait for a window with a committed frame and return a screenshot by default. On timeout or startup failure, return the status without a blank image.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1074,7 +1078,7 @@ fn mcp_tools_schema() -> Vec<Value> {
                     "cwd": { "type": "string" },
                     "width": { "type": "integer" },
                     "height": { "type": "integer" },
-                    "show_on_desktop": { "type": "boolean" },
+                    "show_on_desktop": { "type": "boolean", "default": false, "description": "Show the Stage on the Windows desktop immediately. Defaults to false (hidden background launch)." },
                     "wm_class": { "type": "string", "description": "Application identity override for a raw executable launch; catalog launches use the registered identity" },
                     "wait_ready_ms": { "type": "integer", "minimum": 1, "maximum": 20000, "default": 8000, "description": "Maximum time to wait for the first window frame. On timeout the Stage is kept running." },
                     "observe": { "type": "boolean", "default": true, "description": "Return an unmarked screenshot once ready. Set false to omit the screenshot without skipping the readiness wait." }
@@ -1083,13 +1087,13 @@ fn mcp_tools_schema() -> Vec<Value> {
         }),
         json!({
             "name": "stage_acquire",
-            "description": "Acquire an exclusive AI control lease for a Stage (optionally hiding it from the Windows desktop).",
+            "description": "Acquire an exclusive AI control lease for a Stage. Preserves the Stage's current visibility by default (hidden stays hidden; visible stays visible with the AI takeover overlay unless hide: true is passed).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "stage_id": { "type": "string" },
                     "ttl_s": { "type": "integer", "default": 60 },
-                    "hide": { "type": "boolean", "default": true },
+                    "hide": { "type": "boolean", "default": false, "description": "Hide the Stage from the Windows desktop when acquiring. Defaults to false (preserve current visibility)." },
                     "agent_name": { "type": "string" }
                 },
                 "required": ["stage_id"]
@@ -1260,6 +1264,73 @@ mod tests {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
             assert_eq!(tool["inputSchema"]["properties"]["som"]["default"], false);
         }
+        let launch_tool = tools.iter().find(|tool| tool["name"] == "stage_launch").unwrap();
+        assert_eq!(launch_tool["inputSchema"]["properties"]["show_on_desktop"]["default"], false);
+        let acquire_tool = tools.iter().find(|tool| tool["name"] == "stage_acquire").unwrap();
+        assert_eq!(acquire_tool["inputSchema"]["properties"]["hide"]["default"], false);
+    }
+
+    #[test]
+    fn launch_and_acquire_visibility_defaults_and_overrides() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            for expected_show in [Some(false), Some(true)] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                assert!(matches!(
+                    serde_json::from_str(&request).unwrap(),
+                    ControlRequest::Launch { show_on_desktop, .. } if show_on_desktop == expected_show
+                ));
+                let response = ControlResponse::LaunchReady {
+                    stage_id: "stage-1".into(),
+                    pid: Some(42),
+                    ready: true,
+                    frame: None,
+                    launcher_exit: None,
+                    observe_message: None,
+                };
+                writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            }
+            for expected_hide in [false, true] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                assert!(matches!(
+                    serde_json::from_str(&request).unwrap(),
+                    ControlRequest::Acquire { stage_id, hide, .. }
+                        if stage_id == "stage-1" && hide == expected_hide
+                ));
+                let response = ControlResponse::Acquired {
+                    lease: "lease-stage-1-1".into(),
+                    stage_id: "stage-1".into(),
+                    expires_in_s: 60,
+                };
+                writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            }
+        });
+
+        let client = ControlClient::new(socket);
+        let state = McpState::default();
+        for args in [
+            json!({ "app": "foot", "observe": false }),
+            json!({ "app": "foot", "observe": false, "show_on_desktop": true }),
+        ] {
+            let result = call_tool(&client, &state, "stage_launch", args);
+            assert_eq!(result["isError"], false, "{result}");
+        }
+        for args in [
+            json!({ "stage_id": "stage-1" }),
+            json!({ "stage_id": "stage-1", "hide": true }),
+        ] {
+            let result = call_tool(&client, &state, "stage_acquire", args);
+            assert_eq!(result["isError"], false, "{result}");
+        }
+        server.join().unwrap();
     }
 
     #[test]

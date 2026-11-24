@@ -541,8 +541,10 @@ impl FocusStageState {
             if let Some(stage) = self.stages.get_mut(id) {
                 stage.lease = None;
                 stage.input_owner = InputOwner::Human;
+                stage.input.reset_agent_pointer();
                 self.set_stage_display(id, DisplayState::Desktop);
             }
+            self.sync_stage_agent_overlay(id);
         }
 
         // Abort any pending multi-step Agent jobs for taken-over Stages.
@@ -1163,20 +1165,24 @@ impl FocusStageState {
         match action {
             Action::Move { x, y } => {
                 self.send_stage_pointer_motion(stage_id, *x, *y);
+                self.update_agent_pointer_overlay(stage_id, "move");
                 Ok(None)
             }
             Action::Click { x, y, button } => {
                 let btn = mouse_button_code(button.as_deref().unwrap_or("left"));
                 self.send_stage_button(stage_id, *x, *y, btn, true);
                 self.send_stage_button(stage_id, *x, *y, btn, false);
+                self.update_agent_pointer_overlay(stage_id, "click");
                 Ok(None)
             }
             Action::DoubleClick { x, y, button } => {
                 let btn = mouse_button_code(button.as_deref().unwrap_or("left"));
                 self.send_stage_button(stage_id, *x, *y, btn, true);
                 self.send_stage_button(stage_id, *x, *y, btn, false);
+                self.update_agent_pointer_overlay(stage_id, "click");
                 self.send_stage_button(stage_id, *x, *y, btn, true);
                 self.send_stage_button(stage_id, *x, *y, btn, false);
+                self.update_agent_pointer_overlay(stage_id, "click");
                 Ok(None)
             }
             Action::Drag {
@@ -1190,17 +1196,21 @@ impl FocusStageState {
                 let btn = mouse_button_code(button.as_deref().unwrap_or("left"));
                 let n = steps.unwrap_or(8).max(1);
                 self.send_stage_button(stage_id, *from_x, *from_y, btn, true);
+                self.update_agent_pointer_overlay(stage_id, "down");
                 for i in 1..=n {
                     let t = (i as f64) / (n as f64);
                     let ix = from_x + (to_x - from_x) * t;
                     let iy = from_y + (to_y - from_y) * t;
                     self.send_stage_pointer_motion(stage_id, ix, iy);
+                    self.update_agent_pointer_overlay(stage_id, "drag");
                 }
                 self.send_stage_button(stage_id, *to_x, *to_y, btn, false);
+                self.update_agent_pointer_overlay(stage_id, "move");
                 Ok(None)
             }
             Action::Scroll { x, y, dx, dy } => {
                 self.send_stage_scroll(stage_id, *x, *y, *dx, *dy);
+                self.update_agent_pointer_overlay(stage_id, "scroll");
                 Ok(None)
             }
             Action::Key {

@@ -477,6 +477,8 @@ internal static class NativeHostInterop
     [DllImport("user32.dll")] internal static extern void PostQuitMessage(int exitCode);
     [DllImport("user32.dll")] internal static extern bool TrackMouseEvent(ref MouseTracking request);
     [DllImport("user32.dll")] internal static extern bool InvalidateRect(nint hwnd, nint rect, bool erase);
+    [DllImport("user32.dll")] internal static extern nuint SetTimer(nint hwnd, nuint idEvent, uint elapseMs, nint timerProc);
+    [DllImport("user32.dll")] internal static extern bool KillTimer(nint hwnd, nuint idEvent);
     [DllImport("user32.dll")] internal static extern nint BeginPaint(nint hwnd, out PaintData data);
     [DllImport("user32.dll")] internal static extern bool EndPaint(nint hwnd, in PaintData data);
     [DllImport("user32.dll")] internal static extern bool AddClipboardFormatListener(nint hwnd);

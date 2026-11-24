@@ -30,10 +30,17 @@ internal sealed partial class NativeHostWindow
             case WmMouseMove:
                 _lastPointer = NativePoint.FromLParam(message.LParam);
                 TrackPointerLeave();
+                if (IsOverOverlayBanner(_lastPointer))
+                {
+                    UpdateBannerHover(true);
+                    return true;
+                }
+                UpdateBannerHover(false);
                 var (x, y) = LogicalPoint(_lastPointer);
                 _emit(new { type = "pointer_motion", window_id = _id, x, y });
                 return true;
             case WmMouseLeave:
+                UpdateBannerHover(false);
                 if (_trackingPointer)
                 {
                     _trackingPointer = false;
@@ -43,8 +50,17 @@ internal sealed partial class NativeHostWindow
                 return true;
             case WmLeftDown:
             case WmLeftDoubleClick:
+                if (TryCancelTakeoverOnBannerClick(NativePoint.FromLParam(message.LParam)))
+                    return true;
+                ButtonMessage(message.LParam, BtnLeft, true);
+                return true;
             case WmLeftUp:
-                ButtonMessage(message.LParam, BtnLeft, message.Msg != WmLeftUp);
+                if (_swallowBannerLeftUp)
+                {
+                    _swallowBannerLeftUp = false;
+                    return true;
+                }
+                ButtonMessage(message.LParam, BtnLeft, false);
                 return true;
             case WmRightDown:
             case WmRightDoubleClick:
@@ -332,10 +348,35 @@ internal sealed partial class NativeHostWindow
     private void ReleaseInput(bool releaseCapture = true)
     {
         _pendingAltKey = 0;
+        _swallowBannerLeftUp = false;
+        UpdateBannerHover(false);
         ReleaseButtons(releaseCapture);
         foreach (int key in _keysDown)
             EmitKey(key, false);
         _keysDown.Clear();
+    }
+
+    private bool IsOverOverlayBanner(NativePoint point) =>
+        _renderer.IsAgentOverlayActive && _renderer.HitTestBanner(point.X, point.Y);
+
+    private void UpdateBannerHover(bool hovered)
+    {
+        if (_bannerHovered == hovered)
+            return;
+        _bannerHovered = hovered;
+        _renderer.SetBannerHovered(hovered);
+        if (Handle != 0)
+            InvalidateRect(Handle, 0, false);
+    }
+
+    private bool TryCancelTakeoverOnBannerClick(NativePoint point)
+    {
+        if (!IsOverOverlayBanner(point))
+            return false;
+        _swallowBannerLeftUp = true;
+        UpdateBannerHover(false);
+        _emit(new { type = "cancel_takeover", window_id = _id });
+        return true;
     }
 
     private void ReleaseButtons(bool releaseCapture)

@@ -280,7 +280,9 @@ impl FocusStageState {
                 info!("Lease expired on Stage {}, reverting to Human", sid);
                 stage.lease = None;
                 stage.input_owner = InputOwner::Human;
+                stage.input.reset_agent_pointer();
             }
+            self.sync_stage_agent_overlay(&sid);
         }
     }
 
@@ -466,7 +468,11 @@ impl FocusStageState {
             return ControlResponse::Error { code: "bad_request".into(), message: "Expected one or more absolute Windows or WSL paths".into() };
         }
         let point = position.map(|[x, y]| Point::from((x, y)));
-        self.handle_drop_files(&stage_id, paths, point)
+        let response = self.handle_drop_files(&stage_id, paths, point);
+        if matches!(response, ControlResponse::Ok) && point.is_some() {
+            self.update_agent_pointer_overlay(&stage_id, "move");
+        }
+        response
     }
 
     fn handle_drop_files(&mut self, stage_id: &str, paths: &[String], pos: Option<Point<f64, Logical>>) -> ControlResponse {
@@ -527,6 +533,7 @@ impl FocusStageState {
                 lease_id: lease_id.clone(),
                 agent_name,
             };
+            stage.input.reset_agent_pointer();
         }
 
         if hide {
@@ -534,6 +541,7 @@ impl FocusStageState {
         } else {
             self.ensure_virtual_focus(stage_id);
         }
+        self.sync_stage_agent_overlay(stage_id);
 
         ControlResponse::Acquired {
             lease: lease_id,
@@ -760,10 +768,12 @@ impl FocusStageState {
         if let Some(stage) = self.stages.get_mut(&stage_id) {
             stage.lease = None;
             stage.input_owner = InputOwner::Human;
+            stage.input.reset_agent_pointer();
         }
         if show_on_desktop {
             let _ = self.set_stage_display(&stage_id, DisplayState::Desktop);
         }
+        self.sync_stage_agent_overlay(&stage_id);
         ControlResponse::Ok
     }
 
@@ -797,12 +807,14 @@ impl FocusStageState {
         if frozen {
             stage.lease = None;
             stage.input_owner = InputOwner::Frozen;
+            stage.input.reset_agent_pointer();
         } else if stage.input_owner == InputOwner::Frozen {
             stage.input_owner = InputOwner::Human;
         }
         if frozen {
             self.ensure_virtual_focus(stage_id);
         }
+        self.sync_stage_agent_overlay(stage_id);
         ControlResponse::Ok
     }
 

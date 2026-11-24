@@ -10,9 +10,12 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
     private const int WmActivate = 0x0006, WmKillFocus = 0x0008, WmPaint = 0x000F, WmClose = 0x0010,
         WmEraseBackground = 0x0014, WmShowWindow = 0x0018, WmSetCursor = 0x0020, WmSize = 0x0005,
         WmWindowPosChanged = 0x0047, WmSetIcon = 0x0080,
-        WmNcCalcSize = 0x0083, WmNcHitTest = 0x0084, WmNcActivate = 0x0086, WmDisplayChange = 0x007E, WmSizing = 0x0214,
+        WmNcCalcSize = 0x0083, WmNcHitTest = 0x0084, WmNcActivate = 0x0086, WmDisplayChange = 0x007E,
+        WmTimer = 0x0113, WmSizing = 0x0214,
         WmEnterSizeMove = 0x0231, WmExitSizeMove = 0x0232, WmDropFiles = 0x0233, WmDpiChanged = 0x02E0,
         WmDwmCompositionChanged = 0x031E;
+    private const nuint OverlayTimerId = 1;
+    private const uint OverlayTimerIntervalMs = 16;
     private const int DwmExtendedFrameBounds = 9, DwmWindowCornerPreference = 33;
     private const int SmCxSizeFrame = 32, SmCySizeFrame = 33, SmCxPaddedBorder = 92;
     private static readonly int[] ResizeDirections = [4, 3, 5, 2, 8, 6, 7, 1]; // WMSZ_* in protocol order
@@ -28,6 +31,9 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
     private bool _inSizeMove;
     private bool _sizeCommand;
     private bool _resizing;
+    private bool _overlayTimerRunning;
+    private bool _bannerHovered;
+    private bool _swallowBannerLeftUp;
 
     internal string? ParentId { get; set; }
     internal nint Owner => GetWindow(Handle, GwOwner);
@@ -143,6 +149,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
     internal void Hide()
     {
         CancelInteraction();
+        StopOverlayTimer();
         ShowWindow(Handle, SwHide);
         ReportState();
     }
@@ -205,6 +212,45 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         InvalidateRect(Handle, 0, false);
     }
 
+    internal void SetAgentOverlay(NativeHost.AgentOverlayState state)
+    {
+        _renderer.SetAgentOverlay(state);
+        if (!state.Active)
+        {
+            _bannerHovered = false;
+            _swallowBannerLeftUp = false;
+            _renderer.SetBannerHovered(false);
+        }
+        SyncOverlayTimer();
+        if (Handle != 0)
+            InvalidateRect(Handle, 0, false);
+    }
+
+    private void SyncOverlayTimer()
+    {
+        if (Handle == 0)
+            return;
+        bool needTimer = IsWindowVisible(Handle) && _renderer.HasActiveAnimation();
+        if (needTimer && !_overlayTimerRunning)
+        {
+            if (SetTimer(Handle, OverlayTimerId, OverlayTimerIntervalMs, 0) != 0)
+                _overlayTimerRunning = true;
+        }
+        else if (!needTimer && _overlayTimerRunning)
+        {
+            StopOverlayTimer();
+        }
+    }
+
+    private void StopOverlayTimer()
+    {
+        if (_overlayTimerRunning && Handle != 0)
+        {
+            KillTimer(Handle, OverlayTimerId);
+            _overlayTimerRunning = false;
+        }
+    }
+
     protected override void WndProc(ref Message message)
     {
         switch (message.Msg)
@@ -216,7 +262,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
                 message.Result = HitTest(NativePoint.FromLParam(message.LParam));
                 return;
             case WmSetCursor when LowWord(message.LParam) == HtClient:
-                SetCursor(Cursors.Arrow.Handle);
+                SetCursor((_bannerHovered ? Cursors.Hand : Cursors.Arrow).Handle);
                 message.Result = 1;
                 return;
             case WmNcActivate:
@@ -229,6 +275,11 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
                 return;
             case WmPaint:
                 Paint(message.HWnd);
+                return;
+            case WmTimer when (nuint)message.WParam == OverlayTimerId:
+                if (!_renderer.HasActiveAnimation())
+                    StopOverlayTimer();
+                InvalidateRect(Handle, 0, false);
                 return;
             case WmClose:
                 _emit(new { type = "close_requested", window_id = _id });
@@ -429,12 +480,13 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         try
         {
             if (GetClientRect(hwnd, out var client) && client.Width > 0 && client.Height > 0)
-                _renderer.Draw(hwnd, client.Width, client.Height);
+                _renderer.Draw(hwnd, client.Width, client.Height, Scale);
         }
         finally
         {
             EndPaint(hwnd, in paint);
         }
+        SyncOverlayTimer();
     }
 
     private void DropFiles(nint drop)
@@ -465,6 +517,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         if (Handle == 0)
             return;
         CancelInteraction();
+        StopOverlayTimer();
         ReportInactive();
         DragAcceptFiles(Handle, false);
         if (_stageId is not null)

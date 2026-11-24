@@ -48,6 +48,20 @@ pub enum SinkInputEvent {
         x: f64,
         y: f64,
     },
+    CancelTakeover {
+        window_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentOverlay<'a> {
+    pub window_id: &'a str,
+    pub active: bool,
+    pub agent_name: Option<&'a str>,
+    pub pointer_x: f64,
+    pub pointer_y: f64,
+    pub pointer_visible: bool,
+    pub pointer_state: &'a str,
 }
 
 pub struct WindowInfo<'a> {
@@ -91,6 +105,7 @@ pub trait DisplaySink {
     fn set_host_clipboard(&mut self, _text: &str) {}
     fn set_host_clipboard_image(&mut self, _png_bytes: &[u8]) {}
     fn activate(&mut self, _window_id: &str) {}
+    fn set_agent_overlay(&mut self, _overlay: AgentOverlay<'_>) {}
     fn open_web_url(&mut self, _url: &str) -> bool { false }
     fn event_fd(&self) -> Option<std::os::fd::OwnedFd> {
         None
