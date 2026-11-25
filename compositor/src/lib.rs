@@ -6,6 +6,7 @@ mod dpi;
 pub mod icons;
 pub mod manager;
 pub mod offscreen;
+pub mod polkit;
 pub mod protocol;
 pub mod router;
 pub mod session_env;

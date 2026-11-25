@@ -55,12 +55,12 @@ internal static class LauncherAuthentication
             return LauncherAuthResult.LinuxAccountUnavailable;
 
         cancellation.ThrowIfCancellationRequested();
-        // Ensure the FocusStage-hosted XWayland Polkit agent is up before pkexec requests auth.
+        // Ensure the FocusStage native Polkit agent is registered before pkexec requests auth.
         var (agentCode, agentOutput, _) = await ShortcutManager.RunWslAsync(
             distro, user, 10, "/usr/local/bin/focusstage", "--json", "ensure-polkit-agent").WaitAsync(cancellation);
         if (agentCode == 0 && agentOutput.Contains("\"ready\":true", StringComparison.Ordinal))
         {
-            await Task.Delay(150, cancellation);
+            await Task.Delay(50, cancellation);
         }
 
         const string confirmation = "FocusStageVerified";

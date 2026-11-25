@@ -334,7 +334,20 @@ impl FocusStageState {
     }
 
     pub fn ensure_polkit_agent_stage(&mut self) -> Result<bool, String> {
-        self.ensure_persistent_helper_stage(&POLKIT_AGENT_SPEC)
+        let Some(sink) = self.display_sink.as_ref() else {
+            return Ok(false);
+        };
+        if self.polkit_agent.is_none() {
+            let locale = sink.host_locale().map(str::to_string);
+            self.polkit_agent = Some(crate::polkit::PolkitAgentHandle::spawn(
+                self.polkit_cmd_tx.clone(),
+                locale,
+            ));
+        }
+        Ok(self
+            .polkit_agent
+            .as_ref()
+            .is_some_and(|agent| agent.ensure_registered()))
     }
 
     pub fn ensure_keyring_prompter_stage(&mut self) -> Result<bool, String> {
@@ -411,21 +424,6 @@ struct PersistentHelperSpec {
     stop_process_name: Option<&'static str>,
 }
 
-const POLKIT_AGENT_SPEC: PersistentHelperSpec = PersistentHelperSpec {
-    stage_id: "stage-polkit-agent",
-    wm_class: "focusstage-polkit-agent",
-    unit_name: "focusstage-polkit-agent",
-    label: "Polkit authentication host",
-    candidates: &[
-        "/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1",
-        "/usr/libexec/polkit-gnome-authentication-agent-1",
-        "/usr/libexec/polkit-mate-authentication-agent-1",
-        "/usr/bin/lxpolkit",
-    ],
-    extra_env: &[],
-    stop_process_name: None,
-};
-
 const KEYRING_PROMPTER_SPEC: PersistentHelperSpec = PersistentHelperSpec {
     stage_id: "stage-keyring-prompter",
     wm_class: "focusstage-keyring-prompter",
@@ -457,7 +455,7 @@ pub fn stop_helper_unit(unit_name: &str) {
         .status();
 }
 
-fn stop_existing_user_process(proc_name: &str) {
+pub(crate) fn stop_existing_user_process(proc_name: &str) {
     let uid = unsafe { libc::geteuid() }.to_string();
     let signaled = Command::new("pkill")
         .args(["-TERM", "-u", &uid, "-x", proc_name])

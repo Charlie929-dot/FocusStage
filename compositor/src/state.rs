@@ -107,6 +107,8 @@ pub struct FocusStageState {
     pub pending_act_jobs: Vec<PendingActJob>,
     pub(crate) pending_launches: Vec<crate::control::PendingLaunch>,
     pub a11y: A11yCollector,
+    pub(crate) polkit_cmd_tx: calloop_channel::Sender<crate::polkit::PolkitHostCommand>,
+    pub(crate) polkit_agent: Option<crate::polkit::PolkitAgentHandle>,
     pub display_sink: Option<Box<dyn DisplaySink>>,
     pub should_quit: bool,
 }
@@ -146,6 +148,15 @@ impl FocusStageState {
                 state.handle_clipboard_update_from_stage(&sid, expected_seq, content);
             }
         });
+        let (polkit_cmd_tx, polkit_cmd_rx) =
+            calloop_channel::channel::<crate::polkit::PolkitHostCommand>();
+        let _ = loop_handle.insert_source(polkit_cmd_rx, |event, _, state| {
+            if let calloop_channel::Event::Msg(cmd) = event {
+                if let Some(sink) = state.display_sink.as_mut() {
+                    sink.send_polkit_command(&cmd);
+                }
+            }
+        });
         let a11y = A11yCollector::spawn();
 
         Self {
@@ -181,8 +192,16 @@ impl FocusStageState {
             pending_act_jobs: Vec::new(),
             pending_launches: Vec::new(),
             a11y,
+            polkit_cmd_tx,
+            polkit_agent: None,
             display_sink,
             should_quit: false,
+        }
+    }
+
+    pub fn send_polkit_reply(&self, reply: crate::polkit::PolkitHostReply) {
+        if let Some(agent) = self.polkit_agent.as_ref() {
+            agent.send_host_reply(reply);
         }
     }
 

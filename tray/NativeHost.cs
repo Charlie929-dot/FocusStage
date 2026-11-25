@@ -49,7 +49,12 @@ internal static class NativeHost
         int Width = 0, int Height = 0, ulong Seq = 0, string WmClass = "", string Url = "",
         string? IconPng = null, int? Lz4Bytes = null,
         bool Active = false, string? AgentName = null, double PointerX = 0, double PointerY = 0,
-        bool PointerVisible = false, string PointerState = "idle");
+        bool PointerVisible = false, string PointerState = "idle",
+        string Cookie = "", string ActionId = "", string Message = "",
+        string? ProgramName = null, string? CommandLine = null,
+        string User = "", string[]? Users = null, string Prompt = "",
+        bool EchoOn = false, string? Info = null, string? Error = null,
+        bool Retry = false, bool Succeeded = false);
 
     private static void OpenWebUrl(string url)
     {
@@ -78,10 +83,11 @@ internal static class NativeHost
         private readonly Channel<object> _events = Channel.CreateUnbounded<object>(new UnboundedChannelOptions
         {
             SingleReader = true,
-            SingleWriter = true,
+            SingleWriter = false,
         });
         private readonly NativeHostRenderer.Factory _renderer = new();
         private readonly Dispatcher _dispatcher;
+        private readonly ElevationDialogHost _elevationDialogs;
         private bool _stopping;
         private int _status;
 
@@ -90,6 +96,11 @@ internal static class NativeHost
             try
             {
                 _dispatcher = new Dispatcher(ex => Stop(ex));
+                _elevationDialogs = new ElevationDialogHost(
+                    onSubmit: (cookie, user, response) =>
+                        Emit(new { type = "auth_submit", cookie, user, response }),
+                    onCancel: cookie =>
+                        Emit(new { type = "auth_cancel", cookie }));
                 _dispatcher.ClipboardChanged += payload =>
                 {
                     if (payload.ImagePng is not null)
@@ -110,8 +121,14 @@ internal static class NativeHost
         internal int Run(Stream input, Stream output)
         {
             var primary = WorkAreaForMonitor(MonitorFromPoint(default, MonitorDefaultToPrimary));
-            Emit(new { type = "ready", scale = GetDpiForSystem() / 96.0,
-                width = primary.Monitor.Width, height = primary.Monitor.Height, lz4 = true });
+            Emit(new {
+                type = "ready",
+                scale = GetDpiForSystem() / 96.0,
+                width = primary.Monitor.Width,
+                height = primary.Monitor.Height,
+                lz4 = true,
+                locale = System.Globalization.CultureInfo.CurrentUICulture.Name,
+            });
             _dispatcher.SyncInitialClipboard();
 
             Task<bool> writer = Task.Factory.StartNew(() => WriteEvents(output), CancellationToken.None,
@@ -292,6 +309,36 @@ internal static class NativeHost
                 case "resize":
                     window?.StartResize(command.Direction);
                     break;
+                case "auth_begin":
+                    _elevationDialogs.Begin(new AuthBeginRequest(
+                        command.Cookie,
+                        command.ActionId,
+                        command.Message,
+                        command.IconPng,
+                        command.ProgramName,
+                        command.CommandLine,
+                        command.User,
+                        command.Users ?? Array.Empty<string>(),
+                        command.Prompt,
+                        command.EchoOn,
+                        command.Info,
+                        command.Error));
+                    break;
+                case "auth_prompt":
+                    _elevationDialogs.Prompt(new AuthPromptRequest(
+                        command.Cookie,
+                        command.Prompt,
+                        command.EchoOn,
+                        command.Info,
+                        command.Error,
+                        command.Retry));
+                    break;
+                case "auth_end":
+                    _elevationDialogs.End(new AuthEndRequest(
+                        command.Cookie,
+                        command.Succeeded,
+                        command.Message));
+                    break;
             }
         }
 
@@ -331,6 +378,7 @@ internal static class NativeHost
 
         public void Dispose()
         {
+            _elevationDialogs.Dispose();
             foreach (var window in _windows.Values)
                 window.SetOwner(0);
             foreach (var window in _windows.Values)

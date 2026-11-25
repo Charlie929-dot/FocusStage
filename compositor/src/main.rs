@@ -296,6 +296,7 @@ fn dispatch_sink_events(state: &mut FocusStageState) -> bool {
         match ev {
             SinkInputEvent::Disconnected => {
                 warn!("Native Windows host disconnected; existing stages remain available offscreen");
+                state.send_polkit_reply(focusstage_compositor::polkit::PolkitHostReply::HostDisconnected);
                 state.display_sink = None;
             }
             SinkInputEvent::PointerLeave { window_id } => {
@@ -351,6 +352,22 @@ fn dispatch_sink_events(state: &mut FocusStageState) -> bool {
                 if let Some(stage_id) = human_input_stage(state, &window_id) {
                     let _ = state.drop_files_to_window(&stage_id, Some(&window_id), &paths, Some((x, y).into()));
                 }
+            }
+            SinkInputEvent::AuthSubmit {
+                cookie,
+                user,
+                response,
+            } => {
+                state.send_polkit_reply(focusstage_compositor::polkit::PolkitHostReply::Submit {
+                    cookie,
+                    user,
+                    response,
+                });
+            }
+            SinkInputEvent::AuthCancel { cookie } => {
+                state.send_polkit_reply(focusstage_compositor::polkit::PolkitHostReply::Cancel {
+                    cookie,
+                });
             }
         }
     }

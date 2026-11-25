@@ -83,6 +83,41 @@ enum HostCommand<'a> {
     OpenUrl {
         url: &'a str,
     },
+    AuthBegin {
+        cookie: &'a str,
+        action_id: &'a str,
+        message: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        icon_png: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        program_name: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command_line: Option<&'a str>,
+        user: &'a str,
+        users: &'a [String],
+        prompt: &'a str,
+        echo_on: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        info: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<&'a str>,
+    },
+    AuthPrompt {
+        cookie: &'a str,
+        prompt: &'a str,
+        echo_on: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        info: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<&'a str>,
+        retry: bool,
+    },
+    AuthEnd {
+        cookie: &'a str,
+        succeeded: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<&'a str>,
+    },
     Frame {
         window_id: &'a str,
         width: u32,
@@ -102,6 +137,8 @@ enum HostEvent {
         height: u32,
         #[serde(default)]
         lz4: bool,
+        #[serde(default)]
+        locale: Option<String>,
     },
     State {
         window_id: String,
@@ -157,6 +194,14 @@ enum HostEvent {
     },
     CancelTakeover {
         window_id: String,
+    },
+    AuthSubmit {
+        cookie: String,
+        user: String,
+        response: String,
+    },
+    AuthCancel {
+        cookie: String,
     },
     FrameDone {
         window_id: String,
@@ -239,6 +284,16 @@ impl HostEvent {
                 y,
             },
             Self::CancelTakeover { window_id } => Input::CancelTakeover { window_id },
+            Self::AuthSubmit {
+                cookie,
+                user,
+                response,
+            } => Input::AuthSubmit {
+                cookie,
+                user,
+                response,
+            },
+            Self::AuthCancel { cookie } => Input::AuthCancel { cookie },
         })
     }
 }
@@ -262,6 +317,7 @@ pub struct NativeSink {
     pending: HashMap<String, u64>,
     recycled: Receiver<Vec<u8>>,
     seq: u64,
+    host_locale: Option<String>,
 }
 
 impl NativeSink {
@@ -291,6 +347,7 @@ impl NativeSink {
             pending: HashMap::new(),
             recycled,
             seq: 0,
+            host_locale: None,
         };
 
         let output = sink.child.stdout.take().unwrap();
@@ -323,15 +380,27 @@ impl NativeSink {
                 let _ = notify.write_all(&[1]);
             })?;
 
-        let (rect, scale, lz4) = match sink.events.recv_timeout(Duration::from_secs(3))? {
-            Some(HostEvent::Ready { scale, width, height, lz4 })
-                if width > 0 && height > 0 && scale > 0.0 => (
-                    SavedRect { x: 0, y: 0, width, height },
-                    scale,
-                    lz4,
-                ),
+        let (rect, scale, lz4, locale) = match sink.events.recv_timeout(Duration::from_secs(3))? {
+            Some(HostEvent::Ready {
+                scale,
+                width,
+                height,
+                lz4,
+                locale,
+            }) if width > 0 && height > 0 && scale > 0.0 => (
+                SavedRect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                },
+                scale,
+                lz4,
+                locale,
+            ),
             _ => anyhow::bail!("Windows host did not send a ready event"),
         };
+        sink.host_locale = locale;
 
         let input = sink.child.stdin.take().unwrap();
         thread::Builder::new()
@@ -513,6 +582,73 @@ impl DisplaySink for NativeSink {
         crate::xdg::valid_web_url(url) && self.command(HostCommand::OpenUrl { url })
     }
 
+    fn send_polkit_command(&mut self, cmd: &crate::polkit::PolkitHostCommand) {
+        use crate::polkit::PolkitHostCommand as Cmd;
+        match cmd {
+            Cmd::Begin {
+                cookie,
+                action_id,
+                message,
+                icon_png,
+                program_name,
+                command_line,
+                user,
+                users,
+                prompt,
+                echo_on,
+                info,
+                error,
+            } => {
+                self.command(HostCommand::AuthBegin {
+                    cookie,
+                    action_id,
+                    message,
+                    icon_png: icon_png.as_deref(),
+                    program_name: program_name.as_deref(),
+                    command_line: command_line.as_deref(),
+                    user,
+                    users,
+                    prompt,
+                    echo_on: *echo_on,
+                    info: info.as_deref(),
+                    error: error.as_deref(),
+                });
+            }
+            Cmd::Prompt {
+                cookie,
+                prompt,
+                echo_on,
+                info,
+                error,
+                retry,
+            } => {
+                self.command(HostCommand::AuthPrompt {
+                    cookie,
+                    prompt,
+                    echo_on: *echo_on,
+                    info: info.as_deref(),
+                    error: error.as_deref(),
+                    retry: *retry,
+                });
+            }
+            Cmd::End {
+                cookie,
+                succeeded,
+                message,
+            } => {
+                self.command(HostCommand::AuthEnd {
+                    cookie,
+                    succeeded: *succeeded,
+                    message: message.as_deref(),
+                });
+            }
+        }
+    }
+
+    fn host_locale(&self) -> Option<&str> {
+        self.host_locale.as_deref()
+    }
+
     fn event_fd(&self) -> Option<OwnedFd> {
         self.wake.try_clone().ok().map(Into::into)
     }
@@ -597,6 +733,49 @@ mod tests {
         assert!(matches!(
             event.into_sink_event(),
             Some(SinkInputEvent::CancelTakeover { window_id }) if window_id == "stage-2/1"
+        ));
+    }
+
+    #[test]
+    fn auth_commands_serialize_and_auth_events_deserialize() {
+        let users = vec!["scl".to_string()];
+        let json = serde_json::to_value(HostCommand::AuthBegin {
+            cookie: "cookie-1",
+            action_id: "io.focusstage.launcher.verify",
+            message: "验证身份以解锁 FocusStage 启动器",
+            icon_png: None,
+            program_name: Some("focusstage-auth"),
+            command_line: Some("/usr/local/libexec/focusstage-auth verify"),
+            user: "scl",
+            users: &users,
+            prompt: "Password:",
+            echo_on: false,
+            info: None,
+            error: None,
+        })
+        .unwrap();
+        assert_eq!(json["type"], "auth_begin");
+        assert_eq!(json["cookie"], "cookie-1");
+        assert_eq!(json["user"], "scl");
+        assert_eq!(json["echo_on"], false);
+
+        let submit = serde_json::from_str::<HostEvent>(
+            r#"{"type":"auth_submit","cookie":"cookie-1","user":"scl","response":"secret"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            submit.into_sink_event(),
+            Some(SinkInputEvent::AuthSubmit { cookie, user, response })
+                if cookie == "cookie-1" && user == "scl" && response == "secret"
+        ));
+
+        let cancel = serde_json::from_str::<HostEvent>(
+            r#"{"type":"auth_cancel","cookie":"cookie-1"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            cancel.into_sink_event(),
+            Some(SinkInputEvent::AuthCancel { cookie }) if cookie == "cookie-1"
         ));
     }
 }

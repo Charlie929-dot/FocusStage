@@ -55,6 +55,14 @@ pub enum SinkInputEvent {
     CancelTakeover {
         window_id: String,
     },
+    AuthSubmit {
+        cookie: String,
+        user: String,
+        response: String,
+    },
+    AuthCancel {
+        cookie: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +119,8 @@ pub trait DisplaySink {
     fn activate(&mut self, _window_id: &str) {}
     fn set_agent_overlay(&mut self, _overlay: AgentOverlay<'_>) {}
     fn open_web_url(&mut self, _url: &str) -> bool { false }
+    fn send_polkit_command(&mut self, _cmd: &crate::polkit::PolkitHostCommand) {}
+    fn host_locale(&self) -> Option<&str> { None }
     fn event_fd(&self) -> Option<std::os::fd::OwnedFd> {
         None
     }
