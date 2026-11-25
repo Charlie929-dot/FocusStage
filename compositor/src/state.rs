@@ -557,6 +557,18 @@ impl XdgShellHandler for FocusStageState {
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
         self.maximize_toplevel(surface, false);
     }
+
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+    ) {
+        self.request_window_fullscreen(StageToplevel::Wayland(surface), true);
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        self.request_window_fullscreen(StageToplevel::Wayland(surface), false);
+    }
 }
 
 impl ShmHandler for FocusStageState {
@@ -994,6 +1006,7 @@ mod tests {
         host_clipboard_texts: Vec<String>,
         host_clipboard_images: Vec<Vec<u8>>,
         overlays: Vec<RecordedOverlay>,
+        fullscreen_requests: Vec<(String, bool)>,
     }
 
     struct TestSink(Arc<Mutex<WindowLog>>);
@@ -1007,6 +1020,9 @@ mod tests {
         }
         fn destroy(&mut self, id: &str) { self.0.lock().unwrap().destroyed.push(id.into()); }
         fn set_title(&mut self, _: &str, _: &str) {}
+        fn set_fullscreen(&mut self, window_id: &str, fullscreen: bool) {
+            self.0.lock().unwrap().fullscreen_requests.push((window_id.into(), fullscreen));
+        }
         fn set_host_clipboard(&mut self, text: &str) {
             self.0.lock().unwrap().host_clipboard_texts.push(text.to_string());
         }
@@ -1181,7 +1197,7 @@ mod tests {
             scale: 1.5,
             monitor: Some(SavedRect { x: -1920, y: 0, width: 1920, height: 1080 }),
             pixel_size: Some([767, 720]),
-            activated: true, maximized: false, resizing: true, tiled: [true, false, true, true],
+            activated: true, maximized: false, fullscreen: false, resizing: true, tiled: [true, false, true, true],
         };
         state.update_window_from_sink(&second_id, host_state.clone());
         state.send_window_pointer_motion_at(&sid, Some(&first_id), 20.0, 30.0, 0);
@@ -1221,6 +1237,36 @@ mod tests {
         let second_window = state.stages[&sid].window(&second_id).unwrap();
         assert_eq!(state.offscreen.render_window_bgra_into(Some(second_window), second_window.logical_size,
             second_window.scale, &[], &mut Vec::new()).unwrap(), (767, 720));
+
+        let fullscreen = c_toplevel::State::Fullscreen as u32;
+        let maximized = c_toplevel::State::Maximized as u32;
+        second.set_fullscreen(None);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(log.lock().unwrap().fullscreen_requests, [(second_id.clone(), true)]);
+        assert!(!client.window_configures[&second.id().protocol_id()].2.contains(&fullscreen));
+
+        state.update_window_from_sink(&second_id, crate::sink::WindowState {
+            rect: SavedRect { x: -1920, y: 0, width: 1280, height: 720 },
+            pixel_size: Some([1920, 1080]),
+            fullscreen: true, resizing: false, tiled: [false; 4], ..host_state.clone()
+        });
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let (width, height, flags) = &client.window_configures[&second.id().protocol_id()];
+        assert_eq!((*width, *height), (1280, 720));
+        assert!(flags.contains(&fullscreen));
+        assert_eq!(state.stages[&sid].window(&second_id).unwrap().saved_rect, host_state.rect);
+
+        second.unset_fullscreen();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(log.lock().unwrap().fullscreen_requests.last(), Some(&(second_id.clone(), false)));
+        state.update_window_from_sink(&second_id, crate::sink::WindowState {
+            maximized: true, ..host_state.clone()
+        });
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let (width, height, flags) = &client.window_configures[&second.id().protocol_id()];
+        assert_eq!((*width, *height), (511, 480));
+        assert!(!flags.contains(&fullscreen));
+        assert!(flags.contains(&maximized));
 
         let shift = 42;
         state.send_sink_key(&sid, &first_id, shift, true);

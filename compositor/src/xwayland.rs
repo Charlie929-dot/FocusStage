@@ -99,8 +99,9 @@ impl XwmHandler for FocusStageState {
             };
             stage.add_window(toplevel, size)
         };
-        let size = stage.window(&id).unwrap().logical_size;
-        let _ = window.configure(hosted_x11_geometry(size));
+        let stage_window = stage.window_mut(&id).unwrap();
+        stage_window.fullscreen_requested = window.is_fullscreen();
+        let _ = window.configure(hosted_x11_geometry(stage_window.logical_size));
         let _ = window.set_mapped(true);
         let _ = window.set_activated(true);
         self.update_x11_parent(&id, &window);
@@ -220,6 +221,14 @@ impl XwmHandler for FocusStageState {
 
     fn unmaximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
         self.maximize_x11(window, false);
+    }
+
+    fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.request_window_fullscreen(StageToplevel::X11(window), true);
+    }
+
+    fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.request_window_fullscreen(StageToplevel::X11(window), false);
     }
 
     fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {

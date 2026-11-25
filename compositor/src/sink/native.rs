@@ -32,6 +32,7 @@ enum HostCommand<'a> {
         scale: f64,
         parent_window_id: Option<&'a str>,
         maximized: bool,
+        fullscreen: bool,
     },
     Hide {
         window_id: &'a str,
@@ -60,6 +61,10 @@ enum HostCommand<'a> {
     Maximize {
         window_id: &'a str,
         maximized: bool,
+    },
+    Fullscreen {
+        window_id: &'a str,
+        fullscreen: bool,
     },
     Clipboard {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -501,6 +506,7 @@ impl DisplaySink for NativeSink {
             scale,
             parent_window_id,
             maximized,
+            fullscreen,
         } = window;
         self.command(HostCommand::Show {
             window_id,
@@ -512,6 +518,7 @@ impl DisplaySink for NativeSink {
             scale,
             parent_window_id,
             maximized,
+            fullscreen,
         });
     }
 
@@ -574,6 +581,10 @@ impl DisplaySink for NativeSink {
             window_id,
             maximized,
         });
+    }
+
+    fn set_fullscreen(&mut self, window_id: &str, fullscreen: bool) {
+        self.command(HostCommand::Fullscreen { window_id, fullscreen });
     }
 
     fn set_host_clipboard(&mut self, text: &str) {

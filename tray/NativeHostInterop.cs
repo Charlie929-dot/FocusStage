@@ -9,9 +9,11 @@ namespace FocusStageTray;
 
 internal static class NativeHostInterop
 {
-    internal const int WsOverlappedWindow = 0x00CF0000;
+    internal const int WsOverlappedWindow = 0x00CF0000, GwlStyle = -16;
     internal const int SwHide = 0, SwShow = 5, SwMinimize = 6, SwRestore = 9, SwMaximize = 3;
-    internal const uint SwpNoZOrder = 0x0004, SwpNoActivate = 0x0010, SwpNoOwnerZOrder = 0x0200;
+    internal const uint SwpNoSize = 0x0001, SwpNoMove = 0x0002, SwpNoZOrder = 0x0004,
+        SwpNoActivate = 0x0010, SwpFrameChanged = 0x0020,
+        SwpNoOwnerZOrder = 0x0200;
     internal const uint MonitorDefaultToPrimary = 1, MonitorDefaultToNearest = 2;
     internal const uint GwOwner = 4;
 
@@ -32,6 +34,17 @@ internal static class NativeHostInterop
     {
         internal readonly int Width => Right - Left;
         internal readonly int Height => Bottom - Top;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct WindowPlacement
+    {
+        internal int Length;
+        internal uint Flags;
+        internal uint ShowCommand;
+        internal NativePoint MinPosition;
+        internal NativePoint MaxPosition;
+        internal NativeRect NormalPosition;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -445,6 +458,12 @@ internal static class NativeHostInterop
     [DllImport("user32.dll", EntryPoint = "GetMonitorInfoW", SetLastError = true)]
     private static extern bool GetMonitorInfo(nint monitor, ref MonitorArea info);
     [DllImport("user32.dll")] internal static extern bool GetWindowRect(nint hwnd, out NativeRect rect);
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern bool GetWindowPlacement(nint hwnd, ref WindowPlacement placement);
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern bool SetWindowPlacement(nint hwnd, in WindowPlacement placement);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+    internal static extern int GetWindowLong(nint hwnd, int index);
     [DllImport("user32.dll")] internal static extern bool GetClientRect(nint hwnd, out NativeRect rect);
     [DllImport("user32.dll")] internal static extern bool ClientToScreen(nint hwnd, ref NativePoint point);
     [DllImport("user32.dll")] internal static extern bool ScreenToClient(nint hwnd, ref NativePoint point);
@@ -460,7 +479,7 @@ internal static class NativeHostInterop
     [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
     private static extern nint SetWindowLongPtr(nint hwnd, int index, nint value);
     [DllImport("user32.dll", EntryPoint = "SetWindowLongW", SetLastError = true)]
-    private static extern int SetWindowLong(nint hwnd, int index, int value);
+    internal static extern int SetWindowLong(nint hwnd, int index, int value);
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern bool SetWindowPos(nint hwnd, nint insertAfter, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll")] internal static extern bool GetCursorPos(out NativePoint point);

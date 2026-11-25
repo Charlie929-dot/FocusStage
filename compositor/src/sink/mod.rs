@@ -94,6 +94,7 @@ pub struct WindowInfo<'a> {
     pub scale: f64,
     pub parent_window_id: Option<&'a str>,
     pub maximized: bool,
+    pub fullscreen: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -104,6 +105,8 @@ pub struct WindowState {
     pub pixel_size: Option<[u32; 2]>,
     pub activated: bool,
     pub maximized: bool,
+    #[serde(default)]
+    pub fullscreen: bool,
     pub resizing: bool,
     pub tiled: [bool; 4],
 }
@@ -122,6 +125,7 @@ pub trait DisplaySink {
     fn begin_resize(&mut self, _window_id: &str, _direction: u32) {}
     fn minimize(&mut self, _window_id: &str) {}
     fn set_maximized(&mut self, _window_id: &str, _maximized: bool) {}
+    fn set_fullscreen(&mut self, _window_id: &str, _fullscreen: bool) {}
     fn set_host_clipboard(&mut self, _text: &str) {}
     fn set_host_clipboard_image(&mut self, _png_bytes: &[u8]) {}
     fn activate(&mut self, _window_id: &str) {}
