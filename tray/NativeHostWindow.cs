@@ -28,6 +28,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
     private WindowState? _lastState;
     private (int Style, WindowPlacement Placement)? _beforeFullscreen;
     private bool IsFullscreen => _beforeFullscreen.HasValue;
+    private bool _flatDwmFrame;
     private bool _activated;
     private bool _placing;
     private bool _inSizeMove;
@@ -68,7 +69,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         nint icon = (_appIcon ?? SystemIcons.Application).Handle;
         SendMessage(Handle, WmSetIcon, 0, icon); // ICON_SMALL
         SendMessage(Handle, WmSetIcon, 1, icon); // ICON_BIG
-        ApplyDwmFrame();
+        ApplyDwmFrame(force: true);
         DragAcceptFiles(Handle, true);
     }
 
@@ -416,6 +417,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
                 ReportState();
                 return;
             case WmSize:
+                ApplyDwmFrame();
                 InvalidateRect(Handle, 0, false);
                 break;
             case WmDpiChanged:
@@ -428,7 +430,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
                 }
                 return;
             case WmDwmCompositionChanged:
-                ApplyDwmFrame();
+                ApplyDwmFrame(force: true);
                 break;
             case WmDropFiles:
                 DropFiles(message.WParam);
@@ -438,12 +440,18 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
             base.WndProc(ref message);
     }
 
-    private void ApplyDwmFrame()
+    private void ApplyDwmFrame(bool force = false)
     {
-        var margins = IsFullscreen ? default : new Margins(1, 1, 1, 1);
+        // An extended DWM frame draws over the outermost client pixels even when maximized.
+        bool flat = IsFullscreen || IsZoomed(Handle);
+        if (!force && _flatDwmFrame == flat)
+            return;
+        _flatDwmFrame = flat;
+
+        var margins = flat ? default : new Margins(1, 1, 1, 1);
         DwmExtendFrameIntoClientArea(Handle, in margins);
         const int DoNotRound = 1, RoundCorners = 2;
-        DwmSetWindowAttribute(Handle, DwmWindowCornerPreference, IsFullscreen ? DoNotRound : RoundCorners, sizeof(int));
+        DwmSetWindowAttribute(Handle, DwmWindowCornerPreference, flat ? DoNotRound : RoundCorners, sizeof(int));
     }
 
     private static void CalculateClientArea(nint hwnd, nint lParam)
