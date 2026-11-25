@@ -126,6 +126,7 @@
     { kind: 'action', target: 'action:appCenter', label: '应用中心', group: '功能' },
     { kind: 'action', target: 'action:newFolder', label: '新建文件夹', group: '功能' },
     { kind: 'action', target: 'action:runCommand', label: '运行命令', group: '功能' },
+    { kind: 'action', target: 'action:rootTerminal', label: 'Root 终端', group: '功能' },
     { kind: 'action', target: 'action:refreshApps', label: '刷新应用', group: '功能' },
     { kind: 'action', target: 'action:autoOrganize', label: '整理桌面', group: '功能' },
     { kind: 'action', target: 'action:syncStartMenu', label: '同步快捷方式', group: '功能' }
@@ -150,6 +151,8 @@
     openFolderId: null,
     linuxSettings: null,
     linuxSettingsBusy: false,
+    accountsData: null,
+    accountsBusy: false,
     dragPayload: null,
     dragRepelActive: false,
     lastDragCell: null,
@@ -177,9 +180,6 @@
     iconMaximize: $('icon-maximize'),
     iconRestore: $('icon-restore'),
     btnClose: $('btn-close'),
-    btnUnlock: $('btn-unlock'),
-    btnUnlockLinux: $('btn-unlock-linux'),
-    unlockStatus: $('unlock-status'),
 
     viewApps: $('view-apps'),
     viewControl: $('view-control'),
@@ -221,6 +221,18 @@
     healthPortal: $('health-portal'),
     healthMimeapps: $('health-mimeapps'),
     protocolsList: $('protocols-list'),
+
+    btnAccountsRefresh: $('btn-accounts-refresh'),
+    btnAccountCreate: $('btn-account-create'),
+    accountsHelloDesc: $('accounts-hello-desc'),
+    accountsHelloChip: $('accounts-hello-chip'),
+    accountsKeyringDesc: $('accounts-keyring-desc'),
+    accountsKeyringChip: $('accounts-keyring-chip'),
+    btnKeyringUnlockHello: $('btn-keyring-unlock-hello'),
+    btnKeyringUnlockPw: $('btn-keyring-unlock-pw'),
+    btnKeyringLock: $('btn-keyring-lock'),
+    toggleAutoHelloKeyring: $('toggle-auto-hello-keyring'),
+    accountsList: $('accounts-list'),
 
     themeGrid: $('theme-grid'),
     toggleCustomColors: $('toggle-custom-colors'),
@@ -306,52 +318,6 @@
     els.iconRestore.classList.toggle('is-hidden', !state.maximized);
     els.btnMaximize.title = state.maximized ? '还原' : '最大化';
   }
-
-  let launcherVisible = false;
-  let launcherUnlocked = false;
-  let unlockAttempt = null;
-
-  function applyLauncherSession(session) {
-    if (!session) return;
-    const opened = session.visible && !launcherVisible;
-    launcherVisible = session.visible;
-    launcherUnlocked = session.unlocked;
-    $('app').classList.toggle('session-locked', !launcherUnlocked);
-    if (!launcherVisible) {
-      unlockAttempt = null;
-      closeContextMenu();
-      closeModal();
-      closeFolder();
-    }
-    els.unlockStatus.textContent = launcherUnlocked ? '' : session.message || '';
-    if (launcherUnlocked && session.message) showToast(session.message);
-    els.btnUnlock.disabled = els.btnUnlockLinux.disabled = Boolean(unlockAttempt);
-    if (opened && !launcherUnlocked) requestLauncherUnlock(false);
-  }
-
-  async function requestLauncherUnlock(linuxPassword) {
-    if (!launcherVisible || launcherUnlocked || unlockAttempt) return;
-    const attempt = {};
-    unlockAttempt = attempt;
-    els.unlockStatus.textContent = '请在系统窗口中完成验证。';
-    els.btnUnlock.disabled = els.btnUnlockLinux.disabled = true;
-    try {
-      const session = await bridge.invoke('session.unlock', { linuxPassword });
-      if (unlockAttempt !== attempt) return;
-      unlockAttempt = null;
-      applyLauncherSession(session);
-      if (!launcherUnlocked && launcherVisible) els.btnUnlock.focus();
-    } catch {
-      if (unlockAttempt !== attempt) return;
-      unlockAttempt = null;
-      els.btnUnlock.disabled = els.btnUnlockLinux.disabled = false;
-      els.unlockStatus.textContent = '无法完成验证。请重试或切换验证方式。';
-      els.btnUnlock.focus();
-    }
-  }
-
-  els.btnUnlock.addEventListener('click', () => requestLauncherUnlock(false));
-  els.btnUnlockLinux.addEventListener('click', () => requestLauncherUnlock(true));
 
   // ---------------- Appearance Helpers ----------------
   function themeById(id) {
@@ -569,6 +535,7 @@
       closeFolder();
       if (controlTab) setControlTab(controlTab);
       if (state.activeTab === 'linux' && !state.linuxSettings) loadLinuxSettings();
+      if (state.activeTab === 'accounts' && !state.accountsData) loadAccounts();
       renderControlCenter();
     }
   }
@@ -584,6 +551,7 @@
       pane.classList.toggle('is-active', pane.id === `tab-${tabName}`);
     });
     if (tabName === 'linux' && !state.linuxSettings) loadLinuxSettings();
+    if (tabName === 'accounts') loadAccounts();
     if (tabName === 'appearance') renderAppearanceSettings();
   }
 
@@ -1567,6 +1535,8 @@
         return `<svg viewBox='0 0 18 18' fill='none'><path d='M2.8 5.6A1.6 1.6 0 0 1 4.4 4h2.8l1.4 1.6h5A1.6 1.6 0 0 1 15.2 7v6.4a1.6 1.6 0 0 1-1.6 1.6H4.4a1.6 1.6 0 0 1-1.6-1.6V5.6Z' stroke='currentColor' stroke-width='1.4'/><path d='M9 8.4v3.2M7.4 10h3.2' stroke='currentColor' stroke-width='1.4' stroke-linecap='round'/></svg>`;
       case 'action:runCommand':
         return `<svg viewBox='0 0 18 18' fill='none'><rect x='2.5' y='3.4' width='13' height='11.2' rx='2.2' stroke='currentColor' stroke-width='1.4'/><path d='M5.7 7.3l2.2 1.8-2.2 1.8M9.4 11h3' stroke='currentColor' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/></svg>`;
+      case 'action:rootTerminal':
+        return `<svg viewBox='0 0 18 18' fill='none'><rect x='2.5' y='3.4' width='13' height='11.2' rx='2.2' stroke='currentColor' stroke-width='1.4'/><path d='M5.6 7.5h4.2M5.6 10.5h4.2M6.8 6.1v5.8M8.6 6.1v5.8M11.6 11h1.8' stroke='currentColor' stroke-width='1.35' stroke-linecap='round'/></svg>`;
       case 'action:refreshApps':
         return `<svg viewBox='0 0 18 18' fill='none'><path d='M14.2 7.2A5.4 5.4 0 1 0 14 11' stroke='currentColor' stroke-width='1.4' stroke-linecap='round'/><path d='M14.4 3.8v3.6h-3.6' stroke='currentColor' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/></svg>`;
       case 'action:autoOrganize':
@@ -1689,6 +1659,7 @@
         case 'action:appCenter': handleOpenAppCenter(); break;
         case 'action:newFolder': openCreateFolderModal(); break;
         case 'action:runCommand': openCustomCommandModal(); break;
+        case 'action:rootTerminal': handleOpenRootTerminal(); break;
         case 'action:refreshApps': handleRefreshApps(); break;
         case 'action:autoOrganize': handleAutoOrganize(); break;
         case 'action:syncStartMenu': handleSyncStartMenu(); break;
@@ -2121,6 +2092,7 @@
 
       const badges = document.createElement('div');
       badges.className = 'stage-badges';
+      if (stage.runAsRoot) badges.appendChild(makeChip('root', 'chip-danger'));
       badges.appendChild(makeChip(isDesktop ? '桌面显示' : '后台离屏', isDesktop ? 'chip-emerald' : 'chip-neutral'));
       if (isAgent) badges.appendChild(makeChip(`AI · ${stage.inputOwner.agentName || 'Agent'}`, 'chip-agent'));
       else if (isFrozen) badges.appendChild(makeChip('已冻结', 'chip-amber'));
@@ -2272,6 +2244,673 @@
   els.btnLinuxSync.addEventListener('click', () => loadLinuxSettings('linuxSettings.syncHandlers', {}, '已同步协议关联'));
   els.btnLinuxReload.addEventListener('click', () => loadLinuxSettings('linuxSettings.get', {}, '已刷新 Linux 设置'));
 
+  // ---------------- Accounts & Credentials ----------------
+  async function loadAccounts(successToast = null) {
+    if (state.accountsBusy) return;
+    state.accountsBusy = true;
+    els.btnAccountsRefresh.disabled = true;
+    try {
+      const data = await bridge.invoke('accounts.get');
+      state.accountsData = data;
+      renderAccountsView(data);
+      if (successToast) showToast(successToast, 'success');
+    } catch (err) {
+      els.accountsHelloChip.textContent = '读取失败';
+      els.accountsHelloChip.className = 'chip chip-danger';
+      els.accountsList.innerHTML = `<span class='muted-text'>${escapeHtml(err.message)}</span>`;
+      if (successToast) showToast(`读取账号失败：${err.message}`, 'error');
+    } finally {
+      state.accountsBusy = false;
+      els.btnAccountsRefresh.disabled = false;
+    }
+  }
+
+  function renderAccountsView(data) {
+    if (!data) return;
+    const hello = data.hello || {};
+    els.accountsHelloDesc.textContent = hello.message || 'Windows Hello 状态未知';
+    els.accountsHelloChip.textContent = hello.available ? '已就绪' : '未配置';
+    els.accountsHelloChip.className = hello.available ? 'chip chip-emerald' : 'chip chip-amber';
+
+    els.toggleAutoHelloKeyring.checked = data.autoHelloForKeyring !== false;
+
+    const kr = data.keyring || {};
+    const currentAcct = (data.accounts || []).find((a) => a.isCurrent) || (data.accounts || [])[0] || null;
+    const hasKeyringCred = Boolean(currentAcct && currentAcct.hasKeyringCredential);
+
+    if (!kr.available || !kr.defaultCollection) {
+      els.accountsKeyringChip.textContent = kr.available ? '未初始化' : '未运行';
+      els.accountsKeyringChip.className = 'chip chip-neutral';
+      els.accountsKeyringDesc.textContent = kr.available
+        ? '当前尚未创建默认密钥环（首次应用请求时会按系统规则初始化）。'
+        : 'gnome-keyring-daemon 当前未运行，启动应用后会自动激活。';
+      els.btnKeyringUnlockHello.classList.add('is-hidden');
+      els.btnKeyringUnlockPw.classList.add('is-hidden');
+      els.btnKeyringLock.classList.add('is-hidden');
+    } else if (kr.locked === false) {
+      els.accountsKeyringChip.textContent = '已解锁';
+      els.accountsKeyringChip.className = 'chip chip-emerald';
+      els.accountsKeyringDesc.textContent = `${kr.label || 'Default keyring'} 当前已解锁，本机应用可直接读取已保存凭据。`;
+      els.btnKeyringUnlockHello.classList.add('is-hidden');
+      els.btnKeyringUnlockPw.classList.add('is-hidden');
+      els.btnKeyringLock.classList.remove('is-hidden');
+    } else {
+      els.accountsKeyringChip.textContent = '已锁定';
+      els.accountsKeyringChip.className = 'chip chip-amber';
+      els.accountsKeyringDesc.textContent = hasKeyringCred
+        ? `${kr.label || 'Default keyring'} 当前已锁定，可直接用 Windows Hello 一键解锁。`
+        : `${kr.label || 'Default keyring'} 当前已锁定。可先在下方为当前账号托管密码，或直接输入密码解锁。`;
+      els.btnKeyringUnlockHello.classList.toggle('is-hidden', !(hello.available && hasKeyringCred));
+      els.btnKeyringUnlockPw.classList.remove('is-hidden');
+      els.btnKeyringLock.classList.add('is-hidden');
+    }
+
+    els.accountsList.innerHTML = '';
+    const accounts = data.accounts || [];
+    if (accounts.length === 0) {
+      els.accountsList.innerHTML = `<span class='muted-text'>未找到常规 Linux 账号。</span>`;
+      return;
+    }
+
+    const frag = document.createDocumentFragment();
+    for (const acct of accounts) {
+      const card = document.createElement('div');
+      card.className = 'account-card' + (acct.isCurrent ? ' is-current' : '');
+
+      const top = document.createElement('div');
+      top.className = 'account-top';
+
+      const ident = document.createElement('div');
+      ident.className = 'account-ident';
+      const avatar = document.createElement('div');
+      avatar.className = 'account-avatar';
+      avatar.textContent = (acct.username || 'U').slice(0, 1).toUpperCase();
+
+      const names = document.createElement('div');
+      names.className = 'account-names';
+      const unameRow = document.createElement('div');
+      unameRow.className = 'account-username-row';
+      const uname = document.createElement('span');
+      uname.className = 'account-username';
+      uname.textContent = acct.fullName ? `${acct.username} (${acct.fullName})` : acct.username;
+      unameRow.appendChild(uname);
+
+      const meta = document.createElement('div');
+      meta.className = 'account-meta';
+      meta.textContent = `UID ${acct.uid} · ${acct.home} · ${acct.shell}`;
+      names.append(unameRow, meta);
+      ident.append(avatar, names);
+
+      const badges = document.createElement('div');
+      badges.className = 'account-badges';
+      badges.appendChild(makeChip(
+        acct.isAdmin ? '管理员 (sudo)' : '普通账户',
+        acct.isAdmin ? 'chip-amber' : 'chip-blue'
+      ));
+      if (acct.isCurrent) badges.appendChild(makeChip('当前会话', 'chip-emerald'));
+      if (acct.isDefaultWsl) badges.appendChild(makeChip('默认 WSL 账户', 'chip-neutral'));
+      if (acct.hasLinuxCredential || acct.hasKeyringCredential) {
+        const credText = acct.hasLinuxCredential && acct.hasKeyringCredential
+          ? 'Windows Hello 已托管'
+          : acct.hasLinuxCredential ? '已托管 Linux 密码' : '已托管密钥环密码';
+        badges.appendChild(makeChip(credText, 'chip-emerald'));
+      }
+      top.append(ident, badges);
+
+      const actions = document.createElement('div');
+      actions.className = 'account-actions';
+      const leftBtns = document.createElement('div');
+      leftBtns.className = 'account-actions-left';
+      const rightBtns = document.createElement('div');
+      rightBtns.className = 'account-actions-right';
+
+      const btnBind = document.createElement('button');
+      btnBind.type = 'button';
+      btnBind.className = (acct.hasLinuxCredential || acct.hasKeyringCredential)
+        ? 'btn btn-secondary btn-sm'
+        : 'btn btn-primary btn-sm';
+      btnBind.textContent = (acct.hasLinuxCredential || acct.hasKeyringCredential)
+        ? '管理 Hello 凭据'
+        : 'Windows Hello 托管密码';
+      btnBind.onclick = () => openBindCredentialModal(acct, hello);
+
+      const btnPw = document.createElement('button');
+      btnPw.type = 'button';
+      btnPw.className = 'btn btn-secondary btn-sm';
+      btnPw.textContent = '修改 Linux 密码';
+      btnPw.onclick = () => openSetPasswordModal(acct, hello);
+
+      const btnRole = document.createElement('button');
+      btnRole.type = 'button';
+      btnRole.className = 'btn btn-secondary btn-sm';
+      btnRole.textContent = acct.isAdmin ? '设为普通账户' : '授予 sudo 权限';
+      if (acct.isLastAdmin) {
+        btnRole.disabled = true;
+        btnRole.title = '至少需保留一个管理员 (sudo) 账户，请先新建或指定另一个管理员';
+      }
+      btnRole.onclick = () => confirmToggleAdmin(acct);
+
+      const btnDefault = document.createElement('button');
+      btnDefault.type = 'button';
+      btnDefault.className = 'btn btn-secondary btn-sm';
+      btnDefault.textContent = acct.isDefaultWsl ? '已为默认启动' : '设为默认账户';
+      btnDefault.disabled = Boolean(acct.isDefaultWsl);
+      btnDefault.onclick = () => confirmSetDefaultWsl(acct);
+
+      leftBtns.append(btnBind, btnPw, btnRole, btnDefault);
+
+      if (!acct.isCurrent && !acct.isDefaultWsl && !acct.isLastAdmin) {
+        const btnDel = document.createElement('button');
+        btnDel.type = 'button';
+        btnDel.className = 'btn btn-danger btn-sm';
+        btnDel.textContent = '删除';
+        btnDel.onclick = () => confirmDeleteAccount(acct);
+        rightBtns.appendChild(btnDel);
+      }
+
+      actions.append(leftBtns, rightBtns);
+      card.append(top, actions);
+      frag.appendChild(card);
+    }
+    els.accountsList.appendChild(frag);
+  }
+
+  function makeModalInput(labelText, type = 'text', placeholder = '', mono = false) {
+    const block = document.createElement('label');
+    block.className = 'field-block';
+    const label = document.createElement('span');
+    label.className = 'field-label';
+    label.textContent = labelText;
+    const input = document.createElement('input');
+    input.type = type;
+    input.className = 'text-input' + (mono ? ' mono' : '');
+    input.placeholder = placeholder;
+    block.append(label, input);
+    return { block, input };
+  }
+
+  function makeModalCheck(labelText, checked = false) {
+    const row = document.createElement('label');
+    row.className = 'modal-check-row';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = checked;
+    const span = document.createElement('span');
+    span.textContent = labelText;
+    row.append(input, span);
+    return { row, input };
+  }
+
+  function openBindCredentialModal(acct, hello) {
+    const form = document.createElement('div');
+    form.className = 'modal-form';
+
+    const hint = document.createElement('div');
+    hint.className = 'modal-hint';
+    hint.textContent = hello && hello.available
+      ? `密码将通过 Windows DPAPI 绑定当前 Windows 用户加密保存在本机，且仅在 Windows Hello 验证通过后取出使用，不会明文写入 WSL。`
+      : `当前 Windows Hello 尚未就绪（${(hello && hello.message) || '请先配置 PIN 或指纹'}）。请先在 Windows 设置中启用登录选项。`;
+
+    const linuxPw = makeModalInput(
+      acct.hasLinuxCredential ? '新的 Linux 密码（留空则保持不变）' : 'Linux 登录密码',
+      'password',
+      '输入该 Linux 账号的密码'
+    );
+    const sameCheck = makeModalCheck(
+      '同时使用此密码解锁 GNOME 密钥环 (Default keyring)',
+      acct.keyringUsesLinuxPassword !== false
+    );
+    const krPw = makeModalInput(
+      '独立密钥环密码',
+      'password',
+      '若密钥环密码与 Linux 密码不同，请在此输入'
+    );
+    krPw.block.classList.toggle('is-hidden', sameCheck.input.checked);
+    sameCheck.input.addEventListener('change', () => {
+      krPw.block.classList.toggle('is-hidden', sameCheck.input.checked);
+    });
+
+    const verifyCheck = makeModalCheck('保存前先验证 Linux 密码是否正确', true);
+    const errBox = document.createElement('div');
+    errBox.className = 'field-error is-hidden';
+
+    form.append(hint, linuxPw.block, sameCheck.row, krPw.block, verifyCheck.row, errBox);
+
+    const buttons = [
+      { label: '取消', className: 'btn btn-secondary', onClick: closeModal }
+    ];
+
+    if (acct.hasLinuxCredential || acct.hasKeyringCredential) {
+      buttons.push({
+        label: '清除凭据',
+        className: 'btn btn-danger',
+        onClick: async () => {
+          try {
+            const res = await bridge.invoke('accounts.clearCredential', { username: acct.username });
+            if (res.view) {
+              state.accountsData = res.view;
+              renderAccountsView(res.view);
+            }
+            closeModal();
+            showToast(res.message || '已清除托管凭据', 'info');
+          } catch (err) {
+            errBox.textContent = err.message;
+            errBox.classList.remove('is-hidden');
+          }
+        }
+      });
+      if (acct.hasLinuxCredential && hello && hello.available) {
+        buttons.push({
+          label: '测试已存密码',
+          className: 'btn btn-secondary',
+          onClick: async () => {
+            errBox.classList.add('is-hidden');
+            try {
+              const res = await bridge.invoke('accounts.testCredential', { username: acct.username });
+              showToast(res.message, res.ok ? 'success' : 'error');
+            } catch (err) {
+              errBox.textContent = err.message;
+              errBox.classList.remove('is-hidden');
+            }
+          }
+        });
+      }
+    }
+
+    const submit = async () => {
+      errBox.classList.add('is-hidden');
+      const lp = linuxPw.input.value;
+      const kp = krPw.input.value;
+      const same = sameCheck.input.checked;
+      const updateLinux = lp.length > 0;
+      const updateKeyring = !same && kp.length > 0;
+
+      if (!updateLinux && !acct.hasLinuxCredential && same) {
+        errBox.textContent = '请输入 Linux 密码。';
+        errBox.classList.remove('is-hidden');
+        linuxPw.input.focus();
+        return;
+      }
+      if (!same && !updateKeyring && !acct.hasKeyringCredential && !updateLinux) {
+        errBox.textContent = '请输入要保存的密码。';
+        errBox.classList.remove('is-hidden');
+        return;
+      }
+
+      try {
+        const res = await bridge.invoke('accounts.bindCredential', {
+          username: acct.username,
+          linuxPassword: lp,
+          updateLinux,
+          keyringUsesLinux: same,
+          keyringPassword: kp,
+          updateKeyring,
+          verifyBeforeSave: verifyCheck.input.checked
+        });
+        if (!res.ok) {
+          errBox.textContent = res.message || '保存失败';
+          errBox.classList.remove('is-hidden');
+          return;
+        }
+        if (res.view) {
+          state.accountsData = res.view;
+          renderAccountsView(res.view);
+        }
+        closeModal();
+        showToast(res.message || '已保存托管凭据', 'success');
+      } catch (err) {
+        errBox.textContent = err.message;
+        errBox.classList.remove('is-hidden');
+      }
+    };
+
+    linuxPw.input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); submit(); }
+    });
+    krPw.input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); submit(); }
+    });
+
+    buttons.push({
+      label: '通过 Windows Hello 保存',
+      className: 'btn btn-primary',
+      onClick: submit
+    });
+
+    openModal({
+      title: `托管 “${acct.username}” 的密码凭据`,
+      bodyNode: form,
+      buttons
+    });
+  }
+
+  function openCreateAccountModal() {
+    const hello = state.accountsData && state.accountsData.hello;
+    const form = document.createElement('div');
+    form.className = 'modal-form';
+
+    const uname = makeModalInput('Linux 用户名', 'text', '例如：alice（小写字母开头，可含数字、_、-）', true);
+    const fname = makeModalInput('显示名称（可选）', 'text', '例如：日常工作账户');
+    const pw = makeModalInput('登录密码', 'password', '设置 Linux 账号密码');
+    const pw2 = makeModalInput('确认密码', 'password', '再次输入密码');
+    const adminCheck = makeModalCheck('授予管理员 (sudo) 权限（不勾选则为纯普通账户）', false);
+    const helloCheck = makeModalCheck('创建后同步保存到 Windows Hello 凭据库', Boolean(hello && hello.available));
+    if (!hello || !hello.available) helloCheck.input.disabled = true;
+    const errBox = document.createElement('div');
+    errBox.className = 'field-error is-hidden';
+
+    form.append(uname.block, fname.block, pw.block, pw2.block, adminCheck.row, helloCheck.row, errBox);
+
+    const submit = async () => {
+      errBox.classList.add('is-hidden');
+      const username = uname.input.value.trim();
+      const password = pw.input.value;
+      if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(username)) {
+        errBox.textContent = '用户名需以小写字母或下划线开头，仅含小写字母、数字、_ 或 -（1–32 位）。';
+        errBox.classList.remove('is-hidden');
+        uname.input.focus();
+        return;
+      }
+      if (!password) {
+        errBox.textContent = '请输入密码。';
+        errBox.classList.remove('is-hidden');
+        pw.input.focus();
+        return;
+      }
+      if (password !== pw2.input.value) {
+        errBox.textContent = '两次输入的密码不一致。';
+        errBox.classList.remove('is-hidden');
+        pw2.input.focus();
+        return;
+      }
+
+      showToast('请在弹出的系统窗口中完成管理员授权…', 'info');
+      try {
+        const res = await bridge.invoke('accounts.create', {
+          username,
+          fullName: fname.input.value.trim(),
+          password,
+          isAdmin: adminCheck.input.checked,
+          syncHello: helloCheck.input.checked
+        });
+        if (!res.ok) {
+          errBox.textContent = res.message || '创建失败';
+          errBox.classList.remove('is-hidden');
+          return;
+        }
+        if (res.view) {
+          state.accountsData = res.view;
+          renderAccountsView(res.view);
+        }
+        closeModal();
+        showToast(res.message || '账号已创建', 'success');
+      } catch (err) {
+        errBox.textContent = err.message;
+        errBox.classList.remove('is-hidden');
+      }
+    };
+
+    pw2.input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); submit(); }
+    });
+
+    openModal({
+      title: '新建 WSL Linux 账号',
+      bodyNode: form,
+      buttons: [
+        { label: '取消', className: 'btn btn-secondary', onClick: closeModal },
+        { label: '创建账号', className: 'btn btn-primary', onClick: submit }
+      ]
+    });
+  }
+
+  function openSetPasswordModal(acct, hello) {
+    const form = document.createElement('div');
+    form.className = 'modal-form';
+
+    const pw = makeModalInput('新 Linux 密码', 'password', '输入新密码');
+    const pw2 = makeModalInput('确认新密码', 'password', '再次输入新密码');
+    const syncCheck = makeModalCheck(
+      '同步更新 Windows Hello 托管凭据',
+      Boolean(hello && hello.available && acct.hasLinuxCredential)
+    );
+    if (!hello || !hello.available) syncCheck.input.disabled = true;
+    const errBox = document.createElement('div');
+    errBox.className = 'field-error is-hidden';
+
+    form.append(pw.block, pw2.block, syncCheck.row, errBox);
+
+    const submit = async () => {
+      errBox.classList.add('is-hidden');
+      const password = pw.input.value;
+      if (!password) {
+        errBox.textContent = '密码不能为空。';
+        errBox.classList.remove('is-hidden');
+        pw.input.focus();
+        return;
+      }
+      if (password !== pw2.input.value) {
+        errBox.textContent = '两次输入的密码不一致。';
+        errBox.classList.remove('is-hidden');
+        pw2.input.focus();
+        return;
+      }
+
+      showToast('请在弹出的系统窗口中完成管理员授权…', 'info');
+      try {
+        const res = await bridge.invoke('accounts.setPassword', {
+          username: acct.username,
+          password,
+          syncHello: syncCheck.input.checked
+        });
+        if (!res.ok) {
+          errBox.textContent = res.message || '修改密码失败';
+          errBox.classList.remove('is-hidden');
+          return;
+        }
+        if (res.view) {
+          state.accountsData = res.view;
+          renderAccountsView(res.view);
+        }
+        closeModal();
+        showToast(res.message || '密码已更新', 'success');
+      } catch (err) {
+        errBox.textContent = err.message;
+        errBox.classList.remove('is-hidden');
+      }
+    };
+
+    pw2.input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); submit(); }
+    });
+
+    openModal({
+      title: `修改 “${acct.username}” 的 Linux 密码`,
+      bodyNode: form,
+      buttons: [
+        { label: '取消', className: 'btn btn-secondary', onClick: closeModal },
+        { label: '确认修改', className: 'btn btn-primary', onClick: submit }
+      ]
+    });
+  }
+
+  function openUnlockKeyringPasswordModal() {
+    const form = document.createElement('div');
+    form.className = 'modal-form';
+    const pw = makeModalInput('密钥环密码', 'password', '输入 Default keyring 解锁密码');
+    const errBox = document.createElement('div');
+    errBox.className = 'field-error is-hidden';
+    form.append(pw.block, errBox);
+
+    const submit = async () => {
+      errBox.classList.add('is-hidden');
+      const password = pw.input.value;
+      if (!password) {
+        errBox.textContent = '请输入密钥环密码。';
+        errBox.classList.remove('is-hidden');
+        pw.input.focus();
+        return;
+      }
+      try {
+        const res = await bridge.invoke('keyring.unlockPassword', { password });
+        if (res.view) {
+          state.accountsData = res.view;
+          renderAccountsView(res.view);
+        }
+        if (!res.ok) {
+          errBox.textContent = res.message || '解锁失败';
+          errBox.classList.remove('is-hidden');
+          return;
+        }
+        closeModal();
+        showToast(res.message || '密钥环已解锁', 'success');
+      } catch (err) {
+        errBox.textContent = err.message;
+        errBox.classList.remove('is-hidden');
+      }
+    };
+
+    pw.input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); submit(); }
+    });
+
+    openModal({
+      title: '解锁 GNOME 密钥环',
+      bodyNode: form,
+      buttons: [
+        { label: '取消', className: 'btn btn-secondary', onClick: closeModal },
+        { label: '解锁', className: 'btn btn-primary', onClick: submit }
+      ]
+    });
+  }
+
+  function confirmToggleAdmin(acct) {
+    const nextAdmin = !acct.isAdmin;
+    openConfirmModal({
+      title: nextAdmin ? '授予管理员 (sudo) 权限' : '转为普通账户',
+      message: nextAdmin
+        ? `确定要将 “${acct.username}” 加入 sudo 管理员组吗？操作需要通过管理员提权验证。`
+        : `确定要移除 “${acct.username}” 的 sudo 权限，使其成为纯普通账户吗？需要通过管理员提权验证。`,
+      confirmLabel: nextAdmin ? '授予权限' : '设为普通账户',
+      onConfirm: async () => {
+        showToast('请在弹出的系统窗口中完成管理员授权…', 'info');
+        try {
+          const res = await bridge.invoke('accounts.setAdmin', {
+            username: acct.username,
+            isAdmin: nextAdmin
+          });
+          if (res.view) {
+            state.accountsData = res.view;
+            renderAccountsView(res.view);
+          }
+          showToast(res.message || '操作已完成', res.ok ? 'success' : 'error');
+        } catch (err) {
+          showToast(err.message, 'error');
+        }
+      }
+    });
+  }
+
+  function confirmSetDefaultWsl(acct) {
+    openConfirmModal({
+      title: '切换默认 WSL 账户',
+      message: `将修改 /etc/wsl.conf，把下次启动 WSL (${state.distro}) 时的默认身份设为 “${acct.username}”（${acct.isAdmin ? '管理员' : '普通账户'}）。更改将在重启 WSL 实例后生效。`,
+      confirmLabel: '设为默认',
+      onConfirm: async () => {
+        showToast('请在弹出的系统窗口中完成管理员授权…', 'info');
+        try {
+          const res = await bridge.invoke('accounts.setDefaultWsl', { username: acct.username });
+          if (res.view) {
+            state.accountsData = res.view;
+            renderAccountsView(res.view);
+          }
+          showToast(res.message || '已更新默认账户', res.ok ? 'success' : 'error');
+        } catch (err) {
+          showToast(err.message, 'error');
+        }
+      }
+    });
+  }
+
+  function confirmDeleteAccount(acct) {
+    const form = document.createElement('div');
+    form.className = 'modal-form';
+    const msg = document.createElement('div');
+    msg.textContent = `确定要从 ${state.distro} 删除 Linux 账号 “${acct.username}” 吗？该操作不可撤销。`;
+    const rmHome = makeModalCheck(`同时删除主目录 (${acct.home})`, false);
+    form.append(msg, rmHome.row);
+
+    openModal({
+      title: '删除 Linux 账号',
+      bodyNode: form,
+      buttons: [
+        { label: '取消', className: 'btn btn-secondary', onClick: closeModal },
+        {
+          label: '确认删除',
+          className: 'btn btn-danger',
+          onClick: async () => {
+            closeModal();
+            showToast('请在弹出的系统窗口中完成管理员授权…', 'info');
+            try {
+              const res = await bridge.invoke('accounts.delete', {
+                username: acct.username,
+                removeHome: rmHome.input.checked
+              });
+              if (res.view) {
+                state.accountsData = res.view;
+                renderAccountsView(res.view);
+              }
+              showToast(res.message || '已删除账号', res.ok ? 'success' : 'error');
+            } catch (err) {
+              showToast(err.message, 'error');
+            }
+          }
+        }
+      ]
+    });
+  }
+
+  els.btnAccountsRefresh.addEventListener('click', () => loadAccounts('已刷新账号与凭据状态'));
+  els.btnAccountCreate.addEventListener('click', openCreateAccountModal);
+  els.toggleAutoHelloKeyring.addEventListener('change', async () => {
+    const enabled = els.toggleAutoHelloKeyring.checked;
+    try {
+      await bridge.invoke('accounts.setAutoHelloKeyring', { enabled });
+      showToast(enabled ? '已开启密钥环自动调起 Windows Hello' : '已关闭密钥环自动调起', 'info');
+    } catch (err) {
+      els.toggleAutoHelloKeyring.checked = !enabled;
+      showToast(err.message, 'error');
+    }
+  });
+  els.btnKeyringUnlockHello.addEventListener('click', async () => {
+    const data = state.accountsData;
+    const currentAcct = data && (data.accounts || []).find((a) => a.isCurrent);
+    if (!currentAcct) return;
+    try {
+      const res = await bridge.invoke('keyring.unlockHello', { username: currentAcct.username });
+      if (res.view) {
+        state.accountsData = res.view;
+        renderAccountsView(res.view);
+      }
+      showToast(res.message, res.ok ? 'success' : 'error');
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  });
+  els.btnKeyringUnlockPw.addEventListener('click', openUnlockKeyringPasswordModal);
+  els.btnKeyringLock.addEventListener('click', async () => {
+    try {
+      const res = await bridge.invoke('keyring.lock');
+      if (res.view) {
+        state.accountsData = res.view;
+        renderAccountsView(res.view);
+      }
+      showToast(res.message, res.ok ? 'info' : 'error');
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  });
+
   // ---------------- Actions ----------------
   const uninstallingIds = new Set();
 
@@ -2324,7 +2963,8 @@
     });
   }
 
-  async function handleActivateApp(app) {
+  async function handleActivateApp(app, options = {}) {
+    const asRoot = Boolean(options.asRoot);
     const isDeb = (app.source || '').toLowerCase() === 'deb';
     if (isDeb) {
       openConfirmModal({
@@ -2343,12 +2983,25 @@
       });
       return;
     }
-    showToast(`正在启动 ${app.displayName}…`, 'info');
+    showToast(
+      asRoot ? `请在授权窗口中确认以 root 身份启动 ${app.displayName}…` : `正在启动 ${app.displayName}…`,
+      'info'
+    );
     try {
-      const res = await bridge.invoke('app.activate', { appId: app.id });
+      const res = await bridge.invoke('app.activate', { appId: app.id, asRoot });
       showToast(res.message, res.ok ? 'success' : 'error');
     } catch (err) {
       showToast(`启动失败：${err.message}`, 'error');
+    }
+  }
+
+  async function handleOpenRootTerminal() {
+    showToast('请在授权窗口中确认以打开 Root 终端…', 'info');
+    try {
+      const res = await bridge.invoke('app.openRootTerminal');
+      showToast(res.message || '已发起 Root 终端', res.ok ? 'success' : 'error');
+    } catch (err) {
+      showToast(`打开 Root 终端失败：${err.message}`, 'error');
     }
   }
 
@@ -2678,6 +3331,8 @@
     input.className = 'text-input mono';
     input.placeholder = '例如：chromium, code --no-sandbox, nautilus';
     input.value = initialValue;
+    const asRootCheck = makeModalCheck('以 root 身份运行（通过管理员授权）', false);
+    asRootCheck.row.style.marginTop = '10px';
     const errBox = document.createElement('div');
     errBox.className = 'field-error is-hidden';
     const examples = document.createElement('div');
@@ -2694,7 +3349,7 @@
       };
       examples.appendChild(chip);
     }
-    wrap.append(label, input, errBox, examples);
+    wrap.append(label, input, asRootCheck.row, errBox, examples);
 
     const submit = async () => {
       const commandLine = input.value.trim();
@@ -2706,7 +3361,10 @@
       }
       try {
         errBox.classList.add('is-hidden');
-        const res = await bridge.invoke('app.launchCustom', { commandLine });
+        const res = await bridge.invoke('app.launchCustom', {
+          commandLine,
+          asRoot: asRootCheck.input.checked
+        });
         if (res.ok) {
           closeModal();
           showToast(res.message, 'success');
@@ -2827,6 +3485,7 @@
     const items = [{ label: isDeb ? '安装此 .deb 安装包' : '打开应用', primary: true, onClick: () => handleActivateApp(app) }];
     if (!isDeb) {
       items.push(
+        { label: '以 root 身份运行', onClick: () => handleActivateApp(app, { asRoot: true }) },
         { label: '添加到 Windows 开始菜单', onClick: async () => {
           try {
             const res = await bridge.invoke('shortcut.addToStartMenu', { appId: app.id });
@@ -2894,6 +3553,7 @@
       { label: '外观与字体…', onClick: () => setView('control', 'appearance') },
       { type: 'sep' },
       { label: '打开 Ubuntu 应用中心', onClick: handleOpenAppCenter },
+      { label: '打开 Root 终端', onClick: handleOpenRootTerminal },
       { label: '运行自定义命令…', onClick: () => openCustomCommandModal() },
       { label: '刷新应用列表', onClick: handleRefreshApps },
       { type: 'sep' },
@@ -3089,7 +3749,6 @@
 
   // ---------------- Global Keyboard Shortcuts ----------------
   document.addEventListener('keydown', (e) => {
-    if (!launcherUnlocked) return;
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
       e.preventDefault();
       closeContextMenu();
@@ -3132,7 +3791,6 @@
   }
 
   // ---------------- Host Events & Bootstrap ----------------
-  bridge.on('session', applyLauncherSession);
   bridge.on('state', applyStatePayload);
   bridge.on('apps', (payload) => {
     applyAppsPayload(payload);
@@ -3159,7 +3817,6 @@
         updateMaximizedUi(init.maximized);
         applyStatePayload(init);
         applyAppsPayload(init);
-        applyLauncherSession(init.session);
       }
     } catch (err) {
       showToast(`初始化失败：${err.message}`, 'error');

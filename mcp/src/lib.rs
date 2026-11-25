@@ -292,6 +292,7 @@ fn call_tool(client: &ControlClient, state: &McpState, name: &str, args: Value) 
                 wait_ready_ms: Some(wait_ready_ms),
                 launch_image: Some(observe),
                 launch_wait_for_update: Some(wait_for_update),
+                run_as_root: false,
             };
             match client.call(&req) {
                 Ok(ControlResponse::Launched { stage_id, pid }) => {

@@ -634,6 +634,101 @@ impl OpenTarget {
     }
 }
 
+pub fn preferred_terminal_command() -> Option<String> {
+    if let Ok(paths) = Paths::user() {
+        let catalog = Catalog::read(&paths);
+        let prefs = read_preferences(&paths).ok();
+        let terminals = catalog.terminals();
+        let chosen_id = prefs
+            .and_then(|p| p.terminal)
+            .filter(|id| terminals.iter().any(|t| &t.id == id))
+            .or_else(|| terminals.first().map(|t| t.id.clone()));
+        if let Some(id) = chosen_id {
+            if let Some(entry) = catalog.entry(&id) {
+                return Some(entry.cmd.clone());
+            }
+        }
+    }
+    [
+        "ptyxis",
+        "gnome-terminal",
+        "xfce4-terminal",
+        "konsole",
+        "alacritty",
+        "kitty",
+        "wezterm",
+        "tilix",
+        "foot",
+        "xterm",
+    ]
+    .into_iter()
+    .find(|bin| on_path(bin))
+    .map(str::to_owned)
+}
+
+pub fn root_terminal_launch(focusstage_bin: &Path) -> Result<(String, Vec<String>, Option<String>, bool)> {
+    let mut terminal_cmd: Option<String> = None;
+    let mut wm_class: Option<String> = None;
+
+    if let Ok(view) = settings(SettingsAction::Get) {
+        let target_id = view
+            .terminal
+            .or_else(|| view.terminals.first().map(|c| c.id.clone()));
+        if let Some(id) = target_id {
+            if let Ok(paths) = Paths::user() {
+                let catalog = Catalog::read(&paths);
+                if let Some(entry) = catalog.entry(&id) {
+                    terminal_cmd = Some(entry.cmd.clone());
+                    wm_class = Some(format!("{}{}", crate::desktop::WRAPPER_PREFIX, id));
+                }
+            }
+        }
+    }
+
+    let cmd = terminal_cmd
+        .or_else(preferred_terminal_command)
+        .context("未在 WSL 中找到可用的 Linux 终端程序。")?;
+    let base = Path::new(&cmd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&cmd)
+        .to_ascii_lowercase();
+
+    let focusstage_str = focusstage_bin.to_string_lossy().into_owned();
+    let pkexec_args = [
+        "/usr/bin/pkexec".to_string(),
+        "--disable-internal-agent".to_string(),
+        focusstage_str,
+        "root-shell".to_string(),
+    ];
+
+    let mut args = Vec::new();
+    let mut run_as_root = false;
+    match base.as_str() {
+        "ptyxis" => {
+            args.extend(["-s".into(), "--title".into(), "Root 终端".into(), "--".into()]);
+            args.extend(pkexec_args);
+        }
+        "gnome-terminal" | "tilix" | "kitty" | "foot" => {
+            args.push("--".into());
+            args.extend(pkexec_args);
+        }
+        "wezterm" => {
+            args.extend(["start".into(), "--".into()]);
+            args.extend(pkexec_args);
+        }
+        "xfce4-terminal" | "konsole" | "xterm" | "alacritty" | "terminator" => {
+            args.push("-e".into());
+            args.extend(pkexec_args);
+        }
+        _ => {
+            run_as_root = true;
+        }
+    }
+
+    Ok((cmd, args, wm_class, run_as_root))
+}
+
 pub fn valid_web_url(value: &str) -> bool {
     let Some((scheme, rest)) = value.split_once("://") else {
         return false;

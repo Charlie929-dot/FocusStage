@@ -407,11 +407,12 @@ impl FocusStageState {
                 wait_ready_ms,
                 launch_image,
                 launch_wait_for_update,
+                run_as_root,
             } => {
                 let wait_ready_ms = wait_ready_ms.filter(|&ms| ms > 0);
                 let wait_for_handoff = wait_ready_ms.map(|_| launch_wait_for_update.unwrap_or(!args.is_empty()));
                 let result = self.launch_stage(
-                    app, args, kind, env, cwd, width, height, show_on_desktop, wm_class, wait_for_handoff,
+                    app, args, kind, env, cwd, width, height, show_on_desktop, wm_class, wait_for_handoff, run_as_root,
                 );
                 match (result, wait_ready_ms) {
                     (Ok(launch), Some(ms)) => {

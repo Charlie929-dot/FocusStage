@@ -30,7 +30,6 @@ Windows 11
   FocusStage.exe（WebView2 启动器 + Direct2D 原生宿主）
    · 应用桌面：应用网格 / 文件夹 / 快捷栏 Dock / 主题外观与右键卸载 / 快捷方式同步
    · 舞台中心：运行舞台显隐与接管 / 守护进程与热键 / Linux 默认应用与协议关联 / 外观设置
-   · 会话解锁：Windows Hello 或 Ubuntu 管理员密码（打通 PAM / Polkit / 无缓存 sudo）
    · 托盘后台常驻：全局接管热键 / 动态浏览器快速启动 / 剪贴板同步开关
    · --window-host：无标题栏 Direct2D Win32 HWND + AI 接管覆盖层（内发光边框 / 虚拟指针 / 接管胶囊）+ 原生 Polkit 提权弹窗
              ▲ BGRA / LZ4 帧（WSL 互操作 stdio）▼ 键鼠、窗口状态和 DPI
@@ -84,7 +83,7 @@ WSL2
 
 #### 方式 B：从源码一键构建部署（开发者）
 
-在 Windows PowerShell 中运行开发安装器，会自动构建并安装 WSL2 端（`focusstaged` / `focusstage` / `focusstage-launch` / `focusstage-open` / `focusstage-auth`）及所需 Linux 桌面组件（`gnome-keyring`、`xdg-desktop-portal-gtk`、`xwayland`、`fonts-noto-cjk` 等），发布 `FocusStage.exe` 到 `%LOCALAPPDATA%\FocusStage` 并校验登记原生窗口宿主，初始化 Linux 协议关联，同时同步所有 Linux 应用到 Windows 开始菜单及桌面入口：
+在 Windows PowerShell 中运行开发安装器，会自动构建并安装 WSL2 端（`focusstaged` / `focusstage` / `focusstage-launch` / `focusstage-open`）及所需 Linux 桌面组件（`gnome-keyring`、`xdg-desktop-portal-gtk`、`xwayland`、`fonts-noto-cjk` 等），发布 `FocusStage.exe` 到 `%LOCALAPPDATA%\FocusStage` 并校验登记原生窗口宿主，初始化 Linux 协议关联，同时同步所有 Linux 应用到 Windows 开始菜单及桌面入口：
 
 ```powershell
 # 源码位于当前 Windows 仓库时

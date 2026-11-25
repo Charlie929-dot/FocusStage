@@ -111,7 +111,6 @@ FocusStage 要实现的体验：
  │  FocusStage.exe (.NET 8 + WebView2, 交互壳 + Direct2D 原生宿主) │
  │   · 应用桌面：应用网格 / 文件夹 / 快捷栏 / 快捷方式同步 / 右键卸载 │
  │   · 舞台中心：运行舞台显隐与接管 / 守护进程与热键 / Linux 设置 / 外观 │
- │   · 会话解锁：Windows Hello 或 Ubuntu 管理员密码（PAM / Polkit 复用） │
  │   · 托盘后台常驻：全局接管热键 / 动态浏览器快速启动 / 剪贴板同步  │
  │   · --window-host：Direct2D 原生宿主，支持 LZ4 帧、AI 接管覆盖层与原生 Polkit 提权弹窗 │
  └───────────────────────▲────────────────────┼──────────────────┘
@@ -219,7 +218,7 @@ FocusStage 要实现的体验：
 - 已知限制：`/mnt/c` 走 9P 文件系统，大量小文件读写（如大仓库构建）明显变慢，对性能敏感的项目建议放在 WSL 原生文件系统中；
 - 从资源管理器拖文件到宿主窗口（或 AI 调用 `stage_drop_files`）：路径 `C:\...` 转为 `/mnt/c/...`，经 `wl_data_device` 投递拖放；
 - **默认应用与协议关联（XDG / URI 路由）**：通过 `focusstage settings`（及启动器中的「舞台中心 → Linux 设置」）维护 `~/.config/focusstage/settings.json` 与用户级 `mimeapps.list` / handler `.desktop` 条目，把 `xdg-open` / `gio open` / `focusstage-open` 收到的 `http(s)`、自定义协议（如 `vscode://`）和本地文件交由 `focusstage open --ensure-daemon` 路由到对应 Stage；默认浏览器支持托管 Linux 浏览器或仅限 HTTP(S) 的 Windows 默认浏览器（`windows-host`）；
-- **桌面会话、认证与图标主题**：`focusstaged` 与 `focusstage` 通过 `SessionEnv` 统一解析并向 `systemd --user` 同步桌面环境变量；`focusstaged` 内置原生 Polkit D-Bus 认证代理（`polkit.rs`），将 `pkexec` / 系统提权请求转交给 Windows 宿主弹出原生 Win32 提权框（`NativeElevationDialog`），不再依赖 `policykit-1-gnome`；`focusstage-auth` 与 Windows Hello 协同打通启动器解锁期间的 PAM/Polkit 与无缓存 `sudo` 会话复用；`focusstage list-apps` / `sync-apps` 通过 Linux GTK 图标主题解析并缓存应用图标供启动器和 Windows 开始菜单复用。
+- **桌面会话、认证与图标主题**：`focusstaged` 与 `focusstage` 通过 `SessionEnv` 统一解析并向 `systemd --user` 同步桌面环境变量；`focusstaged` 内置原生 Polkit D-Bus 认证代理（`polkit.rs`），将 `pkexec` / 系统提权请求转交给 Windows 宿主弹出原生 Win32 提权框（`NativeElevationDialog`），不再依赖 `policykit-1-gnome`；`focusstage list-apps` / `sync-apps` 通过 Linux GTK 图标主题解析并缓存应用图标供启动器和 Windows 开始菜单复用。
 
 ### 4.9 Windows 启动器与内置舞台中心
 
@@ -323,7 +322,7 @@ stage_close(stage_id)
 - **已完成**：
   - `NativeSink` + `FocusStage.exe --window-host` 原生无标题栏宿主与显示后端单轨化（移除 WSLg 嵌套后端），支持 Direct2D 立即呈现、大帧可选 LZ4 压缩、同 Stage 多窗口、任务栏分组、动态 DPI（含 XWayland 分数缩放对齐）、新窗口居中、Wayland 标题栏拖动/缩放输入、切窗防漏 `Alt` 及双端文本剪贴板同步；
   - WSL2 图形加速默认路径（Chromium/Electron 默认内置 XWayland + Mesa D3D12）与通用进程归属/生命周期（`FOCUSSTAGE_LAUNCH_TOKEN` 匹配、壳进程脱离保留、`stderr` 透出、Snap/AppImage 兼容、单实例应用复用）；
-  - 统一桌面会话与认证：`SessionEnv` 同步 WSL 桌面环境，内置原生 Polkit D-Bus 代理联动 Win32 提权弹窗（替代 `policykit-1-gnome`），`focusstage-auth` 协同 Windows Hello / Ubuntu 管理员密码打通 PAM / Polkit / 无缓存 `sudo` 会话复用，按 Linux 图标主题解析应用图标并支持 `focusstage uninstall-app`；
+  - 统一桌面会话与认证：`SessionEnv` 同步 WSL 桌面环境，内置原生 Polkit D-Bus 代理联动 Win32 提权弹窗（替代 `policykit-1-gnome`），按 Linux 图标主题解析应用图标并支持 `focusstage uninstall-app`；
   - 完整 MCP 应用工作流（`stage_list_apps`、`stage_launch` 默认后台启动与就绪首帧截图、`stage_observe` 无租约只读观察、`stage_act` 稳定等待控制、`stage_drop_files` 文件拖放、默认原图 + 按需 `som: true`）以及 `Desktop + Agent` 窗口的 AI 接管覆盖层（内发光边框、状态胶囊一键接管、虚拟指针动画）；
   - WebView2 启动器重构与独立「舞台中心」视图（运行舞台 / 守护与桌面 / Linux 设置 / 外观与快捷栏）、桌面布局持久化、托盘动态浏览器快捷启动，以及独立终端用户安装包（Inno Setup + `install-release.ps1`）、开发部署旁路 MSIX 虚拟化/支持 WSL 源码直编和 GitHub Actions 发版流。
 - **按需增强项（非阻塞主闭环）**：

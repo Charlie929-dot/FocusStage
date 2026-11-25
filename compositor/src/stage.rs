@@ -302,6 +302,7 @@ pub struct Stage {
     pub(crate) next_process_check: Option<Instant>,
     pub(crate) launch_env: HashMap<String, String>,
     pub(crate) launch_cwd: Option<String>,
+    pub run_as_root: bool,
 
     pub display: DisplayState,
     pub input_owner: InputOwner,
@@ -417,6 +418,7 @@ impl Stage {
             next_process_check: None,
             launch_env: HashMap::new(),
             launch_cwd: None,
+            run_as_root: false,
             display,
             input_owner: InputOwner::Human,
             lease: None,
@@ -556,6 +558,7 @@ impl Stage {
             has_surface: self.has_live_surface(),
             scale: window.map(|w| w.scale).unwrap_or(self.default_scale),
             wm_class: Some(self.wm_class.clone()),
+            run_as_root: self.run_as_root,
         }
     }
 }

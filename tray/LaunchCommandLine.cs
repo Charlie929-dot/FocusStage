@@ -59,9 +59,11 @@ internal static class LaunchCommandLine
         return args.ToArray();
     }
 
-    internal static string[] ForStage(string command, IReadOnlyCollection<string> args, string? wmClass = null)
+    internal static string[] ForStage(string command, IReadOnlyCollection<string> args, string? wmClass = null, bool asRoot = false)
     {
         var launch = new List<string> { "launch", "--ensure-daemon" };
+        if (asRoot)
+            launch.Add("--as-root");
         if (!string.IsNullOrWhiteSpace(wmClass))
             launch.AddRange(["--wm-class", wmClass]);
         launch.Add(command);

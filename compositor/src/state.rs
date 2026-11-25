@@ -109,6 +109,8 @@ pub struct FocusStageState {
     pub a11y: A11yCollector,
     pub(crate) polkit_cmd_tx: calloop_channel::Sender<crate::polkit::PolkitHostCommand>,
     pub(crate) polkit_agent: Option<crate::polkit::PolkitAgentHandle>,
+    pub(crate) keyring_prompter: Option<crate::keyring::KeyringPrompterHandle>,
+    pub(crate) host_proxy: crate::proxy::HostProxyManager,
     pub display_sink: Option<Box<dyn DisplaySink>>,
     pub should_quit: bool,
 }
@@ -194,14 +196,30 @@ impl FocusStageState {
             a11y,
             polkit_cmd_tx,
             polkit_agent: None,
+            keyring_prompter: None,
+            host_proxy: crate::proxy::HostProxyManager::new(),
             display_sink,
             should_quit: false,
         }
     }
 
+    pub fn apply_host_proxy(&mut self, cfg: crate::proxy::HostProxyConfig) {
+        self.host_proxy.apply(cfg);
+    }
+
+    pub fn clear_host_proxy(&mut self) {
+        self.host_proxy.clear();
+    }
+
     pub fn send_polkit_reply(&self, reply: crate::polkit::PolkitHostReply) {
         if let Some(agent) = self.polkit_agent.as_ref() {
             agent.send_host_reply(reply);
+        }
+    }
+
+    pub fn send_keyring_reply(&self, reply: crate::polkit::PolkitHostReply) {
+        if let Some(prompter) = self.keyring_prompter.as_ref() {
+            prompter.send_host_reply(reply);
         }
     }
 

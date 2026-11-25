@@ -85,6 +85,8 @@ enum HostCommand<'a> {
     },
     AuthBegin {
         cookie: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        distro: Option<&'a str>,
         action_id: &'a str,
         message: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,6 +209,18 @@ enum HostEvent {
         window_id: String,
         seq: u64,
     },
+    HostProxyChanged {
+        enabled: bool,
+        bridge_port: u16,
+        #[serde(default)]
+        http_proxy: Option<String>,
+        #[serde(default)]
+        https_proxy: Option<String>,
+        #[serde(default)]
+        all_proxy: Option<String>,
+        #[serde(default)]
+        no_proxy: Option<String>,
+    },
 }
 
 impl HostEvent {
@@ -294,6 +308,21 @@ impl HostEvent {
                 response,
             },
             Self::AuthCancel { cookie } => Input::AuthCancel { cookie },
+            Self::HostProxyChanged {
+                enabled,
+                bridge_port,
+                http_proxy,
+                https_proxy,
+                all_proxy,
+                no_proxy,
+            } => Input::HostProxyChanged {
+                enabled,
+                bridge_port,
+                http_proxy,
+                https_proxy,
+                all_proxy,
+                no_proxy,
+            },
         })
     }
 }
@@ -587,6 +616,7 @@ impl DisplaySink for NativeSink {
         match cmd {
             Cmd::Begin {
                 cookie,
+                distro,
                 action_id,
                 message,
                 icon_png,
@@ -601,6 +631,7 @@ impl DisplaySink for NativeSink {
             } => {
                 self.command(HostCommand::AuthBegin {
                     cookie,
+                    distro: distro.as_deref(),
                     action_id,
                     message,
                     icon_png: icon_png.as_deref(),
@@ -741,6 +772,7 @@ mod tests {
         let users = vec!["scl".to_string()];
         let json = serde_json::to_value(HostCommand::AuthBegin {
             cookie: "cookie-1",
+            distro: Some("Ubuntu"),
             action_id: "io.focusstage.launcher.verify",
             message: "验证身份以解锁 FocusStage 启动器",
             icon_png: None,
@@ -776,6 +808,24 @@ mod tests {
         assert!(matches!(
             cancel.into_sink_event(),
             Some(SinkInputEvent::AuthCancel { cookie }) if cookie == "cookie-1"
+        ));
+    }
+
+    #[test]
+    fn host_proxy_changed_deserializes() {
+        let ev = serde_json::from_str::<HostEvent>(
+            r#"{"type":"host_proxy_changed","enabled":true,"bridge_port":54321,"http_proxy":"http://127.0.0.1:54321","https_proxy":"http://127.0.0.1:54321","all_proxy":"socks5://127.0.0.1:54321","no_proxy":"localhost,127.0.0.1"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            ev.into_sink_event(),
+            Some(SinkInputEvent::HostProxyChanged {
+                enabled: true,
+                bridge_port: 54321,
+                http_proxy: Some(hp),
+                all_proxy: Some(ap),
+                ..
+            }) if hp == "http://127.0.0.1:54321" && ap == "socks5://127.0.0.1:54321"
         ));
     }
 }

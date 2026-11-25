@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
+use focusstage_compositor::accounts::{self, AccountAction, AccountApplyOutcome};
 use focusstage_compositor::control::ControlClient;
 use focusstage_compositor::desktop;
+use focusstage_compositor::keyring;
 use focusstage_compositor::protocol::{
     default_socket_path, windows_path_to_wsl, Action, ControlRequest, ControlResponse,
     DesktopAppInfo, DisplayState, StageKind,
@@ -63,9 +65,20 @@ enum Commands {
         wm_class: Option<String>,
         #[arg(long, default_value_t = false)]
         ensure_daemon: bool,
+        #[arg(long, default_value_t = false)]
+        as_root: bool,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Open an interactive root terminal Stage (authenticated via Polkit)
+    RootTerminal,
+    #[command(hide = true)]
+    RootExec {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    #[command(hide = true)]
+    RootShell,
     /// Route one or more links or local files through FocusStage
     Open {
         #[arg(long)]
@@ -79,6 +92,16 @@ enum Commands {
     Settings {
         #[command(subcommand)]
         action: SettingsCommand,
+    },
+    /// Inspect or manage WSL Linux user accounts and default WSL user
+    Accounts {
+        #[command(subcommand)]
+        action: AccountsCommand,
+    },
+    /// Inspect, unlock, or lock the default GNOME keyring
+    Keyring {
+        #[command(subcommand)]
+        action: KeyringCommand,
     },
     /// List discovered Linux GUI applications from .desktop entries
     ListApps,
@@ -198,6 +221,24 @@ enum SettingsCommand {
     RemoveHandlers,
 }
 
+#[derive(Debug, Subcommand)]
+enum AccountsCommand {
+    Status,
+    VerifyPassword {
+        #[arg(long)]
+        username: String,
+    },
+    Apply,
+    ApplyStdin,
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyringCommand {
+    Status,
+    Unlock,
+    Lock,
+}
+
 fn parse_kind(s: &str) -> anyhow::Result<StageKind> {
     match s.to_ascii_lowercase().as_str() {
         "wayland" => Ok(StageKind::Wayland),
@@ -210,8 +251,15 @@ fn parse_kind(s: &str) -> anyhow::Result<StageKind> {
 }
 
 fn main() -> anyhow::Result<()> {
-    session_env::ensure_runtime_env_for_current_user();
     let cli = Cli::parse();
+    if matches!(cli.command, Commands::RootExec { .. }) {
+        return focusstage_compositor::root_exec::run_from_stdin().map_err(anyhow::Error::msg);
+    }
+    if matches!(cli.command, Commands::RootShell) {
+        return focusstage_compositor::root_exec::run_root_shell().map_err(anyhow::Error::msg);
+    }
+
+    session_env::ensure_runtime_env_for_current_user();
     let sock = cli.socket.unwrap_or_else(default_socket_path);
 
     if matches!(cli.command, Commands::Mcp) {
@@ -264,6 +312,14 @@ fn main() -> anyhow::Result<()> {
         return run_sync_apps(&sock, &target_dir, remove, from_stdin, uid, cli.json);
     }
 
+    if let Commands::Accounts { action } = cli.command {
+        return run_accounts_command(action, &sock, cli.json);
+    }
+
+    if let Commands::Keyring { action } = cli.command {
+        return run_keyring_command(action, cli.json);
+    }
+
     if let Commands::Settings { action } = cli.command {
         let action = match action {
             SettingsCommand::Get => SettingsAction::Get,
@@ -303,6 +359,49 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if matches!(cli.command, Commands::RootTerminal) {
+        session_env::init_cli_environment(None);
+        ensure_focusstaged_running(&sock, None)?;
+        let client = ControlClient::new(sock);
+        for attempt in 0..40 {
+            if matches!(
+                client.call(&ControlRequest::EnsurePolkitAgent),
+                Ok(ControlResponse::PolkitAgent { ready: true })
+            ) {
+                break;
+            }
+            if attempt < 39 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        let focusstage_bin = std::env::current_exe()
+            .ok()
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| PathBuf::from("/usr/local/bin/focusstage"));
+        let (app, args, wm_class, run_as_root) = xdg::root_terminal_launch(&focusstage_bin)?;
+        let resp = client.call(&ControlRequest::Launch {
+            app,
+            args,
+            kind: None,
+            env: Default::default(),
+            cwd: None,
+            width: None,
+            height: None,
+            show_on_desktop: Some(true),
+            wm_class,
+            wait_ready_ms: None,
+            launch_image: None,
+            launch_wait_for_update: None,
+            run_as_root,
+        })?;
+        let failed = matches!(resp, ControlResponse::Error { .. });
+        print_resp(&resp, cli.json);
+        if failed {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     if matches!(
         cli.command,
         Commands::Launch {
@@ -318,7 +417,12 @@ fn main() -> anyhow::Result<()> {
 
     let client = ControlClient::new(sock);
     let req = match cli.command {
-        Commands::Mcp | Commands::EnsureDaemon { .. } | Commands::EnsurePolkitAgent => unreachable!(),
+        Commands::Mcp
+        | Commands::EnsureDaemon { .. }
+        | Commands::EnsurePolkitAgent
+        | Commands::RootTerminal
+        | Commands::RootExec { .. }
+        | Commands::RootShell => unreachable!(),
         Commands::Ping => ControlRequest::Ping,
         Commands::List => ControlRequest::List,
         Commands::Launch {
@@ -330,6 +434,7 @@ fn main() -> anyhow::Result<()> {
             cwd,
             wm_class,
             ensure_daemon: _,
+            as_root,
             mut args,
         } => {
             if args.first().map(|s| s.as_str()) == Some("--") {
@@ -348,6 +453,7 @@ fn main() -> anyhow::Result<()> {
                 wait_ready_ms: None,
                 launch_image: None,
                 launch_wait_for_update: None,
+                run_as_root: as_root,
             }
         }
         Commands::Open { uris, handler, .. } => {
@@ -367,6 +473,8 @@ fn main() -> anyhow::Result<()> {
         Commands::ListApps
         | Commands::SyncApps { .. }
         | Commands::Settings { .. }
+        | Commands::Accounts { .. }
+        | Commands::Keyring { .. }
         | Commands::UninstallApp { .. } => unreachable!(),
         Commands::Close { stage_id } => ControlRequest::Close { stage_id },
         Commands::Acquire {
@@ -488,6 +596,161 @@ fn print_resp(resp: &ControlResponse, json_mode: bool) {
         println!("{}", serde_json::to_string(resp).unwrap());
     } else {
         println!("{}", serde_json::to_string_pretty(resp).unwrap());
+    }
+}
+
+fn read_stdin_secret_line() -> anyhow::Result<String> {
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    Ok(input.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn print_json_value(value: &serde_json::Value, json_mode: bool) {
+    if json_mode {
+        println!("{value}");
+    } else {
+        println!("{}", serde_json::to_string_pretty(value).unwrap());
+    }
+}
+
+fn run_accounts_command(
+    action: AccountsCommand,
+    sock: &Path,
+    json_mode: bool,
+) -> anyhow::Result<()> {
+    match action {
+        AccountsCommand::Status => {
+            session_env::init_cli_environment(None);
+            let status = accounts::accounts_status();
+            print_json_value(&serde_json::to_value(&status)?, json_mode);
+            Ok(())
+        }
+        AccountsCommand::VerifyPassword { username } => {
+            let password = read_stdin_secret_line()?;
+            match accounts::verify_password(&username, &password) {
+                Ok(valid) => {
+                    let out = serde_json::json!({
+                        "status": "ok",
+                        "valid": valid,
+                        "username": username,
+                    });
+                    print_json_value(&out, json_mode);
+                    Ok(())
+                }
+                Err(message) => {
+                    let out = serde_json::json!({
+                        "status": "error",
+                        "message": message,
+                    });
+                    print_json_value(&out, json_mode);
+                    std::process::exit(1);
+                }
+            }
+        }
+        AccountsCommand::Apply => {
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input)?;
+            let parsed: AccountAction = serde_json::from_str(input.trim())?;
+            match accounts::run_privileged_action(sock, &parsed) {
+                Ok(outcome) => {
+                    print_json_value(&serde_json::to_value(&outcome)?, json_mode);
+                    Ok(())
+                }
+                Err(message) => {
+                    let outcome = AccountApplyOutcome {
+                        status: "error".into(),
+                        message,
+                        username: None,
+                    };
+                    print_json_value(&serde_json::to_value(&outcome)?, json_mode);
+                    std::process::exit(1);
+                }
+            }
+        }
+        AccountsCommand::ApplyStdin => {
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input)?;
+            let parsed: AccountAction = serde_json::from_str(input.trim())?;
+            match accounts::apply_action_as_root(parsed) {
+                Ok(outcome) => {
+                    print_json_value(&serde_json::to_value(&outcome)?, json_mode);
+                    Ok(())
+                }
+                Err(message) => {
+                    let outcome = AccountApplyOutcome {
+                        status: "error".into(),
+                        message,
+                        username: None,
+                    };
+                    print_json_value(&serde_json::to_value(&outcome)?, json_mode);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+fn run_keyring_command(action: KeyringCommand, json_mode: bool) -> anyhow::Result<()> {
+    session_env::init_cli_environment(None);
+    match action {
+        KeyringCommand::Status => {
+            let status = keyring::query_keyring_status();
+            print_json_value(&serde_json::to_value(&status)?, json_mode);
+            Ok(())
+        }
+        KeyringCommand::Unlock => {
+            let password = read_stdin_secret_line()?;
+            match keyring::unlock_default_keyring(&password) {
+                Ok(true) => {
+                    print_json_value(
+                        &serde_json::json!({ "status": "ok", "unlocked": true }),
+                        json_mode,
+                    );
+                    Ok(())
+                }
+                Ok(false) => {
+                    print_json_value(
+                        &serde_json::json!({
+                            "status": "error",
+                            "unlocked": false,
+                            "message": "密钥环密码不正确，请检查后重试。"
+                        }),
+                        json_mode,
+                    );
+                    std::process::exit(1);
+                }
+                Err(message) => {
+                    print_json_value(
+                        &serde_json::json!({
+                            "status": "error",
+                            "unlocked": false,
+                            "message": message
+                        }),
+                        json_mode,
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        KeyringCommand::Lock => match keyring::lock_default_keyring() {
+            Ok(()) => {
+                print_json_value(
+                    &serde_json::json!({ "status": "ok", "locked": true }),
+                    json_mode,
+                );
+                Ok(())
+            }
+            Err(message) => {
+                print_json_value(
+                    &serde_json::json!({
+                        "status": "error",
+                        "message": message
+                    }),
+                    json_mode,
+                );
+                std::process::exit(1);
+            }
+        },
     }
 }
 

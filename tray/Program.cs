@@ -125,6 +125,9 @@ internal sealed class StageDto
 
     [JsonPropertyName("wm_class")]
     public string? WmClass { get; set; }
+
+    [JsonPropertyName("run_as_root")]
+    public bool RunAsRoot { get; set; }
 }
 
 internal sealed class InputOwnerDto
@@ -442,14 +445,15 @@ internal sealed class FocusStageTrayContext : ApplicationContext
     {
         var menu = new ToolStripMenuItem("Quick Launch Stage");
         var status = new ToolStripMenuItem("正在读取 Linux 浏览器…") { Enabled = false };
+        var rootTerm = new ToolStripMenuItem("打开 Root 终端 (root)", null, (_, _) => _ = LaunchRootTerminalAsync());
         var custom = new ToolStripMenuItem("Custom command...", null, (_, _) => PromptLaunchCustom());
-        menu.DropDownItems.AddRange([status, custom]);
+        menu.DropDownItems.AddRange([status, new ToolStripSeparator(), rootTerm, custom]);
         bool loading = false;
         menu.DropDownOpening += async (_, _) =>
         {
             if (loading) return;
             loading = true;
-            while (menu.DropDownItems.Count > 2)
+            while (menu.DropDownItems.Count > 4)
             {
                 var oldItem = menu.DropDownItems[1];
                 menu.DropDownItems.RemoveAt(1);
@@ -466,7 +470,7 @@ internal sealed class FocusStageTrayContext : ApplicationContext
             {
                 var item = new ToolStripMenuItem(app.DisplayName, null, (_, _) => _ = RunControlAndRefreshAsync(
                     LaunchCommandLine.ForStage(app.Cmd, app.Args, app.WmClass)));
-                menu.DropDownItems.Insert(menu.DropDownItems.Count - 1, item);
+                menu.DropDownItems.Insert(menu.DropDownItems.Count - 3, item);
             }
             status.Text = ok ? "没有已安装的 Linux 浏览器" : "无法读取 Linux 浏览器列表";
             status.Visible = browsers.Length == 0;
@@ -498,7 +502,7 @@ internal sealed class FocusStageTrayContext : ApplicationContext
             AutoSize = true,
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
             ColumnCount = 1,
-            RowCount = 3
+            RowCount = 4
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
 
@@ -510,6 +514,11 @@ internal sealed class FocusStageTrayContext : ApplicationContext
         var box = new TextBox
         {
             Dock = DockStyle.Fill
+        };
+        var asRootCheck = new CheckBox
+        {
+            AutoSize = true,
+            Text = "以 root 身份运行（通过管理员授权）",
         };
 
         var buttons = new FlowLayoutPanel
@@ -547,7 +556,8 @@ internal sealed class FocusStageTrayContext : ApplicationContext
 
         layout.Controls.Add(label, 0, 0);
         layout.Controls.Add(box, 0, 1);
-        layout.Controls.Add(buttons, 0, 2);
+        layout.Controls.Add(asRootCheck, 0, 2);
+        layout.Controls.Add(buttons, 0, 3);
         form.Controls.Add(layout);
         form.AcceptButton = ok;
         form.CancelButton = cancel;
@@ -559,7 +569,8 @@ internal sealed class FocusStageTrayContext : ApplicationContext
             label.MaximumSize = new Size(S(460), 0);
             label.Margin = new Padding(0, 0, 0, S(8));
             box.MinimumSize = new Size(S(440), 0);
-            box.Margin = new Padding(0, 0, 0, S(12));
+            box.Margin = new Padding(0, 0, 0, S(8));
+            asRootCheck.Margin = new Padding(0, 0, 0, S(12));
             cancel.MinimumSize = new Size(S(84), S(30));
             cancel.Padding = new Padding(S(10), S(3), S(10), S(3));
             cancel.Margin = new Padding(0);
@@ -578,7 +589,28 @@ internal sealed class FocusStageTrayContext : ApplicationContext
 
         var dialogResult = owner is not null ? form.ShowDialog(owner) : form.ShowDialog();
         if (dialogResult == DialogResult.OK)
-            _ = RunControlAndRefreshAsync(LaunchCommandLine.ForStage(command[0], command[1..]));
+        {
+            var runAsRoot = asRootCheck.Checked;
+            _ = LaunchCustomStageAsync(command, runAsRoot);
+        }
+    }
+
+    public async Task LaunchRootTerminalAsync()
+    {
+        if (!_daemonAlive)
+        {
+            await StartDaemonAsync();
+        }
+        await RunControlAndRefreshAsync("root-terminal");
+    }
+
+    private async Task LaunchCustomStageAsync(string[] command, bool asRoot)
+    {
+        if (asRoot && !_daemonAlive)
+        {
+            await StartDaemonAsync();
+        }
+        await RunControlAndRefreshAsync(LaunchCommandLine.ForStage(command[0], command[1..], asRoot: asRoot));
     }
 
     public async Task TakeoverAllAsync()

@@ -39,13 +39,21 @@ impl FocusStageState {
         show_on_desktop: Option<bool>,
         wm_class: Option<String>,
         wait_for_handoff: Option<bool>,
+        run_as_root: bool,
     ) -> Result<StageLaunch, String> {
+        if run_as_root {
+            if !Path::new("/usr/bin/pkexec").is_file() {
+                return Err("未找到 /usr/bin/pkexec，无法以 root 身份启动应用。".into());
+            }
+            let _ = self.ensure_polkit_agent_stage();
+        }
+
         let inferred_kind = infer_stage_kind(&app);
         let kind = kind_opt.unwrap_or(inferred_kind);
         let show = show_on_desktop.unwrap_or(self.display_sink.is_some());
         let wm_class = wm_class.as_deref().map(str::trim).filter(|class| !class.is_empty());
         if is_single_instance(kind) || is_single_instance(inferred_kind) {
-            let existing = self.find_handoff_stage(&app, None, wm_class).map_err(|err| err.to_string())?;
+            let existing = self.find_handoff_stage(&app, None, wm_class, run_as_root).map_err(|err| err.to_string())?;
             if let Some(stage_id) = existing {
                 let stage = &self.stages[&stage_id];
                 if extra_env.iter().any(|(key, value)| stage.launch_env.get(key) != Some(value)) {
@@ -94,6 +102,7 @@ impl FocusStageState {
         stage.launch_token = Some(new_launch_token().map_err(|err| format!("create Stage launch token: {err}"))?);
         stage.launch_env = extra_env;
         stage.launch_cwd = cwd;
+        stage.run_as_root = run_as_root;
 
         if is_single_instance(kind) {
             self.a11y.prepare_for_launch();
@@ -133,18 +142,18 @@ impl FocusStageState {
             }
             return Ok(ControlResponse::Opened { stage_id: None, reused: false });
         };
-        if let Some(stage_id) = self.find_handoff_stage(&app, Some(&id), wm_class.as_deref())? {
+        if let Some(stage_id) = self.find_handoff_stage(&app, Some(&id), wm_class.as_deref(), false)? {
             let (stage_id, _) = self.handoff_to_stage(stage_id, &app, args, None, true, true)?;
             return Ok(ControlResponse::Opened { stage_id: Some(stage_id), reused: true });
         }
         let wm_class = Some(format!("{}{}", crate::desktop::WRAPPER_PREFIX, id));
-        let launch = self.launch_stage(app, args, None, HashMap::new(), None, None, None, None, wm_class, None)
+        let launch = self.launch_stage(app, args, None, HashMap::new(), None, None, None, None, wm_class, None, false)
             .map_err(anyhow::Error::msg)?;
         Ok(ControlResponse::Opened { stage_id: Some(launch.stage_id), reused: false })
     }
 
-    fn find_handoff_stage(&self, app: &str, id: Option<&str>, wm_class: Option<&str>) -> anyhow::Result<Option<String>> {
-        let matching = self.stages.values().filter(|stage| matches_desktop_app(stage, app, id, wm_class));
+    fn find_handoff_stage(&self, app: &str, id: Option<&str>, wm_class: Option<&str>, run_as_root: bool) -> anyhow::Result<Option<String>> {
+        let matching = self.stages.values().filter(|stage| stage.run_as_root == run_as_root && matches_desktop_app(stage, app, id, wm_class));
         let stage = select_handoff_stage(matching)?;
         if stage.is_some_and(|stage| !stage.has_live_surface()) {
             bail!("The matching Stage has no visible surface yet; wait for it to open or close it before retrying");
@@ -230,6 +239,16 @@ impl FocusStageState {
         if let Some(unit) = stage.helper_unit.as_deref() {
             stop_helper_unit(unit);
         }
+        if stage.run_as_root {
+            for window in &stage.windows {
+                match &window.toplevel {
+                    crate::stage::StageToplevel::Wayland(w) => w.send_close(),
+                    crate::stage::StageToplevel::X11(w) => {
+                        let _ = w.close();
+                    }
+                }
+            }
+        }
         terminate_stage_processes(&stage);
         if let Some(ref mut child) = stage.child {
             let _ = child.kill();
@@ -306,7 +325,7 @@ impl FocusStageState {
         while pid > 1 && visited.insert(pid) {
             let token = read_launch_token(pid);
             if let Some(stage) = self.stages.values().find(|stage| {
-                (stage.pid == Some(pid) && (stage.child.is_some() || stage.launch_token.is_none()))
+                (stage.pid == Some(pid) && (stage.child.is_some() || stage.run_as_root || stage.launch_token.is_none()))
                     || (token.is_some() && stage.launch_token == token)
             }) {
                 return Some(stage.id.clone());
@@ -351,7 +370,24 @@ impl FocusStageState {
     }
 
     pub fn ensure_keyring_prompter_stage(&mut self) -> Result<bool, String> {
-        self.ensure_persistent_helper_stage(&KEYRING_PROMPTER_SPEC)
+        if self.display_sink.is_none() {
+            return Ok(false);
+        }
+        if self.keyring_prompter.is_none() {
+            match crate::keyring::KeyringPrompterHandle::spawn(self.polkit_cmd_tx.clone()) {
+                Ok(handle) => {
+                    self.keyring_prompter = Some(handle);
+                }
+                Err(err) => {
+                    warn!("Native Keyring SystemPrompter unavailable ({err}); falling back to XWayland gcr-prompter");
+                    return self.ensure_persistent_helper_stage(&KEYRING_PROMPTER_SPEC);
+                }
+            }
+        }
+        Ok(self
+            .keyring_prompter
+            .as_ref()
+            .is_some_and(|p| p.ensure_registered()))
     }
 
     fn ensure_persistent_helper_stage(&mut self, spec: &PersistentHelperSpec) -> Result<bool, String> {
@@ -723,11 +759,86 @@ fn resolve_launch_executable(app: &str) -> String {
     app.to_string()
 }
 
+fn resolve_focusstage_cli_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("focusstage");
+            if sibling.is_file() {
+                return sibling;
+            }
+        }
+    }
+    PathBuf::from("/usr/local/bin/focusstage")
+}
+
 fn spawn_stage_process(
     wayland_socket: &str,
     stage: &Stage,
     x11_display: Option<u32>,
 ) -> std::io::Result<Child> {
+    if stage.run_as_root {
+        use std::io::Write;
+        let resolved_app = resolve_launch_executable(&stage.app);
+        let mut spec_cmd = stage_command(wayland_socket, stage, &stage.app, &stage.args, x11_display);
+        apply_stage_opener_env(&mut spec_cmd, |key| std::env::var_os(key));
+        spec_cmd
+            .env("FOCUSSTAGE_STAGE_ID", &stage.id)
+            .env(LAUNCH_TOKEN_ENV, stage.launch_token.as_deref().unwrap());
+
+        let effective_args: Vec<String> = spec_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let mut env_map = HashMap::new();
+        for (k, v) in spec_cmd.get_envs() {
+            if let (Some(ks), Some(vs)) = (k.to_str(), v.and_then(|val| val.to_str())) {
+                if !matches!(ks, "WAYLAND_DISPLAY" | "DISPLAY") {
+                    env_map.insert(ks.to_string(), vs.to_string());
+                }
+            }
+        }
+
+        let caller_uid = crate::session_env::current_uid();
+        let caller_runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("/run/user/{caller_uid}"));
+
+        let spec = crate::root_exec::RootExecSpec {
+            caller_uid,
+            caller_runtime_dir,
+            wayland_socket: wayland_socket.to_string(),
+            x11_display,
+            is_chromium_or_electron: is_chromium(stage.kind),
+            cwd: stage.launch_cwd.clone(),
+            env: env_map,
+            app: resolved_app.clone(),
+            args: effective_args.clone(),
+        };
+
+        let focusstage_bin = resolve_focusstage_cli_path();
+        let mut pkexec = Command::new("/usr/bin/pkexec");
+        pkexec
+            .arg("--disable-internal-agent")
+            .arg(&focusstage_bin)
+            .arg("root-exec")
+            .arg("--")
+            .arg(&resolved_app)
+            .args(&effective_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+
+        let mut child = pkexec.spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let payload = serde_json::to_string(&spec).map_err(std::io::Error::other)?;
+            stdin.write_all(payload.as_bytes())?;
+            stdin.write_all(b"\n")?;
+            stdin.flush()?;
+        }
+        return Ok(child);
+    }
+
     let mut cmd = stage_command(wayland_socket, stage, &stage.app, &stage.args, x11_display);
     cmd.stderr(Stdio::inherit());
     spawn_stage_command(&mut cmd, stage)
@@ -872,7 +983,10 @@ fn read_launch_token(pid: u32) -> Option<String> {
 
 fn live_stage_pid(stage: &Stage, pid: u32) -> bool {
     read_process(pid).is_some_and(|(_, live)| live)
-        && (stage.child.is_some() || stage.launch_token.is_none() || read_launch_token(pid) == stage.launch_token)
+        && (stage.child.is_some()
+            || stage.run_as_root
+            || stage.launch_token.is_none()
+            || read_launch_token(pid) == stage.launch_token)
 }
 
 fn representative_pid(pids: &HashSet<u32>) -> Option<u32> {
@@ -1055,7 +1169,7 @@ mod tests {
             "/bin/sh".into(),
             vec!["-c".into(), "sleep 10 & printf '%s\\n' \"$!\" > \"$1\"".into(),
                  "sh".into(), pid_file.to_string_lossy().into_owned()],
-            Some(StageKind::Wayland), HashMap::new(), None, None, None, None, None, None,
+            Some(StageKind::Wayland), HashMap::new(), None, None, None, None, None, None, false,
         ).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while state.stages[&id].child.is_some() && Instant::now() < deadline {

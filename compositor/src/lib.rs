@@ -1,13 +1,17 @@
 pub mod a11y;
+pub mod accounts;
 pub mod clipboard;
 pub mod control;
 pub mod desktop;
 mod dpi;
 pub mod icons;
+pub mod keyring;
 pub mod manager;
 pub mod offscreen;
 pub mod polkit;
 pub mod protocol;
+pub mod proxy;
+pub mod root_exec;
 pub mod router;
 pub mod session_env;
 pub mod sink;

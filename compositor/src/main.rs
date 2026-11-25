@@ -280,6 +280,7 @@ fn main() -> anyhow::Result<()> {
     for id in stage_ids {
         let _ = state.close_stage(&id);
     }
+    state.clear_host_proxy();
     let _ = std::fs::remove_file(&control_socket);
     info!("focusstaged shut down cleanly");
     Ok(())
@@ -297,6 +298,8 @@ fn dispatch_sink_events(state: &mut FocusStageState) -> bool {
             SinkInputEvent::Disconnected => {
                 warn!("Native Windows host disconnected; existing stages remain available offscreen");
                 state.send_polkit_reply(focusstage_compositor::polkit::PolkitHostReply::HostDisconnected);
+                state.send_keyring_reply(focusstage_compositor::polkit::PolkitHostReply::HostDisconnected);
+                state.clear_host_proxy();
                 state.display_sink = None;
             }
             SinkInputEvent::PointerLeave { window_id } => {
@@ -358,15 +361,42 @@ fn dispatch_sink_events(state: &mut FocusStageState) -> bool {
                 user,
                 response,
             } => {
-                state.send_polkit_reply(focusstage_compositor::polkit::PolkitHostReply::Submit {
-                    cookie,
+                let reply = focusstage_compositor::polkit::PolkitHostReply::Submit {
+                    cookie: cookie.clone(),
                     user,
                     response,
-                });
+                };
+                if cookie.starts_with("keyring-") {
+                    state.send_keyring_reply(reply);
+                } else {
+                    state.send_polkit_reply(reply);
+                }
             }
             SinkInputEvent::AuthCancel { cookie } => {
-                state.send_polkit_reply(focusstage_compositor::polkit::PolkitHostReply::Cancel {
-                    cookie,
+                let reply = focusstage_compositor::polkit::PolkitHostReply::Cancel {
+                    cookie: cookie.clone(),
+                };
+                if cookie.starts_with("keyring-") {
+                    state.send_keyring_reply(reply);
+                } else {
+                    state.send_polkit_reply(reply);
+                }
+            }
+            SinkInputEvent::HostProxyChanged {
+                enabled,
+                bridge_port,
+                http_proxy,
+                https_proxy,
+                all_proxy,
+                no_proxy,
+            } => {
+                state.apply_host_proxy(focusstage_compositor::proxy::HostProxyConfig {
+                    enabled,
+                    bridge_port,
+                    http_proxy,
+                    https_proxy,
+                    all_proxy,
+                    no_proxy,
                 });
             }
         }

@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.Drawing;
-using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -33,15 +32,6 @@ internal sealed class LauncherForm : Form
     private List<StageDto> _stages = new();
     private bool _daemonAlive;
 
-    private const uint AsfwAny = 0xFFFFFFFF;
-
-    [DllImport("user32.dll")]
-    private static extern bool AllowSetForegroundWindow(uint dwProcessId);
-
-    private CancellationTokenSource? _launcherSession;
-    private UbuntuSessionAuthorization? _ubuntuAuthorization;
-    private bool _sessionUnlocked;
-    private bool _authenticating;
     private bool _webViewReady;
     private bool _appsLoaded;
     private bool _loadingApps;
@@ -121,7 +111,14 @@ internal sealed class LauncherForm : Form
             _stages = _ctx.CurrentStages;
             _layout = LauncherLayout.LoadExistingReadOnly();
             await InitializeWebViewAsync();
-            _ = RefreshAppsAsync(forceRender: true);
+            if (!_ctx.DaemonAlive)
+            {
+                _ = StartDaemonAndRefreshAppsAsync();
+            }
+            else
+            {
+                _ = RefreshAppsAsync(forceRender: true);
+            }
             _autoDiscoverTimer.Start();
         };
 
@@ -148,154 +145,12 @@ internal sealed class LauncherForm : Form
         }
     }
 
-    protected override void OnVisibleChanged(EventArgs e)
-    {
-        if (Visible)
-        {
-            _launcherSession ??= new CancellationTokenSource();
-        }
-        else
-        {
-            EndLauncherSession();
-        }
-        base.OnVisibleChanged(e);
-        if (_webViewReady)
-        {
-            PushEvent("session", BuildSessionPayload());
-        }
-    }
-
-    private void EndLauncherSession()
-    {
-        var session = _launcherSession;
-        _launcherSession = null;
-        _sessionUnlocked = false;
-        _authenticating = false;
-        session?.Cancel();
-        _ubuntuAuthorization?.Dispose();
-        _ubuntuAuthorization = null;
-        session?.Dispose();
-    }
-
-    private object BuildSessionPayload(string? message = null) => new
-    {
-        visible = Visible,
-        unlocked = _sessionUnlocked,
-        message,
-    };
-
-    private async Task<object> UnlockLauncherAsync(bool useLinuxPassword)
-    {
-        if (_launcherSession is not { } session || !Visible || _sessionUnlocked || _authenticating)
-        {
-            return BuildSessionPayload();
-        }
-
-        _authenticating = true;
-        var cancellation = session.Token;
-        try
-        {
-            var uid = await UbuntuSessionAuthorization.GetDefaultUserIdAsync(_distro, cancellation);
-            var result = useLinuxPassword
-                ? LauncherAuthResult.HelloUnavailable
-                : await LauncherAuthentication.VerifyHelloAsync(Handle, cancellation);
-            if (result == LauncherAuthResult.HelloUnavailable)
-            {
-                if (uid != 0 && !_ctx.DaemonAlive)
-                {
-                    await _ctx.StartDaemonAsync();
-                }
-                AllowSetForegroundWindow(AsfwAny);
-                result = await LauncherAuthentication.VerifyLinuxAsync(_distro, uid, cancellation);
-            }
-
-            if (_launcherSession != session || !Visible)
-            {
-                return BuildSessionPayload();
-            }
-            if (result == LauncherAuthResult.Verified)
-            {
-                UbuntuSessionAuthorization? authorization = null;
-                string? notice = null;
-                try
-                {
-                    authorization = await UbuntuSessionAuthorization.OpenAsync(_distro, uid, cancellation);
-                }
-                catch (InvalidOperationException)
-                {
-                    notice = "已解锁。Ubuntu 提权将按系统设置单独验证。";
-                }
-                catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
-                {
-                    notice = "已解锁。Ubuntu 提权将按系统设置单独验证。";
-                }
-
-                if (_launcherSession != session || !Visible)
-                {
-                    authorization?.Dispose();
-                    return BuildSessionPayload();
-                }
-                _ubuntuAuthorization = authorization;
-                _sessionUnlocked = true;
-                if (authorization is not null)
-                {
-                    _ = WatchUbuntuAuthorizationAsync(authorization, cancellation);
-                }
-                if (!_ctx.DaemonAlive)
-                {
-                    _ = StartDaemonAndRefreshAppsAsync();
-                }
-                return BuildSessionPayload(notice);
-            }
-            return BuildSessionPayload(result switch
-            {
-                LauncherAuthResult.Canceled => "验证已取消。请选择一种方式重试。",
-                LauncherAuthResult.LinuxUnavailable => "无法打开 Linux 认证窗口。请检查 Polkit 认证代理是否可用，或使用 Windows Hello。",
-                LauncherAuthResult.LinuxAccountUnavailable => "没有可用的 Ubuntu 密码验证账号。请使用 Windows Hello。",
-                _ => null,
-            });
-        }
-        catch (OperationCanceledException)
-        {
-            return BuildSessionPayload(cancellation.IsCancellationRequested ? null : "Ubuntu 授权超时，请重试。");
-        }
-        catch (InvalidOperationException ex)
-        {
-            return BuildSessionPayload(ex.Message);
-        }
-        finally
-        {
-            if (_launcherSession == session)
-            {
-                _authenticating = false;
-            }
-        }
-    }
-
     private async Task StartDaemonAndRefreshAppsAsync()
     {
         await _ctx.StartDaemonAsync();
         if (Visible && !_loadingApps)
         {
             await RefreshAppsAsync(forceRender: false);
-        }
-    }
-
-    private async Task WatchUbuntuAuthorizationAsync(UbuntuSessionAuthorization authorization, CancellationToken cancellation)
-    {
-        try
-        {
-            await authorization.WaitForEndAsync(cancellation);
-        }
-        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
-        {
-            return;
-        }
-        if (_ubuntuAuthorization == authorization)
-        {
-            _ubuntuAuthorization = null;
-            authorization.Dispose();
-            PushEvent("session", BuildSessionPayload("Ubuntu 提权授权已结束。重新打开启动器可再次启用。"));
         }
     }
 
@@ -481,22 +336,12 @@ internal sealed class LauncherForm : Form
                    ?? new List<LauncherDockItem>();
         }
 
-        if (method is not ("app.init" or "session.unlock" or "window.drag" or "window.minimize"
-            or "window.toggleMaximize" or "window.hide") && (!_sessionUnlocked || !Visible))
-        {
-            throw new InvalidOperationException("请先验证身份。");
-        }
-
         switch (method)
         {
-            case "session.unlock":
-                return await UnlockLauncherAsync(Bool("linuxPassword"));
-
             case "app.init":
                 return new
                 {
                     distro = _distro,
-                    session = BuildSessionPayload(),
                     daemonAlive = _daemonAlive,
                     stages = BuildStagePayloads(_stages),
                     apps = BuildAppPayloads(_apps),
@@ -563,18 +408,51 @@ internal sealed class LauncherForm : Form
                     return new { ok, message = msg, installedDeb = true };
                 }
 
-                var args = LaunchCommandLine.ForStage(app.Cmd, app.Args, app.WmClass);
+                var asRoot = Bool("asRoot", false);
+                if (asRoot && !_ctx.DaemonAlive)
+                {
+                    await _ctx.StartDaemonAsync();
+                }
+
+                var args = LaunchCommandLine.ForStage(app.Cmd, app.Args, app.WmClass, asRoot);
                 var (launchOk, launchMsg) = await _ctx.RunControlWithFeedbackAsync(args);
-                return new { ok = launchOk, message = launchOk ? $"已启动 {app.DisplayName}" : launchMsg };
+                return new
+                {
+                    ok = launchOk,
+                    message = launchOk
+                        ? (asRoot ? $"已发起以 root 启动 {app.DisplayName}" : $"已启动 {app.DisplayName}")
+                        : launchMsg
+                };
             }
 
             case "app.launchCustom":
             {
                 var commandLine = Str("commandLine");
+                var asRoot = Bool("asRoot", false);
                 var parsed = LaunchCommandLine.Parse(commandLine);
-                var stageArgs = LaunchCommandLine.ForStage(parsed[0], parsed[1..]);
+                if (asRoot && !_ctx.DaemonAlive)
+                {
+                    await _ctx.StartDaemonAsync();
+                }
+                var stageArgs = LaunchCommandLine.ForStage(parsed[0], parsed[1..], asRoot: asRoot);
                 var (ok, msg) = await _ctx.RunControlWithFeedbackAsync(stageArgs);
-                return new { ok, message = ok ? $"已启动 {parsed[0]}" : msg };
+                return new
+                {
+                    ok,
+                    message = ok
+                        ? (asRoot ? $"已发起以 root 启动 {parsed[0]}" : $"已启动 {parsed[0]}")
+                        : msg
+                };
+            }
+
+            case "app.openRootTerminal":
+            {
+                if (!_ctx.DaemonAlive)
+                {
+                    await _ctx.StartDaemonAsync();
+                }
+                var (ok, msg) = await _ctx.RunControlWithFeedbackAsync("root-terminal");
+                return new { ok, message = ok ? "请在授权窗口中确认后打开 Root 终端" : msg };
             }
 
             case "app.openAppCenter":
@@ -851,6 +729,119 @@ internal sealed class LauncherForm : Form
             case "linuxSettings.syncHandlers":
                 return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("sync-handlers"));
 
+            case "accounts.get":
+                return await AccountService.GetViewAsync(_distro);
+
+            case "accounts.setAutoHelloKeyring":
+            {
+                var enabled = Bool("enabled", true);
+                CredentialVault.SetAutoHelloForKeyring(enabled);
+                return new { ok = true, autoHelloForKeyring = enabled };
+            }
+
+            case "accounts.bindCredential":
+                return await AccountService.BindCredentialAsync(
+                    Handle,
+                    _distro,
+                    Str("username"),
+                    Str("linuxPassword"),
+                    Bool("updateLinux", true),
+                    Bool("keyringUsesLinux", true),
+                    Str("keyringPassword"),
+                    Bool("updateKeyring", false),
+                    Bool("verifyBeforeSave", true));
+
+            case "accounts.testCredential":
+                return await AccountService.TestStoredCredentialAsync(Handle, _distro, Str("username"));
+
+            case "accounts.clearCredential":
+                return await AccountService.ClearCredentialAsync(_distro, Str("username"));
+
+            case "accounts.create":
+            {
+                var username = Str("username");
+                var fullName = Str("fullName");
+                var password = Str("password");
+                var isAdmin = Bool("isAdmin", false);
+                var syncHello = Bool("syncHello", true);
+                var actionJson = JsonSerializer.Serialize(new
+                {
+                    action = "create_user",
+                    username,
+                    full_name = fullName,
+                    password,
+                    is_admin = isAdmin,
+                });
+                return await AccountService.ApplyAccountActionAsync(
+                    _ctx, Handle, _distro, actionJson, syncHello, username, password, isAdmin);
+            }
+
+            case "accounts.setPassword":
+            {
+                var username = Str("username");
+                var password = Str("password");
+                var syncHello = Bool("syncHello", true);
+                var actionJson = JsonSerializer.Serialize(new
+                {
+                    action = "set_password",
+                    username,
+                    password,
+                });
+                return await AccountService.ApplyAccountActionAsync(
+                    _ctx, Handle, _distro, actionJson, syncHello, username, password);
+            }
+
+            case "accounts.setAdmin":
+            {
+                var username = Str("username");
+                var isAdmin = Bool("isAdmin", false);
+                var actionJson = JsonSerializer.Serialize(new
+                {
+                    action = "set_admin",
+                    username,
+                    is_admin = isAdmin,
+                });
+                return await AccountService.ApplyAccountActionAsync(
+                    _ctx, Handle, _distro, actionJson, false, null, null);
+            }
+
+            case "accounts.setDefaultWsl":
+            {
+                var username = Str("username");
+                var actionJson = JsonSerializer.Serialize(new
+                {
+                    action = "set_default_wsl_user",
+                    username,
+                });
+                return await AccountService.ApplyAccountActionAsync(
+                    _ctx, Handle, _distro, actionJson, false, null, null);
+            }
+
+            case "accounts.delete":
+            {
+                var username = Str("username");
+                var removeHome = Bool("removeHome", false);
+                var actionJson = JsonSerializer.Serialize(new
+                {
+                    action = "delete_user",
+                    username,
+                    remove_home = removeHome,
+                });
+                var res = await AccountService.ApplyAccountActionAsync(
+                    _ctx, Handle, _distro, actionJson, false, null, null);
+                CredentialVault.DeleteCredential(_distro, username);
+                return res;
+            }
+
+            case "keyring.unlockHello":
+                return await AccountService.UnlockKeyringWithHelloAsync(Handle, _distro, Str("username"));
+
+            case "keyring.unlockPassword":
+                return await AccountService.UnlockKeyringWithPasswordAsync(_distro, Str("password"));
+
+            case "keyring.lock":
+                return await AccountService.LockKeyringAsync(_distro);
+
             default:
                 throw new InvalidOperationException($"Unknown RPC method: {method}");
         }
@@ -957,7 +948,7 @@ internal sealed class LauncherForm : Form
         var head = $"{daemonAlive}:{startup}:{clip}:{hotkey}:{stages.Count}";
         if (stages.Count == 0) return head;
         var body = string.Join("|", stages.Select(s =>
-            $"{s.StageId}:{s.App}:{s.Title}:{s.Display}:{s.Kind}:{s.Pid}:{s.InputOwner.Type}:{s.InputOwner.AgentName}:{s.InputOwner.LeaseId}:{s.HasSurface}:{(s.Size is { Length: >= 2 } ? $"{s.Size[0]}x{s.Size[1]}" : "")}:{s.Scale:F2}"));
+            $"{s.StageId}:{s.App}:{s.Title}:{s.Display}:{s.Kind}:{s.Pid}:{s.RunAsRoot}:{s.InputOwner.Type}:{s.InputOwner.AgentName}:{s.InputOwner.LeaseId}:{s.HasSurface}:{(s.Size is { Length: >= 2 } ? $"{s.Size[0]}x{s.Size[1]}" : "")}:{s.Scale:F2}"));
         return head + "|" + body;
     }
 
@@ -1023,7 +1014,8 @@ internal sealed class LauncherForm : Form
             frameSeq = s.FrameSeq,
             hasSurface = s.HasSurface,
             scale = s.Scale,
-            wmClass = s.WmClass
+            wmClass = s.WmClass,
+            runAsRoot = s.RunAsRoot
         }).ToArray();
 
     private static object BuildLinuxSettingsPayload(LinuxDesktopSettings s) => new
@@ -1149,7 +1141,6 @@ internal sealed class LauncherForm : Form
     {
         if (disposing)
         {
-            EndLauncherSession();
             _autoDiscoverTimer.Stop();
             _autoDiscoverTimer.Dispose();
             _debounceTimer.Stop();

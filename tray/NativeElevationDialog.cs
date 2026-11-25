@@ -8,6 +8,7 @@ namespace FocusStageTray;
 
 internal sealed record AuthBeginRequest(
     string Cookie,
+    string? Distro,
     string ActionId,
     string Message,
     string? IconPng,
@@ -230,6 +231,7 @@ internal sealed class NativeElevationDialog : Form
     private readonly Action _onClosed;
 
     private readonly ThemePalette _palette;
+    private readonly string _distro;
     private readonly string _actionId;
     private readonly string _message;
     private readonly string? _programName;
@@ -252,6 +254,10 @@ internal sealed class NativeElevationDialog : Form
     private bool _suppressCancel;
     private bool _hasSubmittedOrCanceled;
     private bool _positioned;
+    private bool _hasStoredCredential;
+    private bool _helloAvailable;
+    private bool _helloCheckDone;
+    private bool _autoHelloTriggered;
 
     private readonly TextBox _inputBox;
     private readonly System.Windows.Forms.Timer _shakeTimer;
@@ -267,6 +273,7 @@ internal sealed class NativeElevationDialog : Form
     private Rectangle _detailsBodyRect;
     private Rectangle _inputFrameRect;
     private Rectangle _eyeBtnRect;
+    private Rectangle _helloBtnRect;
     private Rectangle _cancelBtnRect;
     private Rectangle _submitBtnRect;
     private Rectangle _headerDragRect;
@@ -281,6 +288,7 @@ internal sealed class NativeElevationDialog : Form
         UserPill,
         DetailsToggle,
         Eye,
+        Hello,
         Cancel,
         Submit,
     }
@@ -317,9 +325,12 @@ internal sealed class NativeElevationDialog : Form
         _onClosed = onClosed;
 
         _palette = BuildPalette();
+        _distro = string.IsNullOrWhiteSpace(request.Distro) ? "Ubuntu" : request.Distro.Trim();
         _actionId = request.ActionId;
         _message = string.IsNullOrWhiteSpace(request.Message)
-            ? "此操作需要验证您的 Linux 用户密码以继续。"
+            ? (IsKeyringUnlock
+                ? "有应用请求访问 GNOME 密钥环，请输入密码以解锁。"
+                : "此操作需要验证您的 Linux 用户密码以继续。")
             : request.Message.Trim();
         _programName = request.ProgramName;
         _commandLine = request.CommandLine;
@@ -327,6 +338,7 @@ internal sealed class NativeElevationDialog : Form
         _selectedUser = string.IsNullOrWhiteSpace(request.User) ? _users[0] : request.User;
         _promptLabel = FormatPromptLabel(request.Prompt, request.EchoOn);
         _echoOn = request.EchoOn;
+        _hasStoredCredential = HasPasswordInput && CredentialVault.HasSecret(_distro, _selectedUser, forKeyring: IsKeyringUnlock);
         SetBanner(request.Error, request.Info);
 
         _appIconBitmap = DecodePngBitmap(request.IconPng);
@@ -336,9 +348,13 @@ internal sealed class NativeElevationDialog : Form
             _windowIcon = Icon.FromHandle(_windowHicon);
         }
 
-        Text = _actionId == "io.focusstage.launcher.verify"
-            ? "FocusStage 身份验证"
-            : "FocusStage 权限验证";
+        Text = _actionId switch
+        {
+            "org.gnome.keyring.unlock" => "FocusStage 密钥环解锁",
+            "org.gnome.keyring.confirm" => "FocusStage 安全确认",
+            "io.focusstage.launcher.verify" => "FocusStage 身份验证",
+            _ => "FocusStage 权限验证",
+        };
         Icon = _windowIcon;
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
@@ -357,6 +373,7 @@ internal sealed class NativeElevationDialog : Form
             ForeColor = _palette.Ink,
             UseSystemPasswordChar = !_echoOn,
             ShortcutsEnabled = true,
+            Visible = HasPasswordInput,
             TabIndex = 0,
         };
         _inputBox.GotFocus += (_, _) =>
@@ -430,8 +447,34 @@ internal sealed class NativeElevationDialog : Form
         BringToFront();
         SetForegroundWindow(Handle);
         Activate();
-        _inputBox.Focus();
-        _inputBox.SelectAll();
+        if (HasPasswordInput)
+        {
+            _inputBox.Focus();
+            _inputBox.SelectAll();
+        }
+        _ = CheckAndMaybeAutoHelloAsync();
+    }
+
+    private async Task CheckAndMaybeAutoHelloAsync()
+    {
+        var status = await CredentialVault.GetHelloStatusAsync();
+        if (IsDisposed || _hasSubmittedOrCanceled) return;
+        _helloAvailable = status.Available;
+        _helloCheckDone = true;
+        RecalculateLayout(recenter: false);
+        Invalidate();
+
+        if (IsKeyringUnlock
+            && _hasStoredCredential
+            && _helloAvailable
+            && !_autoHelloTriggered
+            && !_verifying
+            && string.IsNullOrEmpty(_bannerMessage)
+            && CredentialVault.IsAutoHelloForKeyringEnabled())
+        {
+            _autoHelloTriggered = true;
+            await TriggerWindowsHelloAsync();
+        }
     }
 
     public void ApplyPrompt(AuthPromptRequest request)
@@ -629,8 +672,14 @@ internal sealed class NativeElevationDialog : Form
                         }
                     }
                     _selectedUser = _users[idx];
-                    Invalidate(_userPillRect);
+                    _hasStoredCredential = HasPasswordInput
+                        && CredentialVault.HasSecret(_distro, _selectedUser, forKeyring: IsKeyringUnlock);
+                    RecalculateLayout(recenter: false);
+                    Invalidate();
                 }
+                break;
+            case HitZone.Hello:
+                _ = TriggerWindowsHelloAsync();
                 break;
         }
     }
@@ -640,10 +689,55 @@ internal sealed class NativeElevationDialog : Form
         if (_closeBtnRect.Contains(pt)) return HitZone.Close;
         if (_cancelBtnRect.Contains(pt)) return HitZone.Cancel;
         if (_submitBtnRect.Contains(pt) && !_verifying) return HitZone.Submit;
-        if (!_echoOn && _eyeBtnRect.Contains(pt)) return HitZone.Eye;
+        if (!_helloBtnRect.IsEmpty && _helloBtnRect.Contains(pt) && !_verifying) return HitZone.Hello;
+        if (HasPasswordInput && !_echoOn && _eyeBtnRect.Contains(pt)) return HitZone.Eye;
         if (!_detailsToggleRect.IsEmpty && _detailsToggleRect.Contains(pt)) return HitZone.DetailsToggle;
         if (_users.Count > 1 && _userPillRect.Contains(pt)) return HitZone.UserPill;
         return HitZone.None;
+    }
+
+    private async Task TriggerWindowsHelloAsync()
+    {
+        if (_verifying || _hasSubmittedOrCanceled || !HasPasswordInput) return;
+        _verifying = true;
+        _bannerMessage = null;
+        _bannerIsError = false;
+        _inputBox.Enabled = false;
+        RecalculateLayout(recenter: false);
+        Invalidate();
+
+        string reason = IsKeyringUnlock
+            ? $"验证 Windows Hello 以自动解锁 “{_selectedUser}” 的 GNOME 密钥环"
+            : $"验证 Windows Hello 以使用 “{_selectedUser}” 授权 Linux 操作";
+
+        var (verify, secret) = await CredentialVault.RetrieveSecretWithHelloAsync(
+            Handle,
+            _distro,
+            _selectedUser,
+            forKeyring: IsKeyringUnlock,
+            reason);
+
+        if (IsDisposed || _hasSubmittedOrCanceled) return;
+
+        if (verify.Status == HelloVerifyStatus.Verified && secret is not null)
+        {
+            _onSubmit(_selectedUser, secret);
+            return;
+        }
+
+        _verifying = false;
+        _inputBox.Enabled = true;
+        SetBanner(
+            verify.Status == HelloVerifyStatus.Error ? verify.Message : null,
+            verify.Status is HelloVerifyStatus.Canceled or HelloVerifyStatus.Unavailable
+                ? (verify.Message ?? "Windows Hello 未完成，可手动输入密码。")
+                : null);
+        RecalculateLayout(recenter: false);
+        Invalidate();
+        if (HasPasswordInput)
+        {
+            _inputBox.Focus();
+        }
     }
 
     private void TriggerSubmit()
@@ -728,6 +822,12 @@ internal sealed class NativeElevationDialog : Form
             _bannerIsError = false;
         }
     }
+
+    private bool IsKeyringUnlock => _actionId == "org.gnome.keyring.unlock";
+    private bool IsKeyringConfirm => _actionId == "org.gnome.keyring.confirm";
+    private bool HasPasswordInput => !IsKeyringConfirm;
+    private bool CanShowHelloButton =>
+        HasPasswordInput && _hasStoredCredential && (!_helloCheckDone || _helloAvailable);
 
     private bool HasDetails =>
         !string.IsNullOrWhiteSpace(_actionId)
@@ -845,34 +945,44 @@ internal sealed class NativeElevationDialog : Form
             : Rectangle.Empty;
         y += _contextCardRect.Height + S(16);
 
-        // Prompt label
-        _yPromptTop = y;
-        y += S(20) + S(6);
-
-        // Input box
-        int inputH = S(40);
-        _inputFrameRect = new Rectangle(padX, y, contentW, inputH);
-        int eyeW = _echoOn ? 0 : S(34);
-        _eyeBtnRect = _echoOn
-            ? Rectangle.Empty
-            : new Rectangle(_inputFrameRect.Right - S(36), y + S(3), S(32), inputH - S(6));
-
-        int textLeft = _inputFrameRect.Left + S(38);
-        int textRight = _inputFrameRect.Right - S(10) - eyeW;
-        int textH = _inputBox.PreferredHeight;
-        int textTop = y + Math.Max(S(4), (inputH - textH) / 2);
-        _inputBox.SetBounds(textLeft, textTop, Math.Max(S(80), textRight - textLeft), textH);
-        y += inputH;
-
-        // Caps Lock warning
-        if (_capsLockOn && !_echoOn)
+        if (HasPasswordInput)
         {
-            y += S(8);
-            _yCapsTop = y;
-            y += S(24);
+            // Prompt label
+            _yPromptTop = y;
+            y += S(20) + S(6);
+
+            // Input box
+            int inputH = S(40);
+            _inputFrameRect = new Rectangle(padX, y, contentW, inputH);
+            int eyeW = _echoOn ? 0 : S(34);
+            _eyeBtnRect = _echoOn
+                ? Rectangle.Empty
+                : new Rectangle(_inputFrameRect.Right - S(36), y + S(3), S(32), inputH - S(6));
+
+            int textLeft = _inputFrameRect.Left + S(38);
+            int textRight = _inputFrameRect.Right - S(10) - eyeW;
+            int textH = _inputBox.PreferredHeight;
+            int textTop = y + Math.Max(S(4), (inputH - textH) / 2);
+            _inputBox.SetBounds(textLeft, textTop, Math.Max(S(80), textRight - textLeft), textH);
+            y += inputH;
+
+            // Caps Lock warning
+            if (_capsLockOn && !_echoOn)
+            {
+                y += S(8);
+                _yCapsTop = y;
+                y += S(24);
+            }
+            else
+            {
+                _yCapsTop = 0;
+            }
         }
         else
         {
+            _yPromptTop = 0;
+            _inputFrameRect = Rectangle.Empty;
+            _eyeBtnRect = Rectangle.Empty;
             _yCapsTop = 0;
         }
 
@@ -906,6 +1016,9 @@ internal sealed class NativeElevationDialog : Form
         int gap = S(10);
         _submitBtnRect = new Rectangle(width - padX - submitW, y, submitW, btnH);
         _cancelBtnRect = new Rectangle(_submitBtnRect.Left - gap - cancelW, y, cancelW, btnH);
+        _helloBtnRect = CanShowHelloButton
+            ? new Rectangle(padX, y, S(148), btnH)
+            : Rectangle.Empty;
         int totalH = y + btnH + S(22);
 
         Size = new Size(width, totalH);
@@ -960,12 +1073,22 @@ internal sealed class NativeElevationDialog : Form
         var badgeRect = new Rectangle(padX, _yBadgeTop, S(46), S(46));
         PaintBadge(g, badgeRect);
 
-        string titleText = _actionId == "io.focusstage.launcher.verify"
-            ? "验证身份以解锁"
-            : "需要管理员权限";
-        string subText = _actionId == "io.focusstage.launcher.verify"
-            ? "FocusStage 启动器安全验证"
-            : "Linux 提权认证 · FocusStage";
+        string titleText = _actionId switch
+        {
+            "org.gnome.keyring.unlock" => "解锁 GNOME 密钥环",
+            "org.gnome.keyring.confirm" => "确认安全操作",
+            "io.focusstage.launcher.verify" => "验证身份以解锁",
+            _ => "需要管理员权限",
+        };
+        string subText = _actionId switch
+        {
+            "org.gnome.keyring.unlock" or "org.gnome.keyring.confirm" => "GNOME Keyring · FocusStage",
+            "io.focusstage.launcher.verify" => "FocusStage 启动器安全验证",
+            _ => "Linux 提权认证 · FocusStage",
+        };
+        string submitLabel = _verifying
+            ? "验证中…"
+            : (IsKeyringUnlock ? "解锁" : (IsKeyringConfirm ? "继续" : "授权"));
 
         int titleX = badgeRect.Right + S(14);
         int titleW = _closeBtnRect.Left - titleX - S(8);
@@ -1003,25 +1126,26 @@ internal sealed class NativeElevationDialog : Form
         // Context card (User + Details)
         PaintContextCard(g);
 
-        // Prompt label
-        using (var labelFont = MakeFont(9.5f, FontStyle.Bold))
+        // Prompt label & Input container
+        if (HasPasswordInput)
         {
-            TextRenderer.DrawText(
-                g,
-                _promptLabel,
-                labelFont,
-                new Rectangle(padX, _yPromptTop, Width - padX * 2, S(20)),
-                _palette.Ink,
-                TextFormatFlags.Left | TextFormatFlags.NoPadding);
-        }
+            using (var labelFont = MakeFont(9.5f, FontStyle.Bold))
+            {
+                TextRenderer.DrawText(
+                    g,
+                    _promptLabel,
+                    labelFont,
+                    new Rectangle(padX, _yPromptTop, Width - padX * 2, S(20)),
+                    _palette.Ink,
+                    TextFormatFlags.Left | TextFormatFlags.NoPadding);
+            }
 
-        // Input container
-        PaintInputContainer(g);
+            PaintInputContainer(g);
 
-        // Caps Lock hint
-        if (_capsLockOn && !_echoOn && _yCapsTop > 0)
-        {
-            PaintCapsLockHint(g, padX, _yCapsTop);
+            if (_capsLockOn && !_echoOn && _yCapsTop > 0)
+            {
+                PaintCapsLockHint(g, padX, _yCapsTop);
+            }
         }
 
         // Error / Info banner
@@ -1031,6 +1155,15 @@ internal sealed class NativeElevationDialog : Form
         }
 
         // Footer buttons
+        if (!_helloBtnRect.IsEmpty)
+        {
+            PaintHelloButton(
+                g,
+                _helloBtnRect,
+                hovered: _hoverZone == HitZone.Hello,
+                pressed: _pressedZone == HitZone.Hello,
+                disabled: _verifying);
+        }
         PaintButton(
             g,
             _cancelBtnRect,
@@ -1042,7 +1175,7 @@ internal sealed class NativeElevationDialog : Form
         PaintButton(
             g,
             _submitBtnRect,
-            _verifying ? "验证中…" : "授权",
+            submitLabel,
             primary: true,
             hovered: _hoverZone == HitZone.Submit,
             pressed: _pressedZone == HitZone.Submit,
@@ -1437,6 +1570,35 @@ internal sealed class NativeElevationDialog : Form
         TextRenderer.DrawText(
             g,
             label,
+            font,
+            rect,
+            fgColor,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+    }
+
+    private void PaintHelloButton(Graphics g, Rectangle rect, bool hovered, bool pressed, bool disabled)
+    {
+        Color bgColor = disabled
+            ? _palette.Subtle
+            : (pressed ? Blend(_palette.AccentSoft, _palette.Accent, 0.20f)
+                : (hovered ? Blend(_palette.AccentSoft, _palette.Accent, 0.10f) : _palette.AccentSoft));
+        Color borderColor = disabled
+            ? _palette.Border
+            : Color.FromArgb(95, _palette.Accent);
+        Color fgColor = disabled ? _palette.InkMuted : _palette.Accent;
+
+        using (var bg = new SolidBrush(bgColor))
+        using (var border = new Pen(borderColor, 1f))
+        using (var path = RoundedRect(rect, Sf(8)))
+        {
+            g.FillPath(bg, path);
+            g.DrawPath(border, path);
+        }
+
+        using var font = MakeFont(9.25f, FontStyle.Bold);
+        TextRenderer.DrawText(
+            g,
+            "Windows Hello 验证",
             font,
             rect,
             fgColor,

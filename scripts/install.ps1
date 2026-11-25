@@ -130,16 +130,19 @@ if (-not $SkipRustBuild) {
 }
 
 Write-Host "[3/5] Installing WSL binaries and desktop helpers..." -ForegroundColor Cyan
-$desktopPackages = 'python3 pkexec gnome-keyring xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland xdg-utils desktop-file-utils'
+$desktopPackages = 'python3 pkexec gnome-keyring xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland xdg-utils desktop-file-utils iproute2 libcap2-bin'
 $installCmd = @(
+    "install -d -m 755 /usr/local/libexec",
     "install -m 755 '$WslRepo/target/release/focusstaged' /usr/local/bin/focusstaged",
     "install -m 755 '$WslRepo/target/release/focusstage' /usr/local/bin/focusstage",
+    "install -m 755 '$WslRepo/target/release/focusstage-tun' /usr/local/libexec/focusstage-tun",
     "sed 's/\r`$//' '$WslRepo/scripts/focusstage-launch' > /usr/local/bin/focusstage-launch",
     "chmod 755 /usr/local/bin/focusstage-launch",
     "sed 's/\r`$//' '$WslRepo/scripts/focusstage-open' > /usr/local/bin/focusstage-open",
     "chmod 755 /usr/local/bin/focusstage-open",
     "if command -v apt-get >/dev/null 2>&1 && ! dpkg -s $desktopPackages >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-upgrade $desktopPackages && fc-cache -f >/dev/null 2>&1; fi",
-    "/usr/bin/python3 -I '$WslRepo/scripts/focusstage-auth' setup $WslUid",
+    "setcap cap_net_admin,cap_dac_override=ep /usr/local/libexec/focusstage-tun",
+    "if test -f /usr/local/libexec/focusstage-auth; then /usr/bin/python3 -I /usr/local/libexec/focusstage-auth remove; fi",
     "/usr/local/bin/focusstage --json sync-apps --uid $WslUid >/dev/null"
 ) -join " && "
 wsl.exe -d $Distro -u root -e bash -lc $installCmd

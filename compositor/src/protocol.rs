@@ -65,6 +65,8 @@ pub struct StageInfo {
     pub scale: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wm_class: Option<String>,
+    #[serde(default)]
+    pub run_as_root: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +219,8 @@ pub enum ControlRequest {
         launch_image: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         launch_wait_for_update: Option<bool>,
+        #[serde(default)]
+        run_as_root: bool,
     },
     OpenUri {
         uri: String,

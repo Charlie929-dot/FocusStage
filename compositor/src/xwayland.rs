@@ -419,6 +419,15 @@ impl FocusStageState {
                                     stage.x11_display_number = Some(display_number);
                                     stage.xwm_id = Some(xwm_id);
                                 }
+                                if state.stages.get(&sid_for_cb).is_some_and(|s| s.run_as_root) {
+                                    let _ = std::process::Command::new("xhost")
+                                        .arg("+SI:localuser:root")
+                                        .env("DISPLAY", format!(":{display_number}"))
+                                        .stdin(Stdio::null())
+                                        .stdout(Stdio::null())
+                                        .stderr(Stdio::null())
+                                        .status();
+                                }
                                 state.launch_pending_x11_client(&sid_for_cb, display_number);
                                 return;
                             }

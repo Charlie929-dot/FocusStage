@@ -42,6 +42,7 @@ const LEGACY_AGENT_PROCS: &[&str] = &[
 pub enum PolkitHostCommand {
     Begin {
         cookie: String,
+        distro: Option<String>,
         action_id: String,
         message: String,
         icon_png: Option<String>,
@@ -1037,16 +1038,13 @@ fn handle_begin_auth(
     }
 
     let current_user = users[0].clone();
-    let program_name = details
-        .get("program")
-        .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
-        .map(str::to_string)
-        .filter(|s| !s.is_empty());
-    let command_line = details
+    let raw_command_line = details
         .get("command_line")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let icon_png = resolve_auth_icon_png(&action_id, &icon_name, &details);
+    let (program_name, command_line, icon_details, effective_message) =
+        normalize_focusstage_elevation_display(&details, raw_command_line.as_deref(), &message);
+    let icon_png = resolve_auth_icon_png(&action_id, &icon_name, &icon_details);
 
     let attempt = 1u64;
     let helper = match HelperProcess::start(&cookie, &current_user, attempt, helper_tx.clone()) {
@@ -1070,7 +1068,7 @@ fn handle_begin_auth(
         ActiveSession {
             cookie,
             action_id,
-            message,
+            message: effective_message,
             icon_png,
             program_name,
             command_line,
@@ -1257,8 +1255,12 @@ fn handle_prompt_line(
 
     if !session.ui_shown {
         session.ui_shown = true;
+        let distro = std::env::var("WSL_DISTRO_NAME")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         let _ = host_tx.send(PolkitHostCommand::Begin {
             cookie: session.cookie.clone(),
+            distro,
             action_id: session.action_id.clone(),
             message: session.message.clone(),
             icon_png: session.icon_png.clone(),
@@ -1327,6 +1329,58 @@ fn restart_helper_for_retry(
     }
 }
 
+fn normalize_focusstage_elevation_display(
+    details: &HashMap<String, String>,
+    raw_command_line: Option<&str>,
+    raw_message: &str,
+) -> (Option<String>, Option<String>, HashMap<String, String>, String) {
+    let mut icon_details = details.clone();
+    if let Some(cmd) = raw_command_line {
+        if let Some((_, target)) = cmd.split_once(" root-exec -- ") {
+            let trimmed = target.trim();
+            if !trimmed.is_empty() {
+                let target_prog = trimmed.split_whitespace().next().unwrap_or(trimmed);
+                let base = Path::new(target_prog)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(target_prog)
+                    .to_string();
+                icon_details.insert("program".to_string(), target_prog.to_string());
+                return (
+                    Some(base.clone()),
+                    Some(trimmed.to_string()),
+                    icon_details,
+                    format!("需要管理员权限以 root 身份运行 {base}"),
+                );
+            }
+        }
+        if cmd.ends_with(" root-shell") || cmd == "root-shell" {
+            if let Some(term_prog) = crate::xdg::preferred_terminal_command() {
+                icon_details.insert("program".to_string(), term_prog);
+            }
+            return (
+                Some("Root 终端".to_string()),
+                Some("/bin/bash -l (root)".to_string()),
+                icon_details,
+                "需要管理员权限以 root 身份打开终端".to_string(),
+            );
+        }
+    }
+
+    let program_name = details
+        .get("program")
+        .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
+    (
+        program_name,
+        raw_command_line.map(str::to_string),
+        icon_details,
+        raw_message.to_string(),
+    )
+}
+
 fn cancel_all_sessions(
     sessions: &mut HashMap<String, ActiveSession>,
     host_tx: &calloop_channel::Sender<PolkitHostCommand>,
@@ -1373,5 +1427,23 @@ mod tests {
         assert_eq!(resolve_polkit_locale(Some("zh-CN")), "zh_CN.UTF-8");
         assert_eq!(resolve_polkit_locale(Some("zh-TW")), "zh_TW.UTF-8");
         assert_eq!(resolve_polkit_locale(Some("en-US")), "en_US.UTF-8");
+    }
+
+    #[test]
+    fn normalizes_focusstage_root_exec_polkit_details() {
+        let mut details = HashMap::new();
+        details.insert("program".to_string(), "/usr/local/bin/focusstage".to_string());
+        let (prog, cmd, icon_details, msg) = normalize_focusstage_elevation_display(
+            &details,
+            Some("/usr/local/bin/focusstage root-exec -- /usr/bin/nautilus --new-window"),
+            "Authentication is needed to run",
+        );
+        assert_eq!(prog.as_deref(), Some("nautilus"));
+        assert_eq!(cmd.as_deref(), Some("/usr/bin/nautilus --new-window"));
+        assert_eq!(
+            icon_details.get("program").map(String::as_str),
+            Some("/usr/bin/nautilus")
+        );
+        assert!(msg.contains("nautilus"));
     }
 }

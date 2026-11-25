@@ -39,7 +39,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Removing FocusStage desktop wrappers..." -ForegroundColor Cyan
-wsl.exe -d $Distro -u root -e bash -lc "/usr/local/bin/focusstage sync-apps --remove >/dev/null 2>&1 || true; rm -f /usr/local/bin/focusstaged /usr/local/bin/focusstage /usr/local/bin/focusstage-launch /usr/local/bin/focusstage-open"
+wsl.exe -d $Distro -u root -e bash -lc "/usr/local/bin/focusstage sync-apps --remove >/dev/null 2>&1 || true; rm -f /usr/local/bin/focusstaged /usr/local/bin/focusstage /usr/local/libexec/focusstage-tun /usr/local/bin/focusstage-launch /usr/local/bin/focusstage-open"
 
 $claudeConfig = Join-Path $HOME ".claude.json"
 if (Test-Path -LiteralPath $claudeConfig) {

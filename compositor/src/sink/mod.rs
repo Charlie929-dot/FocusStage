@@ -63,6 +63,14 @@ pub enum SinkInputEvent {
     AuthCancel {
         cookie: String,
     },
+    HostProxyChanged {
+        enabled: bool,
+        bridge_port: u16,
+        http_proxy: Option<String>,
+        https_proxy: Option<String>,
+        all_proxy: Option<String>,
+        no_proxy: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

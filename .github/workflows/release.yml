@@ -40,9 +40,10 @@ jobs:
       - name: Build focusstaged and focusstage (release)
         run: |
           cargo build --workspace --release --locked
-          strip target/release/focusstaged target/release/focusstage
+          strip target/release/focusstaged target/release/focusstage target/release/focusstage-tun
           ldd target/release/focusstaged
           ldd target/release/focusstage
+          ldd target/release/focusstage-tun
 
       - name: Upload Linux release binaries
         uses: actions/upload-artifact@v4
@@ -51,6 +52,7 @@ jobs:
           path: |
             target/release/focusstaged
             target/release/focusstage
+            target/release/focusstage-tun
           if-no-files-found: error
 
   build-windows-and-release:
@@ -145,7 +147,6 @@ jobs:
           Copy-Item scripts/install-release.ps1 dist/payload/install-release.ps1 -Force
           Copy-Item scripts/focusstage-launch dist/payload/scripts/focusstage-launch -Force
           Copy-Item scripts/focusstage-open dist/payload/scripts/focusstage-open -Force
-          Copy-Item scripts/focusstage-auth dist/payload/scripts/focusstage-auth -Force
           Copy-Item scripts/claude-mcp.py dist/payload/scripts/claude-mcp.py -Force
           Copy-Item scripts/uninstall.ps1 dist/payload/scripts/uninstall.ps1 -Force
 

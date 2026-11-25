@@ -30,9 +30,9 @@ try {
         (Join-Path $WinPayloadDir "FocusStage.exe"),
         (Join-Path $LinuxPayloadDir "focusstaged"),
         (Join-Path $LinuxPayloadDir "focusstage"),
+        (Join-Path $LinuxPayloadDir "focusstage-tun"),
         (Join-Path $ScriptsPayloadDir "focusstage-launch"),
         (Join-Path $ScriptsPayloadDir "focusstage-open"),
-        (Join-Path $ScriptsPayloadDir "focusstage-auth"),
         (Join-Path $ScriptsPayloadDir "claude-mcp.py"),
         (Join-Path $ScriptsPayloadDir "uninstall.ps1")
     )
@@ -231,7 +231,7 @@ try {
     $WslScriptsPayload = Convert-ToWslPath -DistroName $Distro -WinPath $ScriptsPayloadDir
 
     Write-Host "[2/5] Checking and installing Ubuntu runtime packages (missing only)..." -ForegroundColor Cyan
-    $runtimePackages = 'python3 pkexec gnome-keyring xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland xdg-utils desktop-file-utils libpixman-1-0 libwayland-server0 libxkbcommon0 libffi8'
+    $runtimePackages = 'python3 pkexec gnome-keyring xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland xdg-utils desktop-file-utils libpixman-1-0 libwayland-server0 libxkbcommon0 libffi8 iproute2 libcap2-bin'
     $aptCmd = "if ! dpkg -s $runtimePackages >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-upgrade $runtimePackages && fc-cache -f >/dev/null 2>&1; fi"
     $aptB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("set -e`n$aptCmd`n"))
     wsl.exe -d $Distro -u root -e bash -lc "printf %s $aptB64 | base64 -d | bash"
@@ -244,16 +244,16 @@ try {
     $scriptsEsc = $WslScriptsPayload -replace "'", "'\\''"
     $installScript = @(
         "set -e",
+        "install -d -m 755 /usr/local/libexec",
         "install -m 755 '$linuxEsc/focusstaged' /usr/local/bin/focusstaged",
         "install -m 755 '$linuxEsc/focusstage' /usr/local/bin/focusstage",
+        "install -m 755 '$linuxEsc/focusstage-tun' /usr/local/libexec/focusstage-tun",
+        "setcap cap_net_admin,cap_dac_override=ep /usr/local/libexec/focusstage-tun",
         "sed 's/\r`$//' '$scriptsEsc/focusstage-launch' > /usr/local/bin/focusstage-launch",
         "chmod 755 /usr/local/bin/focusstage-launch",
         "sed 's/\r`$//' '$scriptsEsc/focusstage-open' > /usr/local/bin/focusstage-open",
         "chmod 755 /usr/local/bin/focusstage-open",
-        "tmp_auth=`$(mktemp /tmp/focusstage-auth.XXXXXX)",
-        "trap 'rm -f `"`$tmp_auth`"' EXIT",
-        "sed 's/\r`$//' '$scriptsEsc/focusstage-auth' > `"`$tmp_auth`"",
-        "/usr/bin/python3 -I `"`$tmp_auth`" setup $WslUid",
+        "if test -f /usr/local/libexec/focusstage-auth; then /usr/bin/python3 -I /usr/local/libexec/focusstage-auth remove; fi",
         "/usr/local/bin/focusstage --json sync-apps --uid $WslUid >/dev/null"
     ) -join "`n"
     $installB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($installScript + "`n"))

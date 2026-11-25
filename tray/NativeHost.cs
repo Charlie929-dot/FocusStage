@@ -50,7 +50,7 @@ internal static class NativeHost
         string? IconPng = null, int? Lz4Bytes = null,
         bool Active = false, string? AgentName = null, double PointerX = 0, double PointerY = 0,
         bool PointerVisible = false, string PointerState = "idle",
-        string Cookie = "", string ActionId = "", string Message = "",
+        string Cookie = "", string? Distro = null, string ActionId = "", string Message = "",
         string? ProgramName = null, string? CommandLine = null,
         string User = "", string[]? Users = null, string Prompt = "",
         bool EchoOn = false, string? Info = null, string? Error = null,
@@ -88,6 +88,7 @@ internal static class NativeHost
         private readonly NativeHostRenderer.Factory _renderer = new();
         private readonly Dispatcher _dispatcher;
         private readonly ElevationDialogHost _elevationDialogs;
+        private ProxyBridge? _proxyBridge;
         private bool _stopping;
         private int _status;
 
@@ -130,6 +131,15 @@ internal static class NativeHost
                 locale = System.Globalization.CultureInfo.CurrentUICulture.Name,
             });
             _dispatcher.SyncInitialClipboard();
+            try
+            {
+                _proxyBridge = new ProxyBridge((bridge, state) => Emit(bridge.BuildHostEventPayload(state)));
+                Emit(_proxyBridge.BuildHostEventPayload(_proxyBridge.CurrentState));
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"FocusStage proxy bridge unavailable: {ex.Message}");
+            }
 
             Task<bool> writer = Task.Factory.StartNew(() => WriteEvents(output), CancellationToken.None,
                 TaskCreationOptions.LongRunning, TaskScheduler.Default);
@@ -312,6 +322,7 @@ internal static class NativeHost
                 case "auth_begin":
                     _elevationDialogs.Begin(new AuthBeginRequest(
                         command.Cookie,
+                        command.Distro,
                         command.ActionId,
                         command.Message,
                         command.IconPng,
@@ -381,6 +392,8 @@ internal static class NativeHost
             _elevationDialogs.Dispose();
             foreach (var window in _windows.Values)
                 window.SetOwner(0);
+            _proxyBridge?.Dispose();
+            _proxyBridge = null;
             foreach (var window in _windows.Values)
                 window.Dispose();
             _windows.Clear();

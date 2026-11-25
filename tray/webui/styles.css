@@ -410,63 +410,6 @@ select:focus-visible,
   display: flex;
 }
 
-.launcher-lock {
-  display: none;
-  width: 100%;
-  height: 100%;
-  padding: 24px;
-  place-items: center;
-  overflow: auto;
-}
-
-.session-locked .launcher-lock { display: grid; }
-.session-locked .view,
-.session-locked .mode-switch,
-.session-locked .search-wrap,
-.session-locked #btn-appearance,
-.session-locked .titlebar-divider { display: none; }
-
-.launcher-lock-card {
-  width: min(100%, 360px);
-  padding: 30px 28px 24px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-xl);
-  background: var(--surface);
-  box-shadow: var(--shadow-sm);
-  text-align: center;
-}
-
-.launcher-lock-icon {
-  display: grid;
-  place-items: center;
-  width: 46px;
-  height: 46px;
-  margin: 0 auto 14px;
-  border-radius: var(--radius-md);
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-
-.launcher-lock-icon svg { width: 25px; height: 25px; }
-.launcher-lock-card h1 {
-  margin: 0 0 6px;
-  font-family: var(--font-heading);
-  font-size: var(--fz-xl);
-}
-.launcher-lock-card p { margin: 0; color: var(--ink-secondary); }
-.launcher-lock-actions {
-  display: grid;
-  gap: 5px;
-  margin: 22px auto 0;
-  max-width: 224px;
-}
-.launcher-lock-status {
-  margin-top: 8px;
-  color: var(--ink-secondary);
-  font-size: var(--fz-sm);
-}
-.launcher-lock-status:empty { margin-top: 0; }
-
 /* ---------------- Apps Desktop ---------------- */
 
 .view-apps {
@@ -1445,6 +1388,142 @@ body.hide-dock .dock-container {
 
 .muted-text {
   font-size: var(--fz-sm);
+}
+
+.setting-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+}
+
+/* ---------------- Accounts & Credentials ---------------- */
+
+.accounts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.account-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 13px 15px;
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+}
+
+.account-card.is-current {
+  border-color: var(--accent-border);
+}
+
+.account-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.account-ident {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+}
+
+.account-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-family: var(--font-heading);
+  font-size: var(--fz-lg);
+  font-weight: 700;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
+  flex-shrink: 0;
+}
+
+.account-names {
+  min-width: 0;
+}
+
+.account-username-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.account-username {
+  font-size: var(--fz-lg);
+  font-weight: 680;
+  color: var(--ink);
+}
+
+.account-meta {
+  margin-top: 2px;
+  font-size: var(--fz-xs);
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+}
+
+.account-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.account-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 9px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.account-actions-left,
+.account-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.modal-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.modal-check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fz-sm);
+  color: var(--ink-secondary);
+  cursor: pointer;
+}
+
+.modal-check-row input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+}
+
+.modal-hint {
+  font-size: var(--fz-xs);
+  color: var(--ink-muted);
+  line-height: 1.5;
 }
 
 /* ---------------- Appearance Settings ---------------- */
