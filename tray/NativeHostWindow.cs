@@ -26,6 +26,8 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
     private readonly Icon? _appIcon;
     private string? _stageId;
     private WindowState? _lastState;
+    private (int Style, WindowPlacement Placement)? _beforeFullscreen;
+    private bool IsFullscreen => _beforeFullscreen.HasValue;
     private bool _activated;
     private bool _placing;
     private bool _inSizeMove;
@@ -42,7 +44,8 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
     private bool CanReportGeometry => IsWindowVisible(Handle) && !IsIconic(Handle);
 
     private readonly record struct WindowState(NativeHost.WindowRect Rect, NativeHost.WindowRect Monitor,
-        int PixelWidth, int PixelHeight, double Scale, bool Activated, bool Maximized, bool Resizing, int Tiled);
+        int PixelWidth, int PixelHeight, double Scale, bool Activated, bool Maximized, bool Fullscreen,
+        bool Resizing, int Tiled);
 
     internal NativeHostWindow(string id, NativeHostRenderer.Factory renderer, Action<object> emit,
         NativeHost.WindowRect initialRect, double initialScale, string wmClass, string? iconPng)
@@ -115,27 +118,47 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
             Console.Error.WriteLine($"FocusStage window host: unable to update window owner ({error}).");
     }
 
-    internal void Show(string title, NativeHost.WindowRect rect, bool maximized, bool firstShow)
+    internal void Show(string title, NativeHost.WindowRect rect, bool maximized, bool fullscreen, bool firstShow)
     {
         _placing = true;
         try
         {
             SetTitle(title);
-            if (IsIconic(Handle) || (!maximized && IsZoomed(Handle)))
-                ShowWindow(Handle, SwRestore);
-            // Preserve the exact HWND placement (including a Snap zone) across Stage hide/show.
-            if (!IsZoomed(Handle) && (firstShow || _lastState?.Rect != rect))
+            if (IsFullscreen)
             {
-                NativeRect? work = firstShow ? InitialWorkArea() : null;
-                double scale = Scale;
-                Place(rect, scale, work);
-                if (Scale != scale)
-                    Place(rect, Scale, work);
+                if (fullscreen)
+                {
+                    if (IsIconic(Handle))
+                        ShowWindow(Handle, SwRestore);
+                    if (!IsWindowVisible(Handle))
+                        ShowWindow(Handle, SwShow);
+                    PlaceFullscreen();
+                }
+                else
+                {
+                    ApplyFullscreen(false);
+                }
             }
-            if (maximized && !IsZoomed(Handle))
-                ShowWindow(Handle, SwMaximize);
-            else if (!IsWindowVisible(Handle))
-                ShowWindow(Handle, SwShow);
+            else
+            {
+                if (IsIconic(Handle) || (!maximized && IsZoomed(Handle)))
+                    ShowWindow(Handle, SwRestore);
+                // Preserve the exact HWND placement (including a Snap zone) across Stage hide/show.
+                if (!IsZoomed(Handle) && (firstShow || _lastState?.Rect != rect))
+                {
+                    NativeRect? work = firstShow ? InitialWorkArea() : null;
+                    double scale = Scale;
+                    Place(rect, scale, work);
+                    if (Scale != scale)
+                        Place(rect, Scale, work);
+                }
+                if (maximized && !IsZoomed(Handle))
+                    ShowWindow(Handle, SwMaximize);
+                else if (!IsWindowVisible(Handle))
+                    ShowWindow(Handle, SwShow);
+                if (fullscreen)
+                    ApplyFullscreen(true);
+            }
         }
         finally
         {
@@ -172,7 +195,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
 
     internal void Maximize(bool maximized)
     {
-        if (!IsWindowVisible(Handle))
+        if (!IsWindowVisible(Handle) || IsFullscreen)
             return;
         if (IsIconic(Handle) || IsZoomed(Handle) != maximized)
         {
@@ -182,6 +205,69 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
                 ShowWindow(Handle, SwRestore);
         }
         ReportState();
+    }
+
+    internal void SetFullscreen(bool fullscreen)
+    {
+        _placing = true;
+        try
+        {
+            if (IsFullscreen != fullscreen)
+                ApplyFullscreen(fullscreen);
+        }
+        finally
+        {
+            _placing = false;
+        }
+        ReportState();
+    }
+
+    private void ApplyFullscreen(bool fullscreen)
+    {
+        int style = GetWindowLong(Handle, GwlStyle);
+        if (fullscreen)
+        {
+            var placement = new WindowPlacement { Length = Marshal.SizeOf<WindowPlacement>() };
+            if (!GetWindowPlacement(Handle, ref placement))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+
+            // Restoring can move a maximized window back to a different monitor.
+            var monitor = WorkAreaForMonitor(MonitorFromWindow(Handle, MonitorDefaultToNearest)).Monitor;
+            if (IsZoomed(Handle) || IsIconic(Handle))
+            {
+                ShowWindow(Handle, SwRestore);
+                style = GetWindowLong(Handle, GwlStyle);
+            }
+            _beforeFullscreen = (style & WsOverlappedWindow, placement);
+            SetFrameStyle(style & ~WsOverlappedWindow);
+            ApplyDwmFrame();
+            PlaceFullscreen(monitor);
+        }
+        else if (_beforeFullscreen is { } saved)
+        {
+            _beforeFullscreen = null;
+            SetFrameStyle(style | saved.Style);
+            ApplyDwmFrame();
+            if (!SetWindowPlacement(Handle, in saved.Placement))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (!SetWindowPos(Handle, 0, 0, 0, 0, 0,
+                SwpNoMove | SwpNoSize | SwpNoZOrder | SwpNoActivate | SwpNoOwnerZOrder | SwpFrameChanged))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+
+    private void SetFrameStyle(int style)
+    {
+        if (SetWindowLong(Handle, GwlStyle, style) == 0 && Marshal.GetLastWin32Error() is int error and not 0)
+            throw new Win32Exception(error);
+    }
+
+    private void PlaceFullscreen(NativeRect? bounds = null)
+    {
+        var monitor = bounds ?? WorkAreaForMonitor(MonitorFromWindow(Handle, MonitorDefaultToNearest)).Monitor;
+        if (!SetWindowPos(Handle, 0, monitor.Left, monitor.Top, monitor.Width, monitor.Height,
+            SwpNoZOrder | SwpNoActivate | SwpNoOwnerZOrder | SwpFrameChanged))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
     }
 
     internal void StartMove() => StartInteraction(ScMove | HtCaption);
@@ -194,7 +280,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
 
     private void StartInteraction(int command)
     {
-        if (!CanReportGeometry || _inSizeMove || !GetCursorPos(out var pointer))
+        if (!CanReportGeometry || IsFullscreen || _inSizeMove || !GetCursorPos(out var pointer))
             return;
         ReleaseInput();
         SendMessage(Handle, WmSysCommand, command, pointer.ToLParam());
@@ -354,10 +440,10 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
 
     private void ApplyDwmFrame()
     {
-        var margins = new Margins(1, 1, 1, 1);
+        var margins = IsFullscreen ? default : new Margins(1, 1, 1, 1);
         DwmExtendFrameIntoClientArea(Handle, in margins);
-        const int RoundCorners = 2;
-        DwmSetWindowAttribute(Handle, DwmWindowCornerPreference, RoundCorners, sizeof(int));
+        const int DoNotRound = 1, RoundCorners = 2;
+        DwmSetWindowAttribute(Handle, DwmWindowCornerPreference, IsFullscreen ? DoNotRound : RoundCorners, sizeof(int));
     }
 
     private static void CalculateClientArea(nint hwnd, nint lParam)
@@ -377,7 +463,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
 
     private int HitTest(NativePoint pointer)
     {
-        if (IsZoomed(Handle) || !GetWindowRect(Handle, out var rect))
+        if (IsFullscreen || IsZoomed(Handle) || !GetWindowRect(Handle, out var rect))
             return HtClient;
 
         uint dpi = Dpi;
@@ -438,7 +524,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         var area = WorkAreaForMonitor(MonitorFromWindow(Handle, MonitorDefaultToNearest));
         var monitor = new NativeHost.WindowRect(area.Monitor.Left, area.Monitor.Top, area.Monitor.Width, area.Monitor.Height);
         PublishState(new WindowState(rect, monitor, client.Width, client.Height, scale, _activated,
-            maximized, _resizing, maximized ? 0 : TiledEdges(area.Work)));
+            maximized, IsFullscreen, _resizing, maximized || IsFullscreen ? 0 : TiledEdges(area.Work)));
     }
 
     private void ReportInactive()
@@ -456,7 +542,8 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         {
             type = "state", window_id = _id, rect = state.Rect, scale = state.Scale, monitor = state.Monitor,
             pixel_size = new[] { state.PixelWidth, state.PixelHeight },
-            activated = state.Activated, maximized = state.Maximized, resizing = state.Resizing,
+            activated = state.Activated, maximized = state.Maximized, fullscreen = state.Fullscreen,
+            resizing = state.Resizing,
             tiled = new[] { (state.Tiled & 1) != 0, (state.Tiled & 2) != 0, (state.Tiled & 4) != 0, (state.Tiled & 8) != 0 },
         });
     }

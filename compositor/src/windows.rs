@@ -21,6 +21,7 @@ fn show(sink: &mut dyn DisplaySink, stage: &Stage, window: &StageWindow) {
         scale: window.scale,
         parent_window_id: window.parent_window_id.as_deref(),
         maximized: window.maximized,
+        fullscreen: window.fullscreen_requested,
     });
 }
 
@@ -82,6 +83,9 @@ impl FocusStageState {
         let activate_helper = stage.persistent_helper;
         let window = stage.window_mut(window_id).unwrap();
         window.mapped = mapped;
+        if !mapped {
+            window.fullscreen_requested = false;
+        }
         let sync_overlay = mapped && is_desktop;
         if mapped {
             window.dirty = true;
@@ -160,6 +164,45 @@ impl FocusStageState {
         if desktop && window.mapped {
             if let Some(sink) = self.display_sink.as_mut() {
                 sink.set_maximized(window_id, maximized);
+            }
+        }
+    }
+
+    pub(crate) fn request_window_fullscreen(&mut self, toplevel: StageToplevel, fullscreen: bool) {
+        if let Some(id) = self.window_id_for_toplevel(&toplevel) {
+            let (stage_id, _) = id.rsplit_once('/').unwrap();
+            let stage = self.stages.get_mut(stage_id).unwrap();
+            let desktop = stage.display == DisplayState::Desktop;
+            let window = stage.window_mut(&id).unwrap();
+            let changed = window.fullscreen_requested != fullscreen;
+            window.fullscreen_requested = fullscreen;
+            if desktop && window.mapped {
+                if let Some(sink) = self.display_sink.as_mut() {
+                    if changed {
+                        // Use the actual monitor bounds returned by the host before configuring the client.
+                        sink.set_fullscreen(&id, fullscreen);
+                    } else if let StageToplevel::Wayland(surface) = &toplevel {
+                        surface.send_configure();
+                    }
+                    return;
+                }
+            }
+        }
+        // A hidden Stage fills its existing virtual window. An initial fullscreen
+        // request also needs a configure before the client can map a buffer.
+        match toplevel {
+            StageToplevel::Wayland(surface) => {
+                surface.with_pending_state(|pending| {
+                    if fullscreen {
+                        pending.states.set(State::Fullscreen);
+                    } else {
+                        pending.states.unset(State::Fullscreen);
+                    }
+                });
+                surface.send_configure();
+            }
+            StageToplevel::X11(surface) => {
+                let _ = surface.set_fullscreen(fullscreen);
             }
         }
     }
@@ -394,13 +437,17 @@ impl FocusStageState {
             .as_ref()
             .is_some_and(|s| s.pixel_size != window.pixel_size);
         let surface = window.toplevel.wl_surface();
-        window.saved_rect = rect;
+        if !status.as_ref().is_some_and(|s| s.fullscreen) {
+            window.saved_rect = rect;
+        }
         window.logical_size = size;
         if let Some(status) = &status {
             window.scale = status.scale;
             window.monitor = status.monitor;
             window.pixel_size = status.pixel_size;
-            window.maximized = status.maximized;
+            if !status.fullscreen {
+                window.maximized = status.maximized;
+            }
             if let Some(monitor) = status.monitor {
                 self.virtual_outputs
                     .update(&self.display_handle, monitor, status.scale);
@@ -413,7 +460,8 @@ impl FocusStageState {
                     if let Some(status) = &status {
                         for (state, enabled) in [
                             (State::Activated, status.activated),
-                            (State::Maximized, status.maximized),
+                            (State::Maximized, status.maximized && !status.fullscreen),
+                            (State::Fullscreen, status.fullscreen),
                             (State::Resizing, status.resizing),
                             (State::TiledLeft, status.tiled[0]),
                             (State::TiledRight, status.tiled[1]),
@@ -437,7 +485,12 @@ impl FocusStageState {
                 }
                 if let Some(status) = &status {
                     let _ = w.set_activated(status.activated);
-                    let _ = w.set_maximized(status.maximized);
+                    if !status.fullscreen {
+                        let _ = w.set_maximized(status.maximized);
+                    }
+                    if w.is_fullscreen() != status.fullscreen {
+                        let _ = w.set_fullscreen(status.fullscreen);
+                    }
                 }
             }
         }

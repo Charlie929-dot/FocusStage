@@ -54,7 +54,7 @@ internal static class NativeHost
         string? ProgramName = null, string? CommandLine = null,
         string User = "", string[]? Users = null, string Prompt = "",
         bool EchoOn = false, string? Info = null, string? Error = null,
-        bool Retry = false, bool Succeeded = false);
+        bool Retry = false, bool Succeeded = false, bool Fullscreen = false);
 
     private static void OpenWebUrl(string url)
     {
@@ -247,7 +247,7 @@ internal static class NativeHost
                         window.ParentId = command.ParentWindowId;
                         UpdateOwners();
                     }
-                    window.Show(command.Title, command.Rect, command.Maximized, added);
+                    window.Show(command.Title, command.Rect, command.Maximized, command.Fullscreen, added);
                     break;
                 case "frame":
                     if (window is null)
@@ -309,6 +309,9 @@ internal static class NativeHost
                     break;
                 case "maximize":
                     window?.Maximize(command.Maximized);
+                    break;
+                case "fullscreen":
+                    window?.SetFullscreen(command.Fullscreen);
                     break;
                 case "minimize":
                     window?.Minimize();
