@@ -37,7 +37,7 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
     /// Get the iterator over [`WlDataDevice`]. Mostly used for the drag and drop handling.
     pub fn known_data_devices(&self) -> impl Iterator<Item = &WlDataDevice> {
         self.known_devices.iter().filter_map(|device| match device {
-            SelectionDevice::DataDevice(device) => Some(device),
+            SelectionDevice::DataDevice(device) if device.is_alive() => Some(device),
             _ => None,
         })
     }

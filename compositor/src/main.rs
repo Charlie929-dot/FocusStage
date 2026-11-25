@@ -301,24 +301,33 @@ fn dispatch_sink_events(state: &mut FocusStageState) -> bool {
                 state.send_keyring_reply(focusstage_compositor::polkit::PolkitHostReply::HostDisconnected);
                 state.clear_host_proxy();
                 state.display_sink = None;
+                state.cancel_desktop_drags();
             }
             SinkInputEvent::PointerLeave { window_id } => {
                 if let Some(stage_id) = human_input_stage(state, &window_id) {
                     state.leave_window_pointer(&stage_id, &window_id);
                 }
             }
-            SinkInputEvent::PointerMotion { window_id, x, y } => {
+            SinkInputEvent::PointerMotion { window_id, x, y, drag_target } => {
                 if let Some(stage_id) = human_input_stage(state, &window_id) {
+                    state.set_captured_drag_target(&stage_id, &window_id, drag_target);
                     state.send_window_pointer_motion_at(&stage_id, Some(&window_id), x, y, state.now_ms());
                 }
             }
-            SinkInputEvent::PointerButton { window_id, button, pressed, x, y } => {
+            SinkInputEvent::PointerButton { window_id, button, pressed, cancelled, x, y, drag_target } => {
                 if let Some(stage_id) = human_input_stage(state, &window_id) {
+                    if cancelled {
+                        state.cancel_stage_drag(&stage_id);
+                    }
                     if pressed {
                         state.activate_sink_window(&stage_id, &window_id);
                     }
+                    state.set_captured_drag_target(&stage_id, &window_id, drag_target);
                     state.send_window_button_at(&stage_id, Some(&window_id), x, y, button, pressed, state.now_ms());
                 }
+            }
+            SinkInputEvent::FileDragEnded { window_id, serial, dropped, continuing, drag_target } => {
+                state.handle_file_drag_ended(&window_id, serial, dropped, continuing, drag_target);
             }
             SinkInputEvent::PointerScroll { window_id, x, y, dx, dy, v120 } => {
                 if let Some(stage_id) = human_input_stage(state, &window_id) {

@@ -1,18 +1,23 @@
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
-use std::sync::Mutex;
 
+use smithay::input::Seat;
 use smithay::reexports::wayland_server::{
-    backend::{ClientId, GlobalId},
+    backend::ClientId,
     protocol::{
         wl_data_device::{self, WlDataDevice},
         wl_data_device_manager::{self, DndAction, WlDataDeviceManager},
         wl_data_offer::{self, WlDataOffer},
-        wl_data_source::{self, WlDataSource},
+        wl_data_source::WlDataSource,
     },
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, Weak,
 };
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
+use smithay::wayland::selection::{
+    data_device::{register_data_device, with_source_metadata, ClientDndGrabHandler, DataDeviceHandler,
+        DataDeviceState, DataSourceUserData, ServerDndGrabHandler},
+    SelectionHandler,
+};
 use tracing::{debug, warn};
 
 use crate::protocol::{windows_path_to_wsl, InputOwner};
@@ -25,12 +30,6 @@ pub const MAX_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
 pub enum ClipboardReadKind {
     Text,
     ImagePng,
-}
-
-#[derive(Debug, Default)]
-pub struct DataSourceUserData {
-    pub mime_types: Mutex<Vec<String>>,
-    pub stage_id: Mutex<Option<String>>,
 }
 
 #[derive(Debug)]
@@ -46,9 +45,9 @@ pub struct DataOfferUserData {
     pub mime_types: Vec<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StageDataDeviceManagerState {
-    pub global: Option<GlobalId>,
+    data_device: DataDeviceState,
     pub devices: Vec<(String, Weak<WlDataDevice>)>,
     pub latest_host_clipboard: Option<ClipboardContent>,
     pub host_clipboard_seq: u64,
@@ -56,9 +55,8 @@ pub struct StageDataDeviceManagerState {
 
 impl StageDataDeviceManagerState {
     pub fn new(dh: &DisplayHandle) -> Self {
-        let global = dh.create_global::<FocusStageState, WlDataDeviceManager, ()>(3, ());
         Self {
-            global: Some(global),
+            data_device: DataDeviceState::new::<FocusStageState>(dh),
             devices: Vec::new(),
             latest_host_clipboard: None,
             host_clipboard_seq: 0,
@@ -97,14 +95,7 @@ impl Dispatch<WlDataDeviceManager, ()> for FocusStageState {
     ) {
         match request {
             wl_data_device_manager::Request::CreateDataSource { id } => {
-                let stage_id = state.stage_id_for_client(&client.id());
-                data_init.init(
-                    id,
-                    DataSourceUserData {
-                        mime_types: Mutex::new(Vec::new()),
-                        stage_id: Mutex::new(stage_id),
-                    },
-                );
+                data_init.init(id, DataSourceUserData::default());
             }
             wl_data_device_manager::Request::GetDataDevice { id, seat } => {
                 let stage_id = state
@@ -119,7 +110,9 @@ impl Dispatch<WlDataDeviceManager, ()> for FocusStageState {
                     .clipboard_state
                     .devices
                     .push((stage_id.clone(), device.downgrade()));
-                let _ = seat;
+                if let Some(seat) = Seat::<FocusStageState>::from_resource(&seat) {
+                    register_data_device(&seat, device.clone());
+                }
 
                 // Inherit the latest host clipboard if this Human stage has no selection yet.
                 if let Some(host_content) = state.clipboard_state.latest_host_clipboard.clone() {
@@ -152,26 +145,17 @@ impl Dispatch<WlDataDeviceManager, ()> for FocusStageState {
     }
 }
 
-impl Dispatch<WlDataSource, DataSourceUserData> for FocusStageState {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &WlDataSource,
-        request: wl_data_source::Request,
-        data: &DataSourceUserData,
-        _dh: &DisplayHandle,
-        _data_init: &mut DataInit<'_, Self>,
-    ) {
-        match request {
-            wl_data_source::Request::Offer { mime_type } => {
-                let mut mimes = data.mime_types.lock().unwrap();
-                if !mimes.contains(&mime_type) {
-                    mimes.push(mime_type);
-                }
-            }
-            wl_data_source::Request::SetActions { .. } | wl_data_source::Request::Destroy => {}
-            _ => {}
-        }
+smithay::reexports::wayland_server::delegate_dispatch!(FocusStageState: [WlDataSource: DataSourceUserData] => DataDeviceState);
+
+// FocusStage owns clipboard policy; Smithay handles negotiation for client drags.
+impl SelectionHandler for FocusStageState {
+    type SelectionUserData = ();
+}
+impl ClientDndGrabHandler for FocusStageState {}
+impl ServerDndGrabHandler for FocusStageState {}
+impl DataDeviceHandler for FocusStageState {
+    fn data_device_state(&self) -> &DataDeviceState {
+        &self.clipboard_state.data_device
     }
 }
 
@@ -238,9 +222,7 @@ impl Dispatch<WlDataDevice, String> for FocusStageState {
                 debug!("Stage {} set Wayland clipboard selection", stage_id);
                 let mut mimes = Vec::new();
                 if let Some(ref src) = source {
-                    if let Some(ud) = src.data::<DataSourceUserData>() {
-                        mimes = ud.mime_types.lock().unwrap().clone();
-                    }
+                    mimes = with_source_metadata(src, |meta| meta.mime_types.clone()).unwrap_or_default();
                 }
 
                 let picked = pick_clipboard_mime(&mimes);
@@ -317,7 +299,10 @@ impl Dispatch<WlDataDevice, String> for FocusStageState {
                     }
                 }
             }
-            wl_data_device::Request::StartDrag { .. } | wl_data_device::Request::Release => {}
+            wl_data_device::Request::StartDrag { source, origin, icon, serial } => {
+                state.start_stage_drag(&stage_id, resource, source, origin, icon, serial.into());
+            }
+            wl_data_device::Request::Release => {}
             _ => {}
         }
     }
@@ -355,7 +340,7 @@ pub fn pick_text_mime(mimes: &[String]) -> Option<String> {
     })
 }
 
-fn create_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+pub(crate) fn create_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0i32; 2];
     let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
     if rc != 0 {

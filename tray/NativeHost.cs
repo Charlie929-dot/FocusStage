@@ -33,6 +33,7 @@ internal static class NativeHost
     }
 
     internal readonly record struct WindowRect(int X, int Y, int Width, int Height);
+    internal sealed record DragTarget(string Kind, string? WindowId = null, double X = 0, double Y = 0);
 
     internal readonly record struct AgentOverlayState(
         bool Active,
@@ -54,7 +55,8 @@ internal static class NativeHost
         string? ProgramName = null, string? CommandLine = null,
         string User = "", string[]? Users = null, string Prompt = "",
         bool EchoOn = false, string? Info = null, string? Error = null,
-        bool Retry = false, bool Succeeded = false, bool Fullscreen = false);
+        bool Retry = false, bool Succeeded = false, bool Fullscreen = false,
+        uint Serial = 0, string[]? Paths = null);
 
     private static void OpenWebUrl(string url)
     {
@@ -89,6 +91,8 @@ internal static class NativeHost
         private readonly Dispatcher _dispatcher;
         private readonly ElevationDialogHost _elevationDialogs;
         private ProxyBridge? _proxyBridge;
+        private (string WindowId, uint Serial)? _oleDrag;
+        private bool _cancelOleDrag;
         private bool _stopping;
         private int _status;
 
@@ -237,7 +241,7 @@ internal static class NativeHost
                     bool added = window is null;
                     if (window is null)
                     {
-                        window = new NativeHostWindow(id, _renderer, Emit, command.Rect, command.Scale,
+                        window = new NativeHostWindow(id, _renderer, Emit, FindDragTarget, command.Rect, command.Scale,
                             command.WmClass, command.IconPng);
                         _windows.Add(id, window);
                     }
@@ -279,6 +283,13 @@ internal static class NativeHost
                     break;
                 case "open_url":
                     OpenWebUrl(command.Url);
+                    break;
+                case "begin_file_drag":
+                    BeginFileDrag(command, window);
+                    break;
+                case "cancel_file_drag":
+                    if (_oleDrag == (id, command.Serial))
+                        _cancelOleDrag = true;
                     break;
                 case "activate":
                     window?.Activate();
@@ -353,6 +364,68 @@ internal static class NativeHost
                         command.Succeeded,
                         command.Message));
                     break;
+            }
+        }
+
+        private DragTarget? FindDragTarget(NativePoint screenPoint)
+        {
+            nint hwnd = WindowFromPoint(screenPoint);
+            foreach (var window in _windows.Values)
+                if (window.Handle == hwnd)
+                    return window.DragTargetForScreenPoint(screenPoint);
+            return new DragTarget("external");
+        }
+
+        private void BeginFileDrag(Command command, NativeHostWindow? window)
+        {
+            var id = command.WindowId;
+            var serial = command.Serial;
+            bool dropped = false, continuing = false;
+            DragTarget? target = null;
+            void Report() => Emit(new { type = "file_drag_ended", window_id = id, serial, dropped, continuing, drag_target = target });
+
+            if (_oleDrag is not null || window is null || command.Paths is not { Length: > 0 } paths)
+            {
+                Report();
+                return;
+            }
+            if (GetCursorPos(out var point))
+                target = FindDragTarget(point);
+            if (target?.Kind != "external" || !window.SuspendFileDrag())
+            {
+                // Pointer events may have reached another Stage while the payload was in flight.
+                continuing = window.CanStartFileDrag && target?.Kind != "external";
+                Report();
+                return;
+            }
+
+            _oleDrag = (id, serial);
+            _cancelOleDrag = false;
+            try
+            {
+                var data = new DataObject();
+                data.SetData(DataFormats.FileDrop, paths);
+                var source = new NativeFileDrag.Source(
+                    shouldCancel: () => _cancelOleDrag || _stopping || window.Handle == 0 || !IsWindowVisible(window.Handle),
+                    overStage: () => GetCursorPos(out var cursor) && FindDragTarget(cursor) is { Kind: "window" });
+                dropped = NativeFileDrag.Run(data, source);
+                if (source.ReturnedToStage && !_cancelOleDrag && !_stopping && window.Handle != 0
+                    && IsWindowVisible(window.Handle) && (GetAsyncKeyState(1) & 0x8000) != 0
+                    && GetCursorPos(out point) && FindDragTarget(point) is { Kind: "window" } stageTarget)
+                {
+                    window.ResumeFileDrag();
+                    continuing = true;
+                    target = stageTarget;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"FocusStage Windows file drag: {ex.Message}");
+            }
+            finally
+            {
+                _oleDrag = null;
+                Report();
             }
         }
 

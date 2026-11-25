@@ -112,6 +112,10 @@ pub struct StageInputState {
     pub pointer_window_id: Option<String>,
     /// Evdev mouse button codes currently pressed on this Stage
     pub pressed_buttons: HashSet<u32>,
+    /// The implicit Wayland grab established by the first pressed pointer button.
+    pub(crate) pointer_press: Option<(smithay::utils::Serial, WlSurface)>,
+    pub(crate) drag: Option<crate::dnd::StageDrag>,
+    pub(crate) captured_drag_target: Option<(String, crate::sink::CapturedDragTarget)>,
     /// Current surface holding `wl_keyboard` focus on this Stage
     pub current_keyboard_target: Option<StageInputTarget>,
     /// Current surface holding `wl_pointer` focus on this Stage
@@ -156,6 +160,9 @@ impl StageInputState {
             pointer_surface_origin: Point::default(),
             pointer_window_id: None,
             pressed_buttons: HashSet::new(),
+            pointer_press: None,
+            drag: None,
+            captured_drag_target: None,
             current_keyboard_target: None,
             current_pointer_target: None,
             custom_keymap_active: false,

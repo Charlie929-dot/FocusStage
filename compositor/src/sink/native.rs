@@ -15,7 +15,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use super::{AgentOverlay, DisplaySink, SinkInputEvent, WindowInfo, WindowState};
+use super::{AgentOverlay, CapturedDragTarget, DisplaySink, SinkInputEvent, WindowInfo, WindowState};
 use crate::protocol::SavedRect;
 
 #[derive(Serialize)]
@@ -65,6 +65,15 @@ enum HostCommand<'a> {
     Fullscreen {
         window_id: &'a str,
         fullscreen: bool,
+    },
+    BeginFileDrag {
+        window_id: &'a str,
+        serial: u32,
+        paths: &'a [String],
+    },
+    CancelFileDrag {
+        window_id: &'a str,
+        serial: u32,
     },
     Clipboard {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,6 +165,7 @@ enum HostEvent {
         window_id: String,
         x: f64,
         y: f64,
+        drag_target: Option<CapturedDragTarget>,
     },
     PointerLeave {
         window_id: String,
@@ -166,6 +176,16 @@ enum HostEvent {
         y: f64,
         button: u32,
         pressed: bool,
+        #[serde(default)]
+        cancelled: bool,
+        drag_target: Option<CapturedDragTarget>,
+    },
+    FileDragEnded {
+        window_id: String,
+        serial: u32,
+        dropped: bool,
+        continuing: bool,
+        drag_target: Option<CapturedDragTarget>,
     },
     PointerScroll {
         window_id: String,
@@ -234,10 +254,11 @@ impl HostEvent {
         Some(match self {
             Self::Ready { .. } | Self::FrameDone { .. } => return None,
             Self::State { window_id, state } => Input::WindowChanged { window_id, state },
-            Self::PointerMotion { window_id, x, y } => Input::PointerMotion {
+            Self::PointerMotion { window_id, x, y, drag_target } => Input::PointerMotion {
                 window_id,
                 x,
                 y,
+                drag_target,
             },
             Self::PointerLeave { window_id } => Input::PointerLeave { window_id },
             Self::PointerButton {
@@ -246,13 +267,19 @@ impl HostEvent {
                 y,
                 button,
                 pressed,
+                cancelled,
+                drag_target,
             } => Input::PointerButton {
                 window_id,
                 x,
                 y,
                 button,
                 pressed,
+                cancelled,
+                drag_target,
             },
+            Self::FileDragEnded { window_id, serial, dropped, continuing, drag_target } =>
+                Input::FileDragEnded { window_id, serial, dropped, continuing, drag_target },
             Self::PointerScroll {
                 window_id,
                 x,
@@ -585,6 +612,14 @@ impl DisplaySink for NativeSink {
 
     fn set_fullscreen(&mut self, window_id: &str, fullscreen: bool) {
         self.command(HostCommand::Fullscreen { window_id, fullscreen });
+    }
+
+    fn begin_file_drag(&mut self, window_id: &str, serial: u32, paths: &[String]) -> bool {
+        self.command(HostCommand::BeginFileDrag { window_id, serial, paths })
+    }
+
+    fn cancel_file_drag(&mut self, window_id: &str, serial: u32) {
+        self.command(HostCommand::CancelFileDrag { window_id, serial });
     }
 
     fn set_host_clipboard(&mut self, text: &str) {

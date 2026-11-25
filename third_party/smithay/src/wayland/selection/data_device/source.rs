@@ -31,19 +31,10 @@ impl Default for SourceMetadata {
 }
 
 #[doc(hidden)]
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DataSourceUserData {
     pub(crate) inner: Mutex<SourceMetadata>,
     alive_tracker: AliveTracker,
-}
-
-impl DataSourceUserData {
-    pub(super) fn new() -> Self {
-        Self {
-            inner: Default::default(),
-            alive_tracker: Default::default(),
-        }
-    }
 }
 
 impl<D> Dispatch<WlDataSource, DataSourceUserData, D> for DataDeviceState

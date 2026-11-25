@@ -15,7 +15,7 @@ use smithay::reexports::wayland_server::{
     protocol::{wl_keyboard::KeyState as WlKeyState, wl_surface::WlSurface},
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
-use smithay::utils::{Logical, Point, Serial, SERIAL_COUNTER};
+use smithay::utils::{Logical, Point, Rectangle, Serial, SERIAL_COUNTER};
 use tracing::{debug, warn};
 
 use crate::offscreen::wayland_window_geometry_loc;
@@ -388,8 +388,14 @@ impl FocusStageState {
             return;
         }
         stage.input.pointer_window_id = None;
-        stage.input.x11_axis_primed = false;
-        let Some(target) = stage.input.current_pointer_target.take().filter(|t| t.alive()) else { return; };
+        stage.input.pointer_press = None;
+        self.clear_stage_pointer_target(stage_id);
+    }
+
+    pub(crate) fn clear_stage_pointer_target(&mut self, stage_id: &str) {
+        let input = &mut self.stages.get_mut(stage_id).unwrap().input;
+        input.x11_axis_primed = false;
+        let Some(target) = input.current_pointer_target.take().filter(|t| t.alive()) else { return; };
         let seat = self.seat.clone();
         let serial = SERIAL_COUNTER.next_serial();
         let time = self.now_ms();
@@ -406,6 +412,9 @@ impl FocusStageState {
     }
 
     pub(crate) fn clear_window_inputs(&mut self, stage_id: &str, window_id: &str) {
+        if self.stages[stage_id].input.drag.as_ref().is_some_and(|d| d.window_id == window_id) {
+            self.cancel_stage_drag(stage_id);
+        }
         let stage = self.stages.get_mut(stage_id).unwrap();
         let focused = stage.active_window().is_some_and(|w| w.id == window_id)
             || (stage.active_window_id.as_deref() == Some(window_id)
@@ -462,7 +471,7 @@ impl FocusStageState {
                     );
                 }
 
-                if virtual_focus {
+                if virtual_focus && self.stages[stage_id].input.drag.is_none() {
                     let ptr_valid = cur_ptr.as_ref().is_some_and(|t| {
                         t.alive() && matches!(t, StageInputTarget::Wayland(s)
                             if self.window_for_surface(s).is_some_and(|w| w.toplevel.wl_surface().as_ref() == Some(&wl_surf)))
@@ -566,6 +575,7 @@ impl FocusStageState {
     }
 
     pub(crate) fn release_all_stage_inputs(&mut self, stage_id: &str) {
+        self.cancel_stage_drag(stage_id);
         let (pressed_keys, pressed_buttons, pos, pointer_window_id) = match self.stages.get(stage_id) {
             Some(s) => (
                 s.input.pressed_keys.iter().copied().collect::<Vec<_>>(),
@@ -582,7 +592,9 @@ impl FocusStageState {
         for btn in pressed_buttons {
             self.send_window_button_at(stage_id, pointer_window_id.as_deref(), pos.x, pos.y, btn, false, time);
         }
-        self.stages.get_mut(stage_id).unwrap().input.pressed_buttons.clear();
+        let input = &mut self.stages.get_mut(stage_id).unwrap().input;
+        input.pressed_buttons.clear();
+        input.pointer_press = None;
     }
 
     /// Return the surface and its origin in the same coordinates used for rendering.
@@ -628,6 +640,12 @@ impl FocusStageState {
             return;
         };
         let point = Point::from((x, y));
+        if self.route_drag_motion(stage_id, window_id, point, time) {
+            let input = &mut self.stages.get_mut(stage_id).unwrap().input;
+            input.pointer_pos = point;
+            input.pointer_window_id = window_id.map(str::to_owned);
+            return;
+        }
         let input = &mut self.stages.get_mut(stage_id).unwrap().input;
         let grab = match &input.current_pointer_target {
             Some(target @ StageInputTarget::Wayland(surface)) if target.alive()
@@ -720,16 +738,33 @@ impl FocusStageState {
     pub fn send_window_button_at(
         &mut self, stage_id: &str, window_id: Option<&str>, x: f64, y: f64, button: u32, pressed: bool, time: u32,
     ) {
+        let had_drag = self.stages.get(stage_id).is_some_and(|stage| stage.input.drag.is_some());
         self.send_window_pointer_motion_at(stage_id, window_id, x, y, time);
-        let Some(toplevel) = self.stages.get(stage_id).and_then(|s| s.input_toplevel(window_id)).cloned() else {
-            return;
-        };
-        if let Some(stage) = self.stages.get_mut(stage_id) {
-            if pressed {
-                stage.input.pressed_buttons.insert(button);
-            } else {
-                stage.input.pressed_buttons.remove(&button);
+        let Some(stage) = self.stages.get_mut(stage_id) else { return; };
+        let Some(toplevel) = stage.input_toplevel(window_id).cloned() else { return; };
+        let first_press = pressed && stage.input.pressed_buttons.is_empty();
+        if pressed {
+            stage.input.pressed_buttons.insert(button);
+        } else {
+            stage.input.pressed_buttons.remove(&button);
+            if stage.input.pressed_buttons.is_empty() {
+                stage.input.pointer_press = None;
             }
+        }
+        if had_drag {
+            if stage.input.pressed_buttons.is_empty() {
+                let point = Point::from((x, y));
+                let window = match window_id {
+                    Some(id) => stage.window(id),
+                    None => stage.active_window(),
+                };
+                let over_window = window.is_some_and(|w| Rectangle::from_size(w.logical_size.to_f64()).contains(point));
+                self.finish_stage_drag(stage_id);
+                if over_window {
+                    self.send_window_pointer_motion_at(stage_id, window_id, x, y, time);
+                }
+            }
+            return;
         }
 
         let seat = self.seat.clone();
@@ -747,8 +782,11 @@ impl FocusStageState {
 
         match toplevel {
             StageToplevel::Wayland(tl) => {
-                let input = &self.stages[stage_id].input;
+                let input = &mut self.stages.get_mut(stage_id).unwrap().input;
                 let Some(StageInputTarget::Wayland(target)) = input.current_pointer_target.clone() else { return; };
+                if first_press {
+                    input.pointer_press = Some((serial, target.clone()));
+                }
                 let grab_ended = !pressed && input.pressed_buttons.is_empty();
                 PointerTarget::button(&target, &seat, self, &ev);
                 PointerTarget::frame(&target, &seat, self);
@@ -965,6 +1003,9 @@ impl FocusStageState {
         pressed: bool,
         time: u32,
     ) {
+        if pressed && evdev_code == 1 && self.cancel_stage_drag(stage_id) {
+            return;
+        }
         self.ensure_virtual_focus(stage_id);
         let toplevel = self.stages.get(stage_id).and_then(|s| s.active_toplevel().cloned());
         if pressed && toplevel.is_none() {

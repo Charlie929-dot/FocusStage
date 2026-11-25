@@ -718,6 +718,11 @@ mod tests {
         seat: Option<wl_seat::WlSeat>,
         data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
         pointer_enters: Vec<(u32, f64, f64)>,
+        pointer_press_serial: Option<u32>,
+        client_drag_offer: Option<(u32, wl_data_offer::WlDataOffer)>,
+        drag_drops: usize,
+        drag_cancellations: Vec<u32>,
+        drag_finished: Vec<u32>,
         text_input_manager: Option<c_text_manager::ZwpTextInputManagerV3>,
         text_input_enters: Vec<wl_surface::WlSurface>,
         drop_enters: Vec<(u32, f64, f64)>,
@@ -821,12 +826,17 @@ mod tests {
     }
     impl Dispatch<wl_data_source::WlDataSource, ()> for TestClient {
         fn event(state: &mut Self, source: &wl_data_source::WlDataSource, event: wl_data_source::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-            if let wl_data_source::Event::Send { fd, .. } = event {
-                use std::io::Write;
-                if let Some(bytes) = state.source_payloads.get(&source.id().protocol_id()) {
-                    let mut file = std::fs::File::from(fd);
-                    let _ = file.write_all(bytes);
+            match event {
+                wl_data_source::Event::Send { fd, .. } => {
+                    use std::io::Write;
+                    if let Some(bytes) = state.source_payloads.get(&source.id().protocol_id()) {
+                        let mut file = std::fs::File::from(fd);
+                        let _ = file.write_all(bytes);
+                    }
                 }
+                wl_data_source::Event::Cancelled => state.drag_cancellations.push(source.id().protocol_id()),
+                wl_data_source::Event::DndFinished => state.drag_finished.push(source.id().protocol_id()),
+                _ => {}
             }
         }
     }
@@ -837,9 +847,11 @@ mod tests {
 
         fn event(state: &mut Self, _: &wl_data_device::WlDataDevice, event: wl_data_device::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
             match event {
-                wl_data_device::Event::Enter { surface, x, y, .. } => {
+                wl_data_device::Event::Enter { serial, surface, x, y, id } => {
                     state.drop_enters.push((surface.id().protocol_id(), x, y));
+                    state.client_drag_offer = id.map(|id| (serial, id));
                 }
+                wl_data_device::Event::Drop => state.drag_drops += 1,
                 wl_data_device::Event::Selection { id } => {
                     if id.is_none() {
                         state.selection_cleared_count += 1;
@@ -873,9 +885,14 @@ mod tests {
 
     impl Dispatch<wl_pointer::WlPointer, ()> for TestClient {
         fn event(state: &mut Self, _: &wl_pointer::WlPointer, event: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-            if let wl_pointer::Event::Enter { surface, surface_x, surface_y, .. } = event {
-                use wayland_client::Proxy;
-                state.pointer_enters.push((surface.id().protocol_id(), surface_x, surface_y));
+            match event {
+                wl_pointer::Event::Enter { surface, surface_x, surface_y, .. } => {
+                    state.pointer_enters.push((surface.id().protocol_id(), surface_x, surface_y));
+                }
+                wl_pointer::Event::Button { serial, state: wayland_client::WEnum::Value(wl_pointer::ButtonState::Pressed), .. } => {
+                    state.pointer_press_serial = Some(serial);
+                }
+                _ => {}
             }
         }
     }
@@ -1007,6 +1024,8 @@ mod tests {
         host_clipboard_images: Vec<Vec<u8>>,
         overlays: Vec<RecordedOverlay>,
         fullscreen_requests: Vec<(String, bool)>,
+        file_drags_started: Vec<(String, u32, Vec<String>)>,
+        file_drags_cancelled: Vec<(String, u32)>,
     }
 
     struct TestSink(Arc<Mutex<WindowLog>>);
@@ -1022,6 +1041,13 @@ mod tests {
         fn set_title(&mut self, _: &str, _: &str) {}
         fn set_fullscreen(&mut self, window_id: &str, fullscreen: bool) {
             self.0.lock().unwrap().fullscreen_requests.push((window_id.into(), fullscreen));
+        }
+        fn begin_file_drag(&mut self, window_id: &str, serial: u32, paths: &[String]) -> bool {
+            self.0.lock().unwrap().file_drags_started.push((window_id.into(), serial, paths.to_vec()));
+            true
+        }
+        fn cancel_file_drag(&mut self, window_id: &str, serial: u32) {
+            self.0.lock().unwrap().file_drags_cancelled.push((window_id.into(), serial));
         }
         fn set_host_clipboard(&mut self, text: &str) {
             self.0.lock().unwrap().host_clipboard_texts.push(text.to_string());
@@ -1100,6 +1126,246 @@ mod tests {
         second_surface.commit();
         pump(&mut display, &mut state, &second_conn, &mut second_queue, &mut second);
         assert_eq!(second.text_input_enters, [second_surface]);
+    }
+
+    #[test]
+    fn wayland_client_drag_finishes_or_cancels_before_the_next_drop() {
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::FileExt;
+        use wayland_client::protocol::wl_data_device_manager::DndAction;
+
+        let event_loop: EventLoop<'static, FocusStageState> = EventLoop::try_new().unwrap();
+        let mut display = Display::new().unwrap();
+        let mut dh = display.handle();
+        let mut state = FocusStageState::new(
+            &dh, event_loop.handle(), "focusstage-drag-test".into(), 1.0, 60,
+            SavedRect { x: 0, y: 0, width: 1920, height: 1080 }, None,
+        );
+        let (server_sock, client_sock) = UnixStream::pair().unwrap();
+        let peer = dh.insert_client(server_sock, Arc::new(ClientState::default())).unwrap();
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue = conn.new_event_queue();
+        let qh = queue.handle();
+        let mut client = TestClient::default();
+        let sid = state.ensure_stage_for_client(&peer);
+        conn.display().get_registry(&qh, ());
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        let manager = client.data_device_manager.clone().unwrap();
+        let device = manager.get_data_device(client.seat.as_ref().unwrap(), &qh, ());
+        let surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
+        let xdg = client.wm_base.as_ref().unwrap().get_xdg_surface(&surface, &qh, ());
+        let _toplevel = xdg.get_toplevel(&qh, ());
+        surface.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let (_pool, buffer) = create_shm_buffer(client.shm.as_ref().unwrap(), &qh, 640, 480);
+        xdg.set_window_geometry(0, 0, 640, 480);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let window_id = state.stages[&sid].active_window().unwrap().id.clone();
+
+        let mime = "text/uri-list";
+        let payload = b"file:///tmp/source.txt\r\n";
+        let new_source = || {
+            let source = manager.create_data_source(&qh, ());
+            source.offer(mime.into());
+            source.set_actions(DndAction::Copy | DndAction::Move);
+            source
+        };
+        let source = new_source();
+        let source_id = source.id().protocol_id();
+        client.source_payloads.insert(source_id, payload.to_vec());
+        state.send_window_button_at(&sid, Some(&window_id), 20.0, 30.0, 0x110, true, 1);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let press = client.pointer_press_serial.unwrap();
+        device.start_drag(Some(&source), &surface, None, press);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let (enter, offer) = client.client_drag_offer.take().unwrap();
+        offer.set_actions(DndAction::Move, DndAction::Move);
+        offer.accept(enter, Some(mime.into()));
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        state.send_window_button_at(&sid, Some(&window_id), 180.0, 130.0, 0x110, false, 2);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(client.drag_drops, 1);
+        let file = tempfile::tempfile().unwrap();
+        offer.receive(mime.into(), file.as_fd());
+        offer.finish();
+        offer.destroy();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let mut bytes = vec![0; payload.len()];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, payload);
+        assert_eq!(client.drag_finished, [source_id]);
+        assert!(state.stages[&sid].input.drag.is_none());
+
+        let cancelled = new_source();
+        state.send_window_button_at(&sid, Some(&window_id), 20.0, 30.0, 0x110, true, 3);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let press = client.pointer_press_serial.unwrap();
+        device.start_drag(Some(&cancelled), &surface, None, press);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let (enter, offer) = client.client_drag_offer.take().unwrap();
+        offer.set_actions(DndAction::Copy, DndAction::Copy);
+        offer.accept(enter, Some(mime.into()));
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        state.send_window_button_at(&sid, Some(&window_id), -10.0, 130.0, 0x110, false, 4);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(client.drag_drops, 1);
+        assert_eq!(client.drag_cancellations, [cancelled.id().protocol_id()]);
+
+        let stale = new_source();
+        device.start_drag(Some(&stale), &surface, None, press);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(client.drag_cancellations, [cancelled.id().protocol_id(), stale.id().protocol_id()]);
+        state.drop_files_to_window(&sid, Some(&window_id), &[r"C:\probe.txt".into()], Some((180.0, 130.0).into())).unwrap();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(client.drag_drops, 2);
+        let (_, offer) = client.client_drag_offer.take().unwrap();
+        let (mut read, write) = UnixStream::pair().unwrap();
+        read.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+        offer.receive(mime.into(), write.as_fd());
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        drop(write);
+        let mut uri = String::new();
+        read.read_to_string(&mut uri).unwrap();
+        assert_eq!(uri, "file:///mnt/c/probe.txt\r\n");
+    }
+
+    #[test]
+    fn wayland_drag_crosses_stages_and_bridges_files_to_windows() {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::FileExt;
+        use wayland_client::protocol::wl_data_device_manager::DndAction;
+        use crate::sink::CapturedDragTarget;
+
+        let mut event_loop: EventLoop<'static, FocusStageState> = EventLoop::try_new().unwrap();
+        let mut display = Display::new().unwrap();
+        let mut dh = display.handle();
+        let log = Arc::new(Mutex::new(WindowLog::default()));
+        let mut state = FocusStageState::new(
+            &dh, event_loop.handle(), "focusstage-cross-drag-test".into(), 1.0, 60,
+            SavedRect { x: 0, y: 0, width: 1920, height: 1080 }, Some(Box::new(TestSink(log.clone()))),
+        );
+
+        let setup_client = |dh: &mut DisplayHandle, state: &mut FocusStageState, display: &mut Display<FocusStageState>| {
+            let (server_sock, client_sock) = UnixStream::pair().unwrap();
+            let peer = dh.insert_client(server_sock, Arc::new(ClientState::default())).unwrap();
+            let conn = Connection::from_socket(client_sock).unwrap();
+            let mut queue = conn.new_event_queue();
+            let qh = queue.handle();
+            let mut client = TestClient::default();
+            let sid = state.ensure_stage_for_client(&peer);
+            conn.display().get_registry(&qh, ());
+            pump(display, state, &conn, &mut queue, &mut client);
+            let manager = client.data_device_manager.clone().unwrap();
+            let device = manager.get_data_device(client.seat.as_ref().unwrap(), &qh, ());
+            let surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
+            let xdg = client.wm_base.as_ref().unwrap().get_xdg_surface(&surface, &qh, ());
+            let _toplevel = xdg.get_toplevel(&qh, ());
+            surface.commit();
+            pump(display, state, &conn, &mut queue, &mut client);
+            let (_pool, buffer) = create_shm_buffer(client.shm.as_ref().unwrap(), &qh, 640, 480);
+            xdg.set_window_geometry(0, 0, 640, 480);
+            surface.attach(Some(&buffer), 0, 0);
+            surface.commit();
+            pump(display, state, &conn, &mut queue, &mut client);
+            let wid = state.stages[&sid].active_window().unwrap().id.clone();
+            (conn, queue, qh, client, sid, wid, manager, device, surface, _pool, buffer, xdg, _toplevel)
+        };
+
+        let (conn_a, mut queue_a, qh_a, mut client_a, sid_a, wid_a, mgr_a, dev_a, surf_a, ..) =
+            setup_client(&mut dh, &mut state, &mut display);
+        let (conn_b, mut queue_b, _qh_b, mut client_b, _sid_b, wid_b, ..) =
+            setup_client(&mut dh, &mut state, &mut display);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let uri_payload = format!("file://{}\r\n", tmp.path().display()).into_bytes();
+        let mime = "text/uri-list";
+
+        // 1. Cross-stage Wayland drag from stage A to stage B.
+        let src1 = mgr_a.create_data_source(&qh_a, ());
+        src1.offer(mime.into());
+        src1.set_actions(DndAction::Copy | DndAction::Move);
+        let src1_id = src1.id().protocol_id();
+        client_a.source_payloads.insert(src1_id, uri_payload.clone());
+        state.send_window_button_at(&sid_a, Some(&wid_a), 20.0, 30.0, 0x110, true, 1);
+        pump(&mut display, &mut state, &conn_a, &mut queue_a, &mut client_a);
+        let press1 = client_a.pointer_press_serial.unwrap();
+        dev_a.start_drag(Some(&src1), &surf_a, None, press1);
+        pump(&mut display, &mut state, &conn_a, &mut queue_a, &mut client_a);
+        state.set_captured_drag_target(
+            &sid_a,
+            &wid_a,
+            Some(CapturedDragTarget::Window { window_id: wid_b.clone(), x: 140.0, y: 120.0 }),
+        );
+        state.send_window_pointer_motion_at(&sid_a, Some(&wid_a), 720.0, 120.0, 2);
+        pump(&mut display, &mut state, &conn_b, &mut queue_b, &mut client_b);
+        let (enter_b, offer_b) = client_b.client_drag_offer.take().unwrap();
+        offer_b.set_actions(DndAction::Copy, DndAction::Copy);
+        offer_b.accept(enter_b, Some(mime.into()));
+        pump(&mut display, &mut state, &conn_b, &mut queue_b, &mut client_b);
+        state.send_window_button_at(&sid_a, Some(&wid_a), 720.0, 120.0, 0x110, false, 3);
+        pump(&mut display, &mut state, &conn_b, &mut queue_b, &mut client_b);
+        assert_eq!(client_b.drag_drops, 1);
+        let recv_file = tempfile::tempfile().unwrap();
+        offer_b.receive(mime.into(), recv_file.as_fd());
+        offer_b.finish();
+        offer_b.destroy();
+        pump(&mut display, &mut state, &conn_b, &mut queue_b, &mut client_b);
+        pump(&mut display, &mut state, &conn_a, &mut queue_a, &mut client_a);
+        let mut received = vec![0; uri_payload.len()];
+        recv_file.read_exact_at(&mut received, 0).unwrap();
+        assert_eq!(received, uri_payload);
+        assert_eq!(client_a.drag_finished, [src1_id]);
+
+        // 2. Dragging outside starts Windows OLE drag; returning to stage B resumes Wayland, then dragging out and dropping finishes as Copy.
+        let src2 = mgr_a.create_data_source(&qh_a, ());
+        src2.offer(mime.into());
+        src2.set_actions(DndAction::Copy | DndAction::Move);
+        let src2_id = src2.id().protocol_id();
+        client_a.source_payloads.insert(src2_id, uri_payload);
+        state.send_window_button_at(&sid_a, Some(&wid_a), 20.0, 30.0, 0x110, true, 4);
+        pump(&mut display, &mut state, &conn_a, &mut queue_a, &mut client_a);
+        let press2 = client_a.pointer_press_serial.unwrap();
+        dev_a.start_drag(Some(&src2), &surf_a, None, press2);
+        pump(&mut display, &mut state, &conn_a, &mut queue_a, &mut client_a);
+        state.set_captured_drag_target(&sid_a, &wid_a, Some(CapturedDragTarget::External));
+        state.send_window_pointer_motion_at(&sid_a, Some(&wid_a), -40.0, 50.0, 5);
+        for _ in 0..40 {
+            pump(&mut display, &mut state, &conn_a, &mut queue_a, &mut client_a);
+            event_loop.dispatch(Some(std::time::Duration::from_millis(10)), &mut state).unwrap();
+            if !log.lock().unwrap().file_drags_started.is_empty() {
+                break;
+            }
+        }
+        let started = log.lock().unwrap().file_drags_started.clone();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].0, wid_a);
+        assert_eq!(started[0].2.len(), 1);
+        assert!(started[0].2[0].ends_with(tmp.path().file_name().unwrap().to_str().unwrap()));
+
+        // Re-entering stage B while button is held resumes Wayland drag on window B.
+        state.handle_file_drag_ended(
+            &wid_a,
+            started[0].1,
+            false,
+            true,
+            Some(CapturedDragTarget::Window { window_id: wid_b.clone(), x: 80.0, y: 90.0 }),
+        );
+        pump(&mut display, &mut state, &conn_b, &mut queue_b, &mut client_b);
+        assert!(client_b.client_drag_offer.take().is_some());
+
+        // Moving back outside starts OLE drag again; dropping on Windows finishes the Wayland source.
+        state.set_captured_drag_target(&sid_a, &wid_a, Some(CapturedDragTarget::External));
+        state.send_window_pointer_motion_at(&sid_a, Some(&wid_a), -40.0, 50.0, 6);
+        assert_eq!(log.lock().unwrap().file_drags_started.len(), 2);
+        state.handle_file_drag_ended(&wid_a, started[0].1, true, false, Some(CapturedDragTarget::External));
+        pump(&mut display, &mut state, &conn_a, &mut queue_a, &mut client_a);
+        assert_eq!(client_a.drag_finished, [src1_id, src2_id]);
+        assert!(state.stages[&sid_a].input.drag.is_none());
+        assert!(state.stages[&sid_a].input.pressed_buttons.is_empty());
     }
 
     #[test]

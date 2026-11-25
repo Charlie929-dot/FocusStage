@@ -77,11 +77,12 @@ use tracing::instrument;
 use wayland_server::{
     backend::GlobalId,
     protocol::{
+        wl_data_device::WlDataDevice,
         wl_data_device_manager::{DndAction, WlDataDeviceManager},
         wl_data_source::WlDataSource,
         wl_surface::WlSurface,
     },
-    Client, DisplayHandle, GlobalDispatch,
+    Client, DisplayHandle, GlobalDispatch, Resource,
 };
 
 use crate::{
@@ -213,6 +214,16 @@ impl DataDeviceState {
     pub fn global(&self) -> GlobalId {
         self.manager_global.clone()
     }
+}
+
+/// Register a data device whose selection requests are handled by the compositor.
+/// This lets Smithay still route drag-and-drop offers to the device.
+pub fn register_data_device<D: DataDeviceHandler + 'static>(seat: &Seat<D>, device: WlDataDevice) {
+    seat.user_data()
+        .insert_if_missing(|| RefCell::new(SeatData::<D::SelectionUserData>::new()));
+    let mut data = seat.user_data().get::<RefCell<SeatData<D::SelectionUserData>>>().unwrap().borrow_mut();
+    data.retain_devices(|d| !matches!(d, super::device::SelectionDevice::DataDevice(d) if !d.is_alive()));
+    data.add_device(super::device::SelectionDevice::DataDevice(device));
 }
 
 /// A simple action chooser for DnD negociation
@@ -472,7 +483,7 @@ mod handlers {
         ) {
             match request {
                 wl_data_device_manager::Request::CreateDataSource { id } => {
-                    data_init.init(id, DataSourceUserData::new());
+                    data_init.init(id, DataSourceUserData::default());
                 }
                 wl_data_device_manager::Request::GetDataDevice { id, seat: wl_seat } => {
                     match Seat::<D>::from_resource(&wl_seat) {
