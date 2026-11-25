@@ -65,17 +65,18 @@ impl<D: SeatHandler + 'static> fmt::Debug for DnDGrab<D> {
 }
 
 impl<D: SeatHandler> DnDGrab<D> {
-    pub(crate) fn new_pointer(
+    /// Create a client drag whose motion and release are routed by the compositor itself.
+    /// The compositor must validate the initiating implicit grab and call `finish` on release or cancellation.
+    pub fn new_manual(
         dh: &DisplayHandle,
-        start_data: PointerGrabStartData<D>,
-        source: Option<wl_data_source::WlDataSource>,
+        source: Option<WlDataSource>,
         origin: WlSurface,
         seat: Seat<D>,
         icon: Option<WlSurface>,
     ) -> Self {
         Self {
             dh: dh.clone(),
-            pointer_start_data: Some(start_data),
+            pointer_start_data: None,
             touch_start_data: None,
             data_source: source,
             current_focus: None,
@@ -87,26 +88,26 @@ impl<D: SeatHandler> DnDGrab<D> {
         }
     }
 
-    pub(crate) fn new_touch(
+    pub(crate) fn new_pointer(
         dh: &DisplayHandle,
-        start_data: TouchGrabStartData<D>,
-        source: Option<wl_data_source::WlDataSource>,
+        start_data: PointerGrabStartData<D>,
+        source: Option<WlDataSource>,
         origin: WlSurface,
         seat: Seat<D>,
         icon: Option<WlSurface>,
     ) -> Self {
-        Self {
-            dh: dh.clone(),
-            pointer_start_data: None,
-            touch_start_data: Some(start_data),
-            data_source: source,
-            current_focus: None,
-            pending_offers: Vec::with_capacity(1),
-            offer_data: None,
-            origin,
-            icon,
-            seat,
-        }
+        Self { pointer_start_data: Some(start_data), ..Self::new_manual(dh, source, origin, seat, icon) }
+    }
+
+    pub(crate) fn new_touch(
+        dh: &DisplayHandle,
+        start_data: TouchGrabStartData<D>,
+        source: Option<WlDataSource>,
+        origin: WlSurface,
+        seat: Seat<D>,
+        icon: Option<WlSurface>,
+    ) -> Self {
+        Self { touch_start_data: Some(start_data), ..Self::new_manual(dh, source, origin, seat, icon) }
     }
 }
 
@@ -116,7 +117,8 @@ where
     D: SeatHandler,
     D: 'static,
 {
-    fn update_focus<F: WaylandFocus>(
+    /// Update the drop target. `None` clears the target so a subsequent `finish` cancels.
+    pub fn update_focus<F: WaylandFocus>(
         &mut self,
         focus: Option<(F, Point<f64, Logical>)>,
         location: Point<f64, Logical>,
@@ -224,7 +226,12 @@ where
         }
     }
 
-    fn drop(&mut self, data: &mut D) {
+    /// Complete a negotiated drop, or report cancellation to the source.
+    pub fn finish(mut self, data: &mut D) {
+        self.end(data);
+    }
+
+    fn end(&mut self, data: &mut D) {
         // the user dropped, proceed to the drop
         let seat_data = self
             .seat
@@ -400,7 +407,7 @@ where
     }
 
     fn unset(&mut self, data: &mut D) {
-        self.drop(data);
+        self.end(data);
     }
 }
 
@@ -492,7 +499,7 @@ where
     }
 
     fn unset(&mut self, data: &mut D) {
-        self.drop(data);
+        self.end(data);
     }
 }
 

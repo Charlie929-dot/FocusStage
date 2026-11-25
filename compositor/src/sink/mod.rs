@@ -10,13 +10,23 @@ pub enum SinkInputEvent {
         window_id: String,
         x: f64,
         y: f64,
+        drag_target: Option<CapturedDragTarget>,
     },
     PointerButton {
         window_id: String,
         button: u32,
         pressed: bool,
+        cancelled: bool,
         x: f64,
         y: f64,
+        drag_target: Option<CapturedDragTarget>,
+    },
+    FileDragEnded {
+        window_id: String,
+        serial: u32,
+        dropped: bool,
+        continuing: bool,
+        drag_target: Option<CapturedDragTarget>,
     },
     PointerScroll {
         window_id: String,
@@ -73,6 +83,14 @@ pub enum SinkInputEvent {
     },
 }
 
+/// Real HWND under the pointer when the source Window holds native mouse capture.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CapturedDragTarget {
+    Window { window_id: String, x: f64, y: f64 },
+    External,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentOverlay<'a> {
     pub window_id: &'a str,
@@ -126,6 +144,8 @@ pub trait DisplaySink {
     fn minimize(&mut self, _window_id: &str) {}
     fn set_maximized(&mut self, _window_id: &str, _maximized: bool) {}
     fn set_fullscreen(&mut self, _window_id: &str, _fullscreen: bool) {}
+    fn begin_file_drag(&mut self, _window_id: &str, _serial: u32, _paths: &[String]) -> bool { false }
+    fn cancel_file_drag(&mut self, _window_id: &str, _serial: u32) {}
     fn set_host_clipboard(&mut self, _text: &str) {}
     fn set_host_clipboard_image(&mut self, _png_bytes: &[u8]) {}
     fn activate(&mut self, _window_id: &str) {}

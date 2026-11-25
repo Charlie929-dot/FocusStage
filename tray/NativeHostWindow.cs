@@ -22,6 +22,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
 
     private readonly string _id;
     private readonly Action<object> _emit;
+    private readonly Func<NativePoint, NativeHost.DragTarget?> _findDragTarget;
     private readonly NativeHostRenderer _renderer;
     private readonly Icon? _appIcon;
     private string? _stageId;
@@ -49,10 +50,12 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         bool Resizing, int Tiled);
 
     internal NativeHostWindow(string id, NativeHostRenderer.Factory renderer, Action<object> emit,
-        NativeHost.WindowRect initialRect, double initialScale, string wmClass, string? iconPng)
+        Func<NativePoint, NativeHost.DragTarget?> findDragTarget, NativeHost.WindowRect initialRect,
+        double initialScale, string wmClass, string? iconPng)
     {
         _id = id;
         _emit = emit;
+        _findDragTarget = findDragTarget;
         _renderer = new NativeHostRenderer(renderer);
         CreateHandle(new CreateParams
         {

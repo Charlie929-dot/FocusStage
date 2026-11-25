@@ -483,6 +483,8 @@ internal static class NativeHostInterop
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern bool SetWindowPos(nint hwnd, nint insertAfter, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll")] internal static extern bool GetCursorPos(out NativePoint point);
+    [DllImport("user32.dll")] internal static extern nint WindowFromPoint(NativePoint point);
+    [DllImport("user32.dll")] internal static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll")] internal static extern nint SetCursor(nint cursor);
     [DllImport("user32.dll")] internal static extern nint GetCapture();
     [DllImport("user32.dll")] internal static extern nint SetCapture(nint hwnd);

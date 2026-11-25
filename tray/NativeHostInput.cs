@@ -39,7 +39,8 @@ internal sealed partial class NativeHostWindow
                 }
                 UpdateBannerHover(false);
                 var (x, y) = LogicalPoint(_lastPointer);
-                _emit(new { type = "pointer_motion", window_id = _id, x, y });
+                var dragTarget = _buttonsDown.Count != 0 ? DragTargetAt(_lastPointer) : null;
+                _emit(new { type = "pointer_motion", window_id = _id, x, y, drag_target = dragTarget });
                 return true;
             case WmMouseLeave:
                 UpdateBannerHover(false);
@@ -162,10 +163,42 @@ internal sealed partial class NativeHostWindow
         }
     }
 
-    private void EmitButton(int button, bool pressed)
+    private void EmitButton(int button, bool pressed, bool cancelled = false)
     {
         var (x, y) = LogicalPoint(_lastPointer);
-        _emit(new { type = "pointer_button", window_id = _id, x, y, button, pressed });
+        var dragTarget = cancelled ? null : DragTargetAt(_lastPointer);
+        _emit(new { type = "pointer_button", window_id = _id, x, y, button, pressed, cancelled, drag_target = dragTarget });
+    }
+
+    private NativeHost.DragTarget? DragTargetAt(NativePoint point) =>
+        ClientToScreen(Handle, ref point) ? _findDragTarget(point) : null;
+
+    internal bool CanStartFileDrag => Handle != 0 && _buttonsDown.Contains(BtnLeft)
+        && GetCapture() == Handle && (GetAsyncKeyState(1) & 0x8000) != 0;
+
+    internal bool SuspendFileDrag()
+    {
+        if (!CanStartFileDrag)
+            return false;
+        // OLE manages capture until it returns. Do not synthesize a release on handoff.
+        _buttonsDown.Clear();
+        ReleaseCapture();
+        return true;
+    }
+
+    internal void ResumeFileDrag()
+    {
+        _buttonsDown.Add(BtnLeft);
+        SetCapture(Handle);
+    }
+
+    internal NativeHost.DragTarget? DragTargetForScreenPoint(NativePoint point)
+    {
+        if (!ScreenToClient(Handle, ref point) || !GetClientRect(Handle, out var rect)
+            || point.X < 0 || point.Y < 0 || point.X >= rect.Right || point.Y >= rect.Bottom)
+            return null;
+        var (x, y) = LogicalPoint(point);
+        return new NativeHost.DragTarget("window", _id, x, y);
     }
 
     private void ScrollMessage(Message message)
@@ -612,7 +645,7 @@ internal sealed partial class NativeHostWindow
             if (GetCursorPos(out var point) && ScreenToClient(Handle, ref point))
                 _lastPointer = point;
             foreach (int button in _buttonsDown)
-                EmitButton(button, false);
+                EmitButton(button, false, cancelled: true);
             _buttonsDown.Clear();
             FinishPointerDrag();
         }

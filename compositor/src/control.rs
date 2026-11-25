@@ -638,6 +638,9 @@ impl FocusStageState {
             self.expire_stage_lease(stage_id);
         }
 
+        if self.stages[stage_id].input.drag.is_some() {
+            self.release_all_stage_inputs(stage_id);
+        }
         self.next_lease_seq += 1;
         let lease_id = format!("lease-{}-{}", stage_id, self.next_lease_seq);
         let ttl = Duration::from_secs(ttl_s.clamp(1, 3600));
@@ -895,6 +898,9 @@ impl FocusStageState {
             return ControlResponse::Ok;
         }
         stage.display = display;
+        if stage.input.drag.is_some() {
+            self.release_all_stage_inputs(stage_id);
+        }
 
         self.update_stage_window_visibility(stage_id);
         if display == DisplayState::Hidden {
@@ -912,6 +918,8 @@ impl FocusStageState {
         };
         if frozen && stage.lease.is_some() {
             self.end_stage_lease(stage_id, LeaseEnd::Preempted);
+        } else if frozen && stage.input.drag.is_some() {
+            self.release_all_stage_inputs(stage_id);
         }
         let stage = self.stages.get_mut(stage_id).unwrap();
         if frozen {

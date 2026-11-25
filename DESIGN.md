@@ -217,6 +217,7 @@ FocusStage 要实现的体验：
 - 引导应用的默认目录（XDG User Dirs）指向 `/mnt/c/Users/<user>/` 下的桌面、下载、文档与图片目录；
 - 已知限制：`/mnt/c` 走 9P 文件系统，大量小文件读写（如大仓库构建）明显变慢，对性能敏感的项目建议放在 WSL 原生文件系统中；
 - 从资源管理器拖文件到宿主窗口（或 AI 调用 `stage_drop_files`）：路径 `C:\...` 转为 `/mnt/c/...`，经 `wl_data_device` 投递拖放；
+- Wayland 应用发起拖放时，FocusStage 按鼠标落点在同窗口或跨宿主窗口间转发 Wayland 拖放；将带本地文件（`text/uri-list`）的拖拽移到 FocusStage 窗口之外时，交给 Windows 原生 OLE 拖放（仅复制 `CF_HDROP`），拖回宿主窗口则交还 Wayland 拖拽；
 - **默认应用与协议关联（XDG / URI 路由）**：通过 `focusstage settings`（及启动器中的「舞台中心 → Linux 设置」）维护 `~/.config/focusstage/settings.json` 与用户级 `mimeapps.list` / handler `.desktop` 条目，把 `xdg-open` / `gio open` / `focusstage-open` 收到的 `http(s)`、自定义协议（如 `vscode://`）和本地文件交由 `focusstage open --ensure-daemon` 路由到对应 Stage；默认浏览器支持托管 Linux 浏览器或仅限 HTTP(S) 的 Windows 默认浏览器（`windows-host`）；
 - **桌面会话、认证与图标主题**：`focusstaged` 与 `focusstage` 通过 `SessionEnv` 统一解析并向 `systemd --user` 同步桌面环境变量；`focusstaged` 内置原生 Polkit D-Bus 认证代理（`polkit.rs`），将 `pkexec` / 系统提权请求转交给 Windows 宿主弹出原生 Win32 提权框（`NativeElevationDialog`），不再依赖 `policykit-1-gnome`；`focusstage list-apps` / `sync-apps` 通过 Linux GTK 图标主题解析并缓存应用图标供启动器和 Windows 开始菜单复用。
 

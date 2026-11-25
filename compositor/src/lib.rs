@@ -4,6 +4,7 @@ pub mod clipboard;
 pub mod control;
 pub mod desktop;
 mod dpi;
+mod dnd;
 pub mod icons;
 pub mod keyring;
 pub mod manager;

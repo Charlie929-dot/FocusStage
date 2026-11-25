@@ -619,6 +619,10 @@ impl OpenTarget {
         &self.uri
     }
 
+    pub(crate) fn local_path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+
     fn mime_type(&self) -> Result<String> {
         let Some(path) = &self.path else {
             return Ok(format!("x-scheme-handler/{}", self.scheme));

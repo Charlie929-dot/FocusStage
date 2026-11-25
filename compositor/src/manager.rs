@@ -226,6 +226,7 @@ impl FocusStageState {
     }
 
     pub fn close_stage(&mut self, stage_id: &str) -> Result<(), String> {
+        self.cancel_stage_drag(stage_id);
         let mut stage = self
             .stages
             .remove(stage_id)
