@@ -87,11 +87,15 @@ impl XwmHandler for FocusStageState {
             known.set_mapped_size(window.geometry().size);
             known.id.clone()
         } else {
-            let size = if stage.windows.is_empty() {
+            let size = if stage.windows.is_empty() && !stage.persistent_helper {
                 stage.logical_size()
             } else {
                 let geo = window.geometry();
-                (geo.size.w.max(1), geo.size.h.max(1)).into()
+                if geo.size.w > 1 && geo.size.h > 1 {
+                    geo.size
+                } else {
+                    stage.logical_size()
+                }
             };
             stage.add_window(toplevel, size)
         };

@@ -40,6 +40,8 @@ enum Commands {
         #[arg(long)]
         native_host: Option<String>,
     },
+    /// Ensure the FocusStage-hosted Polkit authentication agent is ready
+    EnsurePolkitAgent,
     /// Ping focusstaged
     Ping,
     /// List active Stages
@@ -226,6 +228,22 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if matches!(cli.command, Commands::EnsurePolkitAgent) {
+        let client = ControlClient::new(sock);
+        let mut last = ControlResponse::PolkitAgent { ready: false };
+        for attempt in 0..60 {
+            last = client.call(&ControlRequest::EnsurePolkitAgent)?;
+            if matches!(last, ControlResponse::PolkitAgent { ready: true }) {
+                break;
+            }
+            if attempt < 59 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        print_resp(&last, cli.json);
+        return Ok(());
+    }
+
     if matches!(cli.command, Commands::ListApps) {
         return run_list_apps(&sock, cli.json);
     }
@@ -300,7 +318,7 @@ fn main() -> anyhow::Result<()> {
 
     let client = ControlClient::new(sock);
     let req = match cli.command {
-        Commands::Mcp | Commands::EnsureDaemon { .. } => unreachable!(),
+        Commands::Mcp | Commands::EnsureDaemon { .. } | Commands::EnsurePolkitAgent => unreachable!(),
         Commands::Ping => ControlRequest::Ping,
         Commands::List => ControlRequest::List,
         Commands::Launch {

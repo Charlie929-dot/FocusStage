@@ -121,7 +121,10 @@ internal static class NativeHost
 
             try
             {
-                // Dispatch raw keys directly; the Linux client handles character input.
+                const uint wmKeyDown = 0x0100, wmSysKeyDown = 0x0104;
+                const nuint vkPacket = 0xE7;
+                // Dispatch physical keys directly; translate only VK_PACKET (KEYEVENTF_UNICODE)
+                // so remote/synthetic Unicode text produces WM_CHAR without duplicating hardware keys.
                 while (true)
                 {
                     int result = GetMessage(out var message, 0, 0, 0);
@@ -129,6 +132,8 @@ internal static class NativeHost
                         break;
                     if (result < 0)
                         throw new Win32Exception();
+                    if (message.Message is wmKeyDown or wmSysKeyDown && message.WParam == vkPacket)
+                        TranslateMessage(in message);
                     Dispatch(in message);
                 }
             }

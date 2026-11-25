@@ -118,6 +118,9 @@ pub struct StageInputState {
     pub current_pointer_target: Option<StageInputTarget>,
     /// Whether a temporary custom keymap is currently uploaded to clients
     pub custom_keymap_active: bool,
+    /// Round-robin Unicode keysym slots mapped on unused high evdev keycodes (231..=239, 241..=247)
+    pub unicode_slots: [(u32, Option<char>); 16],
+    pub unicode_next_slot: usize,
     /// Whether the AI virtual cursor should be drawn on desktop overlay windows
     pub agent_pointer_visible: bool,
     /// Current AI virtual cursor visual action state ("idle" | "move" | "down" | "click" | "drag" | "scroll")
@@ -156,6 +159,25 @@ impl StageInputState {
             current_keyboard_target: None,
             current_pointer_target: None,
             custom_keymap_active: false,
+            unicode_slots: [
+                (231, None),
+                (232, None),
+                (233, None),
+                (234, None),
+                (235, None),
+                (236, None),
+                (237, None),
+                (238, None),
+                (239, None),
+                (241, None),
+                (242, None),
+                (243, None),
+                (244, None),
+                (245, None),
+                (246, None),
+                (247, None),
+            ],
+            unicode_next_slot: 0,
             agent_pointer_visible: false,
             agent_pointer_state: "idle",
             x11_axis_primed: false,
@@ -296,6 +318,8 @@ pub struct Stage {
     pub active_window_id: Option<String>,
     pub window_seq: u64,
     pub retire_when_empty: bool,
+    pub persistent_helper: bool,
+    pub helper_unit: Option<String>,
 
     pub input: StageInputState,
     pub clipboard: StageClipboard,
@@ -406,6 +430,8 @@ impl Stage {
             active_window_id: None,
             window_seq: 0,
             retire_when_empty: false,
+            persistent_helper: false,
+            helper_unit: None,
             input: StageInputState::new(),
             clipboard: StageClipboard::default(),
             xwayland: None,
@@ -420,7 +446,11 @@ impl Stage {
     pub fn add_window(&mut self, toplevel: StageToplevel, size: Size<i32, Logical>) -> String {
         self.window_seq += 1;
         let id = format!("{}/{}", self.id, self.window_seq);
-        let cascade = ((self.window_seq - 1) % 8) as i32 * 24;
+        let cascade = if self.persistent_helper {
+            0
+        } else {
+            ((self.window_seq - 1) % 8) as i32 * 24
+        };
         self.windows.push(StageWindow {
             id: id.clone(),
             toplevel,

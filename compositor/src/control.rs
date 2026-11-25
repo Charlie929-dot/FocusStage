@@ -385,7 +385,12 @@ impl FocusStageState {
                 });
             }
             ControlRequest::List => {
-                let mut stages: Vec<_> = self.stages.values().map(|s| s.info()).collect();
+                let mut stages: Vec<_> = self
+                    .stages
+                    .values()
+                    .filter(|s| !s.persistent_helper || s.has_live_surface())
+                    .map(|s| s.info())
+                    .collect();
                 stages.sort_by(|a, b| a.stage_id.cmp(&b.stage_id));
                 let _ = reply_tx.send(ControlResponse::Stages { stages });
             }
@@ -538,6 +543,14 @@ impl FocusStageState {
             }
             ControlRequest::ListApps => {
                 let _ = reply_tx.send(handle_list_apps());
+            }
+            ControlRequest::EnsurePolkitAgent => {
+                let ready = if self.display_sink.is_some() {
+                    self.ensure_polkit_agent_stage().unwrap_or(false)
+                } else {
+                    false
+                };
+                let _ = reply_tx.send(ControlResponse::PolkitAgent { ready });
             }
             ControlRequest::Settings { action } => {
                 let _ = reply_tx.send(handle_settings(action));

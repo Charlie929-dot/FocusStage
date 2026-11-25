@@ -51,83 +51,6 @@ struct Args {
     native_host: Option<PathBuf>,
 }
 
-fn ensure_desktop_session_helpers() {
-    use std::process::{Command, Stdio};
-
-    let already_running = Command::new("pgrep")
-        .args(["-u", &unsafe { libc::geteuid() }.to_string(), "-f", "polkit-.*authentication-agent|lxpolkit"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if already_running {
-        return;
-    }
-
-    let agent_candidates = [
-        "/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1",
-        "/usr/libexec/polkit-gnome-authentication-agent-1",
-        "/usr/libexec/polkit-mate-authentication-agent-1",
-        "/usr/bin/lxpolkit",
-    ];
-    let Some(agent_bin) = agent_candidates
-        .iter()
-        .find(|p| std::path::Path::new(p).is_file())
-    else {
-        return;
-    };
-
-    let x_display = std::env::var("DISPLAY")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| ":0".to_string());
-    let mut cmd = Command::new("systemd-run");
-    cmd.args([
-        "--user",
-        "--collect",
-        "--unit=focusstage-polkit-agent",
-        "-E",
-        &format!("DISPLAY={x_display}"),
-    ]);
-    if let Ok(xauth) = std::env::var("XAUTHORITY") {
-        if !xauth.is_empty() {
-            cmd.args(["-E", &format!("XAUTHORITY={xauth}")]);
-        }
-    } else if std::path::Path::new("/mnt/wslg/.Xauthority").exists() {
-        cmd.args(["-E", "XAUTHORITY=/mnt/wslg/.Xauthority"]);
-    }
-    // polkit-gnome segfaults under Wayland; force X11 on WSLg so prompts render reliably.
-    cmd.args([
-        "/usr/bin/env",
-        "-u",
-        "WAYLAND_DISPLAY",
-        "GDK_BACKEND=x11",
-        agent_bin,
-    ])
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null());
-
-    match cmd.status() {
-        Ok(s) if s.success() => {
-            info!(
-                "Started Polkit authentication agent ({}) on DISPLAY={}",
-                agent_bin, x_display
-            );
-        }
-        Ok(s) => {
-            warn!("systemd-run focusstage-polkit-agent exited with {}", s);
-        }
-        Err(e) => {
-            warn!(
-                "Failed to start Polkit authentication agent ({}): {}",
-                agent_bin, e
-            );
-        }
-    }
-}
-
 fn installed_native_host() -> Option<PathBuf> {
     let config = std::env::var_os("XDG_CONFIG_HOME").filter(|p| !p.is_empty())
         .map(PathBuf::from)
@@ -172,7 +95,6 @@ fn main() -> anyhow::Result<()> {
     std::env::set_var("FOCUSSTAGE_SOCKET", &control_socket);
     if !args.headless {
         session_env::sync_desktop_session_environment();
-        ensure_desktop_session_helpers();
     }
     let (display_sink, monitor, scale) = connect_desktop(&args);
 
@@ -201,6 +123,9 @@ fn main() -> anyhow::Result<()> {
         monitor,
         display_sink,
     );
+    if !args.headless && state.display_sink.is_some() {
+        state.ensure_session_helper_stages();
+    }
 
     info!(
         "focusstaged started: WAYLAND_DISPLAY={}, control_socket={}, desktop={}",
@@ -351,6 +276,10 @@ fn main() -> anyhow::Result<()> {
         event_loop.dispatch(None, &mut state)?;
     }
 
+    let stage_ids: Vec<String> = state.stages.keys().cloned().collect();
+    for id in stage_ids {
+        let _ = state.close_stage(&id);
+    }
     let _ = std::fs::remove_file(&control_socket);
     info!("focusstaged shut down cleanly");
     Ok(())
@@ -397,6 +326,9 @@ fn dispatch_sink_events(state: &mut FocusStageState) -> bool {
             }
             SinkInputEvent::Key { window_id, evdev_keycode, pressed } => {
                 state.handle_sink_key(&window_id, evdev_keycode, pressed);
+            }
+            SinkInputEvent::TextInput { window_id, text } => {
+                state.handle_sink_text_input(&window_id, &text);
             }
             SinkInputEvent::CancelTakeover { window_id } => {
                 state.handle_sink_cancel_takeover(&window_id);

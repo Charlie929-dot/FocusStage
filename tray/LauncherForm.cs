@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -31,6 +32,11 @@ internal sealed class LauncherForm : Form
     private LauncherLayout _layout = LauncherLayout.LoadExistingReadOnly();
     private List<StageDto> _stages = new();
     private bool _daemonAlive;
+
+    private const uint AsfwAny = 0xFFFFFFFF;
+
+    [DllImport("user32.dll")]
+    private static extern bool AllowSetForegroundWindow(uint dwProcessId);
 
     private CancellationTokenSource? _launcherSession;
     private UbuntuSessionAuthorization? _ubuntuAuthorization;
@@ -199,6 +205,7 @@ internal sealed class LauncherForm : Form
                 {
                     await _ctx.StartDaemonAsync();
                 }
+                AllowSetForegroundWindow(AsfwAny);
                 result = await LauncherAuthentication.VerifyLinuxAsync(_distro, uid, cancellation);
             }
 
@@ -243,7 +250,7 @@ internal sealed class LauncherForm : Form
             return BuildSessionPayload(result switch
             {
                 LauncherAuthResult.Canceled => "验证已取消。请选择一种方式重试。",
-                LauncherAuthResult.LinuxUnavailable => "无法打开 Linux 认证窗口。请检查 WSLg 和 Polkit，或使用 Windows Hello。",
+                LauncherAuthResult.LinuxUnavailable => "无法打开 Linux 认证窗口。请检查 Polkit 认证代理是否可用，或使用 Windows Hello。",
                 LauncherAuthResult.LinuxAccountUnavailable => "没有可用的 Ubuntu 密码验证账号。请使用 Windows Hello。",
                 _ => null,
             });

@@ -1121,46 +1121,55 @@ impl FocusStageState {
         ch: char,
         xwm_id: Option<smithay::xwayland::xwm::XwmId>,
     ) {
-        let keysym_val = if (ch as u32) >= 0x20 {
-            0x0100_0000 + (ch as u32)
-        } else {
+        if (ch as u32) < 0x20 {
+            return;
+        }
+
+        let Some(stage) = self.stages.get_mut(stage_id) else {
             return;
         };
 
-        // Wayland temporary keymap upload on a single unused evdev keycode (200 -> XKB <I208>)
-        if let Some(stage) = self.stages.get(stage_id) {
-            let base_str = stage
-                .input
-                .xkb_keymap
-                .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
-            // Replace key <FK13> or <I208> symbol in the XKB keymap string if present, or append a custom symbol
-            let sym_name = format!("U{:04X}", ch as u32);
-            let patched = inject_keysym_into_xkb(&base_str, &sym_name);
-            if let Some(temp_km) = xkb::Keymap::new_from_string(
-                &stage.input.xkb_context,
-                patched,
-                xkb::KEYMAP_FORMAT_TEXT_V1,
-                xkb::KEYMAP_COMPILE_NO_FLAGS,
-            ) {
-                let km_file = KeymapFile::new(&temp_km);
-                self.send_keymap_to_stage_clients(stage_id, &km_file);
-                // Keycode 191 = <FK13> (evdev 183 + 8 = 191)
-                self.send_stage_evdev_key(stage_id, 183, true);
-                self.send_stage_evdev_key(stage_id, 183, false);
-
-                // Restore standard keymap
-                if let Some(stage) = self.stages.get(stage_id) {
-                    let orig_file = KeymapFile::new(&stage.input.xkb_keymap);
-                    self.send_keymap_to_stage_clients(stage_id, &orig_file);
-                }
-                return;
-            }
+        if let Some((evdev_code, _)) = stage.input.unicode_slots.iter().copied().find(|(_, mapped)| *mapped == Some(ch)) {
+            self.send_stage_evdev_key(stage_id, evdev_code, true);
+            self.send_stage_evdev_key(stage_id, evdev_code, false);
+            return;
         }
 
-        // Fallback for X11 if needed (uses x11rb change_keyboard_mapping if available)
+        let slot_idx = stage.input.unicode_next_slot % stage.input.unicode_slots.len();
+        stage.input.unicode_next_slot = (slot_idx + 1) % stage.input.unicode_slots.len();
+        let evdev_code = stage.input.unicode_slots[slot_idx].0;
+        stage.input.unicode_slots[slot_idx].1 = Some(ch);
+        let active_slots: Vec<(u32, char)> = stage
+            .input
+            .unicode_slots
+            .iter()
+            .filter_map(|(code, mapped)| mapped.map(|c| (*code, c)))
+            .collect();
+
+        let base_str = stage
+            .input
+            .xkb_keymap
+            .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+        let patched = inject_unicode_slots_into_xkb(&base_str, &active_slots);
+        if let Some(temp_km) = xkb::Keymap::new_from_string(
+            &stage.input.xkb_context,
+            patched,
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        ) {
+            stage.input.custom_keymap_active = true;
+            let km_file = KeymapFile::new(&temp_km);
+            self.send_keymap_to_stage_clients(stage_id, &km_file);
+            // Keep the slot mapped rather than immediately reverting to orig_km in the same flush;
+            // XWayland/X11 clients process MappingNotify asynchronously relative to KeyPress.
+            self.send_stage_evdev_key(stage_id, evdev_code, true);
+            self.send_stage_evdev_key(stage_id, evdev_code, false);
+            return;
+        }
+
         if let Some(id) = xwm_id {
-            let _ = (id, keysym_val);
-            warn!("Unicode character '{}' fallback skipped on X11 without XKB keymap", ch);
+            let _ = id;
+            warn!("Unicode character '{}' fallback skipped without valid XKB keymap", ch);
         }
     }
 
@@ -1339,17 +1348,30 @@ impl FocusStageState {
     }
 }
 
-fn inject_keysym_into_xkb(keymap_str: &str, keysym_name: &str) -> String {
-    if let Some(idx) = keymap_str.find("key <FK13>") {
-        if let Some(end) = keymap_str[idx..].find("};") {
-            let mut out = String::with_capacity(keymap_str.len() + 64);
-            out.push_str(&keymap_str[..idx]);
-            out.push_str(&format!("key <FK13> {{ [ {} ] }};", keysym_name));
-            out.push_str(&keymap_str[idx + end + 2..]);
-            return out;
+fn inject_unicode_slots_into_xkb(keymap_str: &str, slots: &[(u32, char)]) -> String {
+    let mut out = keymap_str.to_string();
+    let mut missing = String::new();
+    for &(evdev_code, ch) in slots {
+        let xkb_code = evdev_code + 8;
+        let key_name = format!("<I{xkb_code}>");
+        let needle = format!("key {key_name}");
+        let replacement = format!("key {key_name} {{ [ U{:04X} ] }};", ch as u32);
+        if let Some(idx) = out.find(&needle) {
+            if let Some(end) = out[idx..].find("};") {
+                out.replace_range(idx..idx + end + 2, &replacement);
+                continue;
+            }
+        }
+        missing.push_str(&format!("\n    {replacement}"));
+    }
+    if !missing.is_empty() {
+        if let Some(sym_idx) = out.find("xkb_symbols") {
+            if let Some(rel_end) = out[sym_idx..].find("\n};") {
+                out.insert_str(sym_idx + rel_end, &missing);
+            }
         }
     }
-    keymap_str.to_string()
+    out
 }
 
 pub fn mouse_button_code(name: &str) -> u32 {
@@ -1522,4 +1544,29 @@ pub fn us_char_to_evdev(ch: char) -> Option<(u32, bool)> {
         ' ' => (57, false),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod unicode_keymap_tests {
+    use super::*;
+    use crate::stage::StageInputState;
+
+    #[test]
+    fn unicode_slots_compile_and_preserve_multiple_mappings() {
+        let input = StageInputState::new();
+        let base_str = input.xkb_keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+        let slots = [(231, '你'), (232, '好'), (241, '🚀')];
+        let patched = inject_unicode_slots_into_xkb(&base_str, &slots);
+        let km = xkb::Keymap::new_from_string(
+            &input.xkb_context,
+            patched,
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("patched unicode XKB keymap must compile");
+        let state = xkb::State::new(&km);
+        assert_eq!(state.key_get_utf8((231u32 + 8).into()), "你");
+        assert_eq!(state.key_get_utf8((232u32 + 8).into()), "好");
+        assert_eq!(state.key_get_utf8((241u32 + 8).into()), "🚀");
+    }
 }

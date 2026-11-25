@@ -55,29 +55,50 @@ internal static class LauncherAuthentication
             return LauncherAuthResult.LinuxAccountUnavailable;
 
         cancellation.ThrowIfCancellationRequested();
-        var unit = $"focusstage-launcher-auth-{Guid.NewGuid():N}.service";
-        const string confirmation = "FocusStageVerified";
-        var verification = ShortcutManager.RunWslAsync(distro, user, 100,
-            "/usr/bin/systemd-run", "--user", "--wait", "--pipe", "--quiet", "--collect",
-            $"--unit={unit}", "--property=RuntimeMaxSec=90s",
-            "/usr/bin/pkexec", "--disable-internal-agent", UbuntuSessionAuthorization.HelperPath, "verify");
-        try
+        // Ensure the FocusStage-hosted XWayland Polkit agent is up before pkexec requests auth.
+        var (agentCode, agentOutput, _) = await ShortcutManager.RunWslAsync(
+            distro, user, 10, "/usr/local/bin/focusstage", "--json", "ensure-polkit-agent").WaitAsync(cancellation);
+        if (agentCode == 0 && agentOutput.Contains("\"ready\":true", StringComparison.Ordinal))
         {
-            var (resultCode, output, _) = await verification.WaitAsync(cancellation);
-            // Stopping a systemd service can report success without running the authorized command.
-            return resultCode switch
-            {
-                0 when output == confirmation => LauncherAuthResult.Verified,
-                0 or 126 => LauncherAuthResult.Canceled,
-                _ => LauncherAuthResult.LinuxUnavailable,
-            };
+            await Task.Delay(150, cancellation);
         }
-        finally
+
+        const string confirmation = "FocusStageVerified";
+        for (var attempt = 0; attempt < 2; attempt++)
         {
-            if (cancellation.IsCancellationRequested)
+            cancellation.ThrowIfCancellationRequested();
+            var unit = $"focusstage-launcher-auth-{Guid.NewGuid():N}.service";
+            var startedAt = Environment.TickCount64;
+            var verification = ShortcutManager.RunWslAsync(distro, user, 100,
+                "/usr/bin/systemd-run", "--user", "--wait", "--pipe", "--quiet", "--collect",
+                $"--unit={unit}", "--property=RuntimeMaxSec=90s",
+                "/usr/bin/pkexec", "--disable-internal-agent", UbuntuSessionAuthorization.HelperPath, "verify");
+            try
             {
-                _ = ShortcutManager.RunWslAsync(distro, user, 15, "/usr/bin/systemctl", "--user", "stop", unit);
+                var (resultCode, output, _) = await verification.WaitAsync(cancellation);
+                // If the Polkit agent just started and hadn't registered on D-Bus yet, pkexec fails
+                // immediately with 127; give it a brief moment and retry once.
+                if (resultCode == 127 && attempt == 0 && Environment.TickCount64 - startedAt < 2500)
+                {
+                    await Task.Delay(350, cancellation);
+                    continue;
+                }
+                // Stopping a systemd service can report success without running the authorized command.
+                return resultCode switch
+                {
+                    0 when output == confirmation => LauncherAuthResult.Verified,
+                    0 or 126 => LauncherAuthResult.Canceled,
+                    _ => LauncherAuthResult.LinuxUnavailable,
+                };
+            }
+            finally
+            {
+                if (cancellation.IsCancellationRequested)
+                {
+                    _ = ShortcutManager.RunWslAsync(distro, user, 15, "/usr/bin/systemctl", "--user", "stop", unit);
+                }
             }
         }
+        return LauncherAuthResult.LinuxUnavailable;
     }
 }

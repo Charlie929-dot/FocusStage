@@ -309,6 +309,7 @@ pub enum ControlRequest {
         position: Option<[f64; 2]>,
     },
     ListApps,
+    EnsurePolkitAgent,
     Settings {
         action: crate::xdg::SettingsAction,
     },
@@ -406,6 +407,9 @@ pub enum ControlResponse {
     },
     Settings {
         view: crate::xdg::SettingsView,
+    },
+    PolkitAgent {
+        ready: bool,
     },
 }
 

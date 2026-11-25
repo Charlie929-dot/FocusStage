@@ -195,7 +195,12 @@ impl FocusStageState {
         if !std::mem::take(&mut stage.pending_x11_launch) {
             return;
         }
-        match spawn_stage_process(&self.wayland_socket_name, stage, Some(display_number)) {
+        let spawned = if stage.persistent_helper {
+            spawn_persistent_helper_process(&self.wayland_socket_name, stage, display_number)
+        } else {
+            spawn_stage_process(&self.wayland_socket_name, stage, Some(display_number))
+        };
+        match spawned {
             Ok(child) => {
                 let pid = child.id();
                 stage.pid = Some(pid);
@@ -221,6 +226,9 @@ impl FocusStageState {
             use crate::control::LeaseEnd;
             let end = if lease.is_expired() { LeaseEnd::Expired } else { LeaseEnd::Preempted };
             self.record_ended_lease(lease, end);
+        }
+        if let Some(unit) = stage.helper_unit.as_deref() {
+            stop_helper_unit(unit);
         }
         terminate_stage_processes(&stage);
         if let Some(ref mut child) = stage.child {
@@ -315,6 +323,237 @@ impl FocusStageState {
         pids.extend(stage.windows.iter().filter_map(|window| window.toplevel.peer_pid()));
         pids
     }
+
+    pub fn ensure_session_helper_stages(&mut self) {
+        if let Err(err) = self.ensure_polkit_agent_stage() {
+            warn!("Failed to start FocusStage Polkit authentication host: {err}");
+        }
+        if let Err(err) = self.ensure_keyring_prompter_stage() {
+            warn!("Failed to start FocusStage Keyring prompter host: {err}");
+        }
+    }
+
+    pub fn ensure_polkit_agent_stage(&mut self) -> Result<bool, String> {
+        self.ensure_persistent_helper_stage(&POLKIT_AGENT_SPEC)
+    }
+
+    pub fn ensure_keyring_prompter_stage(&mut self) -> Result<bool, String> {
+        self.ensure_persistent_helper_stage(&KEYRING_PROMPTER_SPEC)
+    }
+
+    fn ensure_persistent_helper_stage(&mut self, spec: &PersistentHelperSpec) -> Result<bool, String> {
+        if let Some(existing) = self.stages.get_mut(spec.stage_id) {
+            if let Some(child) = existing.child.as_mut() {
+                if let Ok(Some(_)) = child.try_wait() {
+                    existing.child = None;
+                    existing.pid = None;
+                }
+            }
+            let alive = existing.child.is_some()
+                || existing.pending_x11_launch
+                || existing.pid.is_some_and(|pid| live_stage_pid(existing, pid));
+            if alive {
+                let ready = existing.x11_display_number.is_some() && existing.pid.is_some();
+                return Ok(ready);
+            }
+            let _ = self.close_stage(spec.stage_id);
+        }
+
+        let Some(helper_bin) = spec.candidates.iter().find(|p| Path::new(p).is_file()) else {
+            return Ok(false);
+        };
+
+        // Stop any older WSLg-bound helper unit or D-Bus-activated instance before claiming inside FocusStage.
+        stop_helper_unit(spec.unit_name);
+        if let Some(proc_name) = spec.stop_process_name {
+            stop_existing_user_process(proc_name);
+        }
+
+        let mut stage = Stage::new(
+            spec.stage_id.to_string(),
+            (*helper_bin).to_string(),
+            Vec::new(),
+            StageKind::X11,
+            480,
+            240,
+            DisplayState::Desktop,
+            self.default_scale,
+        );
+        stage.wm_class = spec.wm_class.to_string();
+        stage.persistent_helper = true;
+        stage.helper_unit = Some(spec.unit_name.to_string());
+        stage.pending_x11_launch = true;
+        for &(key, val) in spec.extra_env {
+            stage.launch_env.insert(key.to_string(), val.to_string());
+        }
+        stage.launch_token = Some(
+            new_launch_token()
+                .map_err(|err| format!("create {} launch token: {err}", spec.label))?,
+        );
+
+        self.stages.insert(spec.stage_id.to_string(), stage);
+        if let Err(err) = self.spawn_xwayland_for_stage(spec.stage_id.to_string()) {
+            self.stages.remove(spec.stage_id);
+            return Err(err);
+        }
+        info!("Started FocusStage XWayland {} ({})", spec.label, helper_bin);
+        Ok(false)
+    }
+}
+
+struct PersistentHelperSpec {
+    stage_id: &'static str,
+    wm_class: &'static str,
+    unit_name: &'static str,
+    label: &'static str,
+    candidates: &'static [&'static str],
+    extra_env: &'static [(&'static str, &'static str)],
+    stop_process_name: Option<&'static str>,
+}
+
+const POLKIT_AGENT_SPEC: PersistentHelperSpec = PersistentHelperSpec {
+    stage_id: "stage-polkit-agent",
+    wm_class: "focusstage-polkit-agent",
+    unit_name: "focusstage-polkit-agent",
+    label: "Polkit authentication host",
+    candidates: &[
+        "/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1",
+        "/usr/libexec/polkit-gnome-authentication-agent-1",
+        "/usr/libexec/polkit-mate-authentication-agent-1",
+        "/usr/bin/lxpolkit",
+    ],
+    extra_env: &[],
+    stop_process_name: None,
+};
+
+const KEYRING_PROMPTER_SPEC: PersistentHelperSpec = PersistentHelperSpec {
+    stage_id: "stage-keyring-prompter",
+    wm_class: "focusstage-keyring-prompter",
+    unit_name: "focusstage-gcr-prompter",
+    label: "Keyring prompter host",
+    candidates: &[
+        "/usr/libexec/gcr-prompter",
+        "/usr/lib/gcr/gcr-prompter",
+    ],
+    extra_env: &[("GCR_PERSIST", "1")],
+    stop_process_name: Some("gcr-prompter"),
+};
+
+pub fn stop_helper_unit(unit_name: &str) {
+    if !crate::session_env::systemd_user_available() {
+        return;
+    }
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", unit_name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = Command::new("systemctl")
+        .args(["--user", "reset-failed", unit_name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn stop_existing_user_process(proc_name: &str) {
+    let uid = unsafe { libc::geteuid() }.to_string();
+    let signaled = Command::new("pkill")
+        .args(["-TERM", "-u", &uid, "-x", proc_name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !signaled {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < deadline {
+        let still_alive = Command::new("pgrep")
+            .args(["-u", &uid, "-x", proc_name])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !still_alive {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn build_helper_systemd_args(
+    stage: &Stage,
+    unit_name: &str,
+    display_number: u32,
+    xdg_desktop: &str,
+) -> Vec<String> {
+    let token = stage.launch_token.as_deref().unwrap_or_default();
+    let mut args = vec![
+        "--user".to_string(),
+        "--wait".to_string(),
+        "--collect".to_string(),
+        format!("--unit={unit_name}"),
+        "-E".to_string(),
+        format!("DISPLAY=:{display_number}"),
+        "-E".to_string(),
+        format!("XDG_CURRENT_DESKTOP={xdg_desktop}"),
+        "-E".to_string(),
+        format!("FOCUSSTAGE_STAGE_ID={}", stage.id),
+        "-E".to_string(),
+        format!("{LAUNCH_TOKEN_ENV}={token}"),
+    ];
+    let mut extra_keys: Vec<_> = stage.launch_env.keys().collect();
+    extra_keys.sort();
+    for key in extra_keys {
+        let val = &stage.launch_env[key];
+        args.push("-E".to_string());
+        args.push(format!("{key}={val}"));
+    }
+    args.extend([
+        "/usr/bin/env".to_string(),
+        "-u".to_string(),
+        "WAYLAND_DISPLAY".to_string(),
+        "-u".to_string(),
+        "XAUTHORITY".to_string(),
+        "GDK_BACKEND=x11".to_string(),
+        "QT_QPA_PLATFORM=xcb".to_string(),
+        stage.app.clone(),
+    ]);
+    args
+}
+
+fn spawn_persistent_helper_process(
+    wayland_socket: &str,
+    stage: &Stage,
+    display_number: u32,
+) -> std::io::Result<Child> {
+    if crate::session_env::systemd_user_available() {
+        let unit_name = stage
+            .helper_unit
+            .as_deref()
+            .unwrap_or("focusstage-helper");
+        let xdg_desktop = std::env::var("XDG_CURRENT_DESKTOP")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "GNOME".to_string());
+        let args = build_helper_systemd_args(stage, unit_name, display_number, &xdg_desktop);
+        let mut cmd = Command::new("systemd-run");
+        cmd.args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        return cmd.spawn();
+    }
+
+    let mut cmd = stage_command(wayland_socket, stage, &stage.app, &stage.args, Some(display_number));
+    cmd.env_remove("WAYLAND_DISPLAY");
+    cmd.env_remove("XAUTHORITY");
+    cmd.stderr(Stdio::inherit());
+    spawn_stage_command(&mut cmd, stage)
 }
 
 fn is_chromium(kind: StageKind) -> bool {
@@ -841,5 +1080,73 @@ mod tests {
         }
         assert!(!read_process(worker).is_some_and(|(_, live)| live));
         assert!(!runtime.path().join("profiles").exists());
+    }
+
+    #[test]
+    fn persistent_helper_stage_is_hidden_when_idle_and_does_not_retire_on_window_close() {
+        use crate::protocol::ControlRequest;
+        let event_loop = EventLoop::try_new().unwrap();
+        let display = Display::<FocusStageState>::new().unwrap();
+        let mut state = FocusStageState::new(
+            &display.handle(),
+            event_loop.handle(),
+            "unused".into(),
+            1.0,
+            60,
+            SavedRect { x: 0, y: 0, width: 640, height: 480 },
+            None,
+        );
+        let mut stage = Stage::new(
+            "stage-polkit-agent".into(),
+            "polkit-gnome".into(),
+            Vec::new(),
+            StageKind::X11,
+            480,
+            240,
+            DisplayState::Desktop,
+            1.0,
+        );
+        stage.persistent_helper = true;
+        state.stages.insert("stage-polkit-agent".into(), stage);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.handle_control_message(crate::control::ControlServerMessage {
+            request: ControlRequest::List,
+            reply_tx: tx,
+            peer_pid: None,
+        });
+        match rx.recv().unwrap() {
+            ControlResponse::Stages { stages } => assert!(stages.is_empty()),
+            other => panic!("unexpected list response: {:?}", other),
+        }
+
+        // Removing a host-closed window from a persistent_helper stage must not mark retire_when_empty.
+        assert!(!state.stages["stage-polkit-agent"].retire_when_empty);
+    }
+
+    #[test]
+    fn keyring_prompter_systemd_args_forward_gcr_persist_and_x11_isolation() {
+        let mut stage = Stage::new(
+            "stage-keyring-prompter".into(),
+            "/usr/libexec/gcr-prompter".into(),
+            Vec::new(),
+            StageKind::X11,
+            480,
+            240,
+            DisplayState::Desktop,
+            1.0,
+        );
+        stage.persistent_helper = true;
+        stage.helper_unit = Some("focusstage-gcr-prompter".into());
+        stage.launch_token = Some("tok-123".into());
+        stage.launch_env.insert("GCR_PERSIST".into(), "1".into());
+
+        let args = build_helper_systemd_args(&stage, "focusstage-gcr-prompter", 4, "GNOME");
+        assert!(args.contains(&"--unit=focusstage-gcr-prompter".to_string()));
+        assert!(args.contains(&"DISPLAY=:4".to_string()));
+        assert!(args.contains(&"GCR_PERSIST=1".to_string()));
+        assert!(args.contains(&"GDK_BACKEND=x11".to_string()));
+        assert!(args.contains(&"WAYLAND_DISPLAY".to_string()));
+        assert_eq!(args.last().map(String::as_str), Some("/usr/libexec/gcr-prompter"));
     }
 }

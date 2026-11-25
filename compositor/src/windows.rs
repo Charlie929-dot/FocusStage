@@ -79,6 +79,7 @@ impl FocusStageState {
         }
         let stage = self.stages.get_mut(&stage_id).unwrap();
         let is_desktop = stage.display == DisplayState::Desktop;
+        let activate_helper = stage.persistent_helper;
         let window = stage.window_mut(window_id).unwrap();
         window.mapped = mapped;
         let sync_overlay = mapped && is_desktop;
@@ -87,10 +88,20 @@ impl FocusStageState {
             if is_desktop {
                 if let Some(sink) = self.display_sink.as_mut() {
                     show(sink.as_mut(), stage, stage.window(window_id).unwrap());
+                    if activate_helper {
+                        sink.activate(window_id);
+                    }
                 }
             }
         } else if let Some(sink) = self.display_sink.as_mut() {
             sink.hide(window_id);
+        }
+        let release_helper_lease = !mapped
+            && self.stages[&stage_id].persistent_helper
+            && !self.stages[&stage_id].has_live_surface()
+            && self.stages[&stage_id].lease.is_some();
+        if release_helper_lease {
+            self.end_stage_lease(&stage_id, crate::control::LeaseEnd::Preempted);
         }
         self.ensure_virtual_focus(&stage_id);
         if sync_overlay {
@@ -108,9 +119,11 @@ impl FocusStageState {
             .window(window_id)
             .is_some_and(|w| w.host_close_requested);
         stage.windows.retain(|w| w.id != window_id);
-        if host_close_requested && stage.windows.is_empty() {
+        if !stage.persistent_helper && host_close_requested && stage.windows.is_empty() {
             stage.retire_when_empty = true;
         }
+        let release_helper_lease =
+            stage.persistent_helper && stage.windows.is_empty() && stage.lease.is_some();
         if stage.active_window_id.as_deref() == Some(window_id) {
             stage.active_window_id = None;
         }
@@ -126,6 +139,9 @@ impl FocusStageState {
             sink.destroy(window_id);
         }
         stage.bump_frame();
+        if release_helper_lease {
+            self.end_stage_lease(&stage_id, crate::control::LeaseEnd::Preempted);
+        }
         self.ensure_virtual_focus(&stage_id);
     }
 
@@ -268,6 +284,19 @@ impl FocusStageState {
         }
         if self.is_input_allowed(&stage_id, InputSource::Human, None) {
             self.send_sink_key(&stage_id, window_id, evdev_keycode, pressed);
+        }
+    }
+
+    pub fn handle_sink_text_input(&mut self, window_id: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let Some(stage_id) = self.desktop_stage_for_window(window_id) else {
+            return;
+        };
+        if self.is_input_allowed(&stage_id, InputSource::Human, None) {
+            self.activate_sink_window(&stage_id, window_id);
+            let _ = self.send_stage_type_text(&stage_id, text);
         }
     }
 

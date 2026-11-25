@@ -53,6 +53,9 @@ internal static class NativeHostInterop
         private uint _time;
         private NativePoint _point;
         private uint _reserved;
+
+        internal uint Message => _message;
+        internal nuint WParam => _wParam;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -472,8 +475,12 @@ internal static class NativeHostInterop
     internal static extern bool PostMessage(nint hwnd, int message, nint wParam, nint lParam);
     [DllImport("user32.dll", EntryPoint = "GetMessageW", SetLastError = true)]
     internal static extern int GetMessage(out NativeMessage message, nint hwnd, uint first, uint last);
+    [DllImport("user32.dll")] internal static extern bool TranslateMessage(in NativeMessage message);
     [DllImport("user32.dll", EntryPoint = "DispatchMessageW")]
     internal static extern nint Dispatch(in NativeMessage message);
+    [DllImport("user32.dll", EntryPoint = "MapVirtualKeyExW")]
+    internal static extern uint MapVirtualKeyEx(uint code, uint mapType, nint layout);
+    [DllImport("user32.dll")] internal static extern nint GetKeyboardLayout(uint threadId);
     [DllImport("user32.dll")] internal static extern void PostQuitMessage(int exitCode);
     [DllImport("user32.dll")] internal static extern bool TrackMouseEvent(ref MouseTracking request);
     [DllImport("user32.dll")] internal static extern bool InvalidateRect(nint hwnd, nint rect, bool erase);

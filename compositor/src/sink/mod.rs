@@ -31,6 +31,10 @@ pub enum SinkInputEvent {
         evdev_keycode: u32,
         pressed: bool,
     },
+    TextInput {
+        window_id: String,
+        text: String,
+    },
     WindowChanged {
         window_id: String,
         state: WindowState,

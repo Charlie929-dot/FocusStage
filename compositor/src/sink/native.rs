@@ -136,6 +136,10 @@ enum HostEvent {
         evdev_keycode: u32,
         pressed: bool,
     },
+    TextInput {
+        window_id: String,
+        text: String,
+    },
     CloseRequested {
         window_id: String,
     },
@@ -209,6 +213,7 @@ impl HostEvent {
                 evdev_keycode,
                 pressed,
             },
+            Self::TextInput { window_id, text } => Input::TextInput { window_id, text },
             Self::CloseRequested { window_id } => Input::CloseRequested { window_id },
             Self::HostClipboardChanged {
                 text,
