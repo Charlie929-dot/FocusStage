@@ -1,25 +1,64 @@
 param(
     [string]$Distro = "Ubuntu",
+    [string]$WslRepo = "",
     [switch]$SkipRustBuild,
+    [switch]$SkipTrayBuild,
     [switch]$NoLaunch,
     [switch]$SkipMcpConfig
 )
 
 $ErrorActionPreference = "Stop"
+$env:WSL_UTF8 = "1"
 
-$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$WslRepo = wsl.exe -d $Distro -e wslpath -a ($RepoRoot -replace '\\', '/')
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($WslRepo)) {
-    throw "Failed to resolve WSL path for $RepoRoot in distro '$Distro'."
+if (-not [string]::IsNullOrWhiteSpace($WslRepo)) {
+    if ($WslRepo -eq "~") {
+        $targetExpr = '"$HOME"'
+    } elseif ($WslRepo.StartsWith("~/")) {
+        $restEsc = $WslRepo.Substring(2) -replace "'", "'\\''"
+        $targetExpr = "`"`$HOME`"/`'$restEsc`'"
+    } else {
+        $repoEsc = $WslRepo -replace "'", "'\\''"
+        $targetExpr = "'$repoEsc'"
+    }
+    $resolveScript = "cd $targetExpr && pwd -P"
+    $resolveB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($resolveScript))
+    $resolvedWslRepo = wsl.exe -d $Distro -e bash -lc "printf %s $resolveB64 | base64 -d | bash"
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($resolvedWslRepo)) {
+        throw "Failed to resolve WSL repository '$WslRepo' in distro '$Distro'."
+    }
+    $WslRepo = $resolvedWslRepo.Trim()
+    $RepoRoot = wsl.exe -d $Distro -e wslpath -w $WslRepo
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($RepoRoot)) {
+        throw "Failed to resolve Windows path for '$WslRepo' in distro '$Distro'."
+    }
+    $RepoRoot = $RepoRoot.Trim()
+} else {
+    $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    if ((-not $PSBoundParameters.ContainsKey('Distro')) -and ($RepoRoot -match '^\\\\(?:wsl\.localhost|wsl\$)\\([^\\]+)\\')) {
+        $Distro = $Matches[1]
+    }
+    $WslRepo = wsl.exe -d $Distro -e wslpath -a ($RepoRoot -replace '\\', '/')
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($WslRepo)) {
+        throw "Failed to resolve WSL path for $RepoRoot in distro '$Distro'."
+    }
+    $WslRepo = $WslRepo.Trim()
 }
-$WslRepo = $WslRepo.Trim()
+
+$IsWslUncRepo = ($RepoRoot -match '^\\\\(?:wsl\.localhost|wsl\$)\\')
 $WslUid = wsl.exe -d $Distro -e /usr/bin/id -u
 if ($LASTEXITCODE -ne 0 -or $WslUid -notmatch '^[0-9]+$') {
     throw "Failed to identify the Ubuntu user in '$Distro'."
 }
 $WslUid = $WslUid.Trim()
 $InstallDir = Join-Path $env:LOCALAPPDATA "FocusStage"
-$PublishDir = Join-Path $RepoRoot "tray\bin\Release\publish"
+if ($IsWslUncRepo) {
+    $TrayBuildRoot = Join-Path ([IO.Path]::GetTempPath()) "FocusStage-tray-build"
+    $TrayStageDir = Join-Path $TrayBuildRoot "tray"
+    $PublishDir = Join-Path $TrayBuildRoot "publish"
+} else {
+    $TrayStageDir = Join-Path $RepoRoot "tray"
+    $PublishDir = Join-Path $RepoRoot "tray\bin\Release\publish"
+}
 
 function Test-PathVirtualized {
     param(
@@ -91,7 +130,7 @@ if (-not $SkipRustBuild) {
 }
 
 Write-Host "[3/5] Installing WSL binaries and desktop helpers..." -ForegroundColor Cyan
-$desktopPackages = 'python3 pkexec policykit-1-gnome gnome-keyring xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland xdg-utils desktop-file-utils'
+$desktopPackages = 'python3 pkexec gnome-keyring xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland xdg-utils desktop-file-utils'
 $installCmd = @(
     "install -m 755 '$WslRepo/target/release/focusstaged' /usr/local/bin/focusstaged",
     "install -m 755 '$WslRepo/target/release/focusstage' /usr/local/bin/focusstage",
@@ -99,7 +138,7 @@ $installCmd = @(
     "chmod 755 /usr/local/bin/focusstage-launch",
     "sed 's/\r`$//' '$WslRepo/scripts/focusstage-open' > /usr/local/bin/focusstage-open",
     "chmod 755 /usr/local/bin/focusstage-open",
-    "if command -v apt-get >/dev/null 2>&1 && ! dpkg -s $desktopPackages >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $desktopPackages && fc-cache -f >/dev/null 2>&1; fi",
+    "if command -v apt-get >/dev/null 2>&1 && ! dpkg -s $desktopPackages >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-upgrade $desktopPackages && fc-cache -f >/dev/null 2>&1; fi",
     "/usr/bin/python3 -I '$WslRepo/scripts/focusstage-auth' setup $WslUid",
     "/usr/local/bin/focusstage --json sync-apps --uid $WslUid >/dev/null"
 ) -join " && "
@@ -109,63 +148,78 @@ if ($LASTEXITCODE -ne 0) {
 }
 wsl.exe -d $Distro -e bash -lc "if command -v gsettings >/dev/null 2>&1; then if gsettings writable org.gnome.desktop.wm.preferences button-layout 2>/dev/null | grep -qx true; then gsettings set org.gnome.desktop.wm.preferences button-layout ':minimize,maximize,close'; fi; if gsettings writable org.gnome.desktop.interface toolkit-accessibility 2>/dev/null | grep -qx true; then gsettings set org.gnome.desktop.interface toolkit-accessibility true; fi; fi" | Out-Null
 
-Write-Host "[4/5] Publishing Windows Launcher & Tray app to '$InstallDir'..." -ForegroundColor Cyan
-if (Test-Path $PublishDir) {
-    Remove-Item -Recurse -Force $PublishDir
-}
-New-Item -ItemType Directory -Force -Path $PublishDir | Out-Null
-$csproj = Join-Path $RepoRoot "tray\FocusStageTray.csproj"
-dotnet publish $csproj -c Release -o $PublishDir --nologo
-if ($LASTEXITCODE -ne 0) {
-    throw "dotnet publish failed."
-}
-
-$stagedExePath = Join-Path $PublishDir "FocusStage.exe"
-if (-not (Test-Path $stagedExePath)) {
-    throw "Expected launcher binary missing at $stagedExePath"
-}
-
-# Verify the newly published executable before installing and registering its path.
-$hostStart = [System.Diagnostics.ProcessStartInfo]::new($stagedExePath, "--window-host")
-$hostStart.UseShellExecute = $false
-$hostStart.RedirectStandardInput = $true
-$hostStart.RedirectStandardOutput = $true
-$previousInputEncoding = [Console]::InputEncoding
-try {
-    # Windows PowerShell uses the console encoding for the child stdin pipe.
-    [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
-    $hostProcess = [System.Diagnostics.Process]::Start($hostStart)
-} finally {
-    [Console]::InputEncoding = $previousInputEncoding
-}
-try {
-    $readyLine = $hostProcess.StandardOutput.ReadLineAsync()
-    if (-not $readyLine.Wait(5000) -or [string]::IsNullOrWhiteSpace($readyLine.Result)) {
-        throw "The installed FocusStage.exe did not complete the window host handshake: $stagedExePath"
-    }
-    $ready = $readyLine.Result | ConvertFrom-Json
-    if ($ready.type -ne "ready" -or $ready.scale -le 0 -or $ready.width -le 0 -or $ready.height -le 0 -or $hostProcess.HasExited) {
-        throw "The installed FocusStage.exe returned an invalid window host handshake: $stagedExePath"
-    }
-} finally {
-    if (-not $hostProcess.HasExited) {
-        $hostProcess.StandardInput.BaseStream.Close()
-        if (-not $hostProcess.WaitForExit(2000)) {
-            $hostProcess.Kill()
-            $hostProcess.WaitForExit()
+$exePath = Join-Path $InstallDir "FocusStage.exe"
+$stagedExePath = $null
+if (-not $SkipTrayBuild) {
+    Write-Host "[4/5] Publishing Windows Launcher & Tray app to '$InstallDir'..." -ForegroundColor Cyan
+    if ($IsWslUncRepo) {
+        $repoTrayDir = Join-Path $RepoRoot "tray"
+        New-Item -ItemType Directory -Force -Path $TrayStageDir | Out-Null
+        Write-Host "Staging tray/ from WSL into native Windows build directory '$TrayStageDir'..." -ForegroundColor DarkGray
+        & robocopy $repoTrayDir $TrayStageDir /MIR /XD bin obj /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null
+        if ($LASTEXITCODE -ge 8) {
+            throw "Failed to stage tray/ sources to '$TrayStageDir' (robocopy exit code $LASTEXITCODE)."
         }
     }
-    $hostProcess.Dispose()
-}
+    if (Test-Path $PublishDir) {
+        Remove-Item -Recurse -Force $PublishDir
+    }
+    New-Item -ItemType Directory -Force -Path $PublishDir | Out-Null
+    $csproj = Join-Path $TrayStageDir "FocusStageTray.csproj"
+    dotnet publish $csproj -c Release -o $PublishDir --nologo
+    if ($LASTEXITCODE -ne 0) {
+        throw "dotnet publish failed."
+    }
 
-if ($isVirtualized) {
-    Copy-DirectoryViaWsl -DistroName $Distro -SourceDir $PublishDir -DestinationDir $InstallDir
+    $stagedExePath = Join-Path $PublishDir "FocusStage.exe"
+    if (-not (Test-Path $stagedExePath)) {
+        throw "Expected launcher binary missing at $stagedExePath"
+    }
+
+    # Verify the newly published executable before installing and registering its path.
+    $hostStart = [System.Diagnostics.ProcessStartInfo]::new($stagedExePath, "--window-host")
+    $hostStart.UseShellExecute = $false
+    $hostStart.RedirectStandardInput = $true
+    $hostStart.RedirectStandardOutput = $true
+    $previousInputEncoding = [Console]::InputEncoding
+    try {
+        # Windows PowerShell uses the console encoding for the child stdin pipe.
+        [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+        $hostProcess = [System.Diagnostics.Process]::Start($hostStart)
+    } finally {
+        [Console]::InputEncoding = $previousInputEncoding
+    }
+    try {
+        $readyLine = $hostProcess.StandardOutput.ReadLineAsync()
+        if (-not $readyLine.Wait(5000) -or [string]::IsNullOrWhiteSpace($readyLine.Result)) {
+            throw "The installed FocusStage.exe did not complete the window host handshake: $stagedExePath"
+        }
+        $ready = $readyLine.Result | ConvertFrom-Json
+        if ($ready.type -ne "ready" -or $ready.scale -le 0 -or $ready.width -le 0 -or $ready.height -le 0 -or $hostProcess.HasExited) {
+            throw "The installed FocusStage.exe returned an invalid window host handshake: $stagedExePath"
+        }
+    } finally {
+        if (-not $hostProcess.HasExited) {
+            $hostProcess.StandardInput.BaseStream.Close()
+            if (-not $hostProcess.WaitForExit(2000)) {
+                $hostProcess.Kill()
+                $hostProcess.WaitForExit()
+            }
+        }
+        $hostProcess.Dispose()
+    }
+
+    [IO.File]::WriteAllText((Join-Path $PublishDir "distro.txt"), $Distro + "`n")
+
+    if ($isVirtualized) {
+        Copy-DirectoryViaWsl -DistroName $Distro -SourceDir $PublishDir -DestinationDir $InstallDir
+    } else {
+        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+        Copy-Item -Path (Join-Path $PublishDir "*") -Destination $InstallDir -Recurse -Force
+    }
 } else {
-    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    Copy-Item -Path (Join-Path $PublishDir "*") -Destination $InstallDir -Recurse -Force
+    Write-Host "[4/5] Skipping Windows Launcher & Tray build (-SkipTrayBuild)." -ForegroundColor Yellow
 }
-
-$exePath = Join-Path $InstallDir "FocusStage.exe"
 $wslHostPath = wsl.exe -d $Distro -e wslpath -a ($exePath -replace '\\', '/')
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($wslHostPath)) {
     throw "Failed to resolve the Windows host path for WSL '$Distro'."
@@ -173,7 +227,7 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($wslHostPath)) {
 $wslHostPath = $wslHostPath.TrimEnd("`r", "`n")
 wsl.exe -d $Distro -e test -f $wslHostPath
 if ($LASTEXITCODE -ne 0) {
-    throw "Deployed FocusStage.exe was not found on the real filesystem at '$wslHostPath'."
+    throw "Deployed FocusStage.exe was not found on the real filesystem at '$wslHostPath'. Run without -SkipTrayBuild first."
 }
 $hostPathBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($wslHostPath))
 $registerHost = 'dir="${XDG_CONFIG_HOME:-$HOME/.config}/focusstage"; umask 077; mkdir -p "$dir" && printf %s ' + $hostPathBase64 + ' | base64 -d > "$dir/native-host-path"'
@@ -189,22 +243,27 @@ wsl.exe -d $Distro -e /usr/local/bin/focusstage --json settings init-defaults | 
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to initialize FocusStage protocol associations."
 }
-& $stagedExePath --sync-shortcuts --distro $Distro
-if ($LASTEXITCODE -ne 0) {
-    throw "FocusStage --sync-shortcuts failed."
-}
-if ($isVirtualized) {
-    $virtualIconsDir = Join-Path $InstallDir "icons"
-    if (Test-Path $virtualIconsDir) {
-        $stagedIconsDir = Join-Path $PublishDir "_icons"
-        New-Item -ItemType Directory -Force -Path $stagedIconsDir | Out-Null
-        try {
-            Copy-Item -Path (Join-Path $virtualIconsDir "*") -Destination $stagedIconsDir -Recurse -Force
-            Copy-DirectoryViaWsl -DistroName $Distro -SourceDir $stagedIconsDir -DestinationDir $virtualIconsDir
-        } finally {
-            Remove-Item -Recurse -Force -LiteralPath $stagedIconsDir -ErrorAction SilentlyContinue
+$shortcutRunner = if ($stagedExePath) { $stagedExePath } elseif (-not $isVirtualized) { $exePath } else { $null }
+if ($shortcutRunner) {
+    & $shortcutRunner --sync-shortcuts --distro $Distro
+    if ($LASTEXITCODE -ne 0) {
+        throw "FocusStage --sync-shortcuts failed."
+    }
+    if ($isVirtualized -and $stagedExePath) {
+        $virtualIconsDir = Join-Path $InstallDir "icons"
+        if (Test-Path $virtualIconsDir) {
+            $stagedIconsDir = Join-Path $PublishDir "_icons"
+            New-Item -ItemType Directory -Force -Path $stagedIconsDir | Out-Null
+            try {
+                Copy-Item -Path (Join-Path $virtualIconsDir "*") -Destination $stagedIconsDir -Recurse -Force
+                Copy-DirectoryViaWsl -DistroName $Distro -SourceDir $stagedIconsDir -DestinationDir $virtualIconsDir
+            } finally {
+                Remove-Item -Recurse -Force -LiteralPath $stagedIconsDir -ErrorAction SilentlyContinue
+            }
         }
     }
+} else {
+    Write-Host "Skipping shortcut icon sync with -SkipTrayBuild inside MSIX/virtualized host." -ForegroundColor Yellow
 }
 
 if (-not $SkipMcpConfig) {

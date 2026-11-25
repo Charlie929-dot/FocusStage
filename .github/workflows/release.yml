@@ -1,0 +1,220 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag label (e.g. v0.1.0); defaults to tag or dev SHA"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build WSL2 Linux binaries (Ubuntu 22.04)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install native Wayland/Pixman/XKB build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev \
+            libpixman-1-dev \
+            libxkbcommon-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build focusstaged and focusstage (release)
+        run: |
+          cargo build --workspace --release --locked
+          strip target/release/focusstaged target/release/focusstage
+          ldd target/release/focusstaged
+          ldd target/release/focusstage
+
+      - name: Upload Linux release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: focusstage-linux-x86_64
+          path: |
+            target/release/focusstaged
+            target/release/focusstage
+          if-no-files-found: error
+
+  build-windows-and-release:
+    name: Package Windows Installer & Publish Release
+    needs: build-linux
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Resolve release version metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $rawTag = "${{ github.event.inputs.version }}"
+          if ([string]::IsNullOrWhiteSpace($rawTag)) {
+            if ("${{ github.ref }}" -like "refs/tags/*") {
+              $rawTag = "${{ github.ref_name }}"
+            } else {
+              $shortSha = "${{ github.sha }}".Substring(0, 7)
+              $rawTag = "v0.1.0-dev.$shortSha"
+            }
+          }
+          $cleanVer = $rawTag.TrimStart('v')
+          if ($cleanVer -match '^(\d+\.\d+\.\d+)') {
+            $numericVer = $Matches[1]
+          } else {
+            $numericVer = "0.1.0"
+          }
+          $isTagRelease = ("${{ github.ref }}" -like "refs/tags/v*")
+          "release_tag=$rawTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "app_version=$cleanVer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "numeric_version=$numericVer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "is_tag_release=$isTagRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Publish self-contained FocusStage.exe (win-x64)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/payload/win | Out-Null
+          dotnet publish tray/FocusStageTray.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:Version=${{ steps.meta.outputs.numeric_version }} `
+            -o dist/payload/win `
+            --nologo
+
+      - name: Verify FocusStage.exe window host handshake
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "dist/payload/win/FocusStage.exe").Path
+          $psi = [System.Diagnostics.ProcessStartInfo]::new($exe, "--window-host")
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardInput = $true
+          $psi.RedirectStandardOutput = $true
+          $proc = [System.Diagnostics.Process]::Start($psi)
+          try {
+            $lineTask = $proc.StandardOutput.ReadLineAsync()
+            if (-not $lineTask.Wait(10000) -or [string]::IsNullOrWhiteSpace($lineTask.Result)) {
+              throw "FocusStage.exe --window-host timed out or returned empty output."
+            }
+            Write-Host "Handshake response: $($lineTask.Result)"
+            $ready = $lineTask.Result | ConvertFrom-Json
+            if ($ready.type -ne "ready" -or $ready.scale -le 0 -or $ready.width -le 0 -or $ready.height -le 0) {
+              throw "Invalid handshake payload: $($lineTask.Result)"
+            }
+          } finally {
+            if (-not $proc.HasExited) {
+              $proc.StandardInput.BaseStream.Close()
+              if (-not $proc.WaitForExit(2000)) {
+                $proc.Kill()
+              }
+            }
+            $proc.Dispose()
+          }
+
+      - name: Download Linux release binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: focusstage-linux-x86_64
+          path: dist/payload/linux
+
+      - name: Assemble release payload
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/payload/scripts | Out-Null
+          Copy-Item scripts/install-release.ps1 dist/payload/install-release.ps1 -Force
+          Copy-Item scripts/focusstage-launch dist/payload/scripts/focusstage-launch -Force
+          Copy-Item scripts/focusstage-open dist/payload/scripts/focusstage-open -Force
+          Copy-Item scripts/focusstage-auth dist/payload/scripts/focusstage-auth -Force
+          Copy-Item scripts/claude-mcp.py dist/payload/scripts/claude-mcp.py -Force
+          Copy-Item scripts/uninstall.ps1 dist/payload/scripts/uninstall.ps1 -Force
+
+          $zipName = "FocusStage-${{ steps.meta.outputs.release_tag }}-win-x64.zip"
+          Compress-Archive -Path dist/payload/* -DestinationPath "dist/$zipName" -Force
+
+      - name: Build Inno Setup installer (FocusStage-Setup.exe)
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            $cmd = Get-Command iscc -ErrorAction SilentlyContinue
+            if (-not $cmd) {
+              throw "Inno Setup compiler (ISCC.exe) not found."
+            }
+            $iscc = $cmd.Source
+          }
+          & $iscc `
+            "/DAppVersion=${{ steps.meta.outputs.app_version }}" `
+            "/DReleaseTag=${{ steps.meta.outputs.release_tag }}" `
+            "/DPayloadDir=$((Resolve-Path 'dist/payload').Path)" `
+            "/DOutputDir=$((Resolve-Path 'dist').Path)" `
+            "packaging/FocusStage.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "ISCC failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Generate SHA256 checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -File | Where-Object { $_.Extension -in ".exe", ".zip" } | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content -Path dist/SHA256SUMS.txt -Encoding ascii
+          Get-Content dist/SHA256SUMS.txt
+
+      - name: Upload release bundle workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: focusstage-release-${{ steps.meta.outputs.release_tag }}
+          path: |
+            dist/FocusStage-Setup-*.exe
+            dist/FocusStage-*-win-x64.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.is_tag_release == 'True'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.meta.outputs.release_tag }}"
+          $files = @(
+            (Get-Item "dist/FocusStage-Setup-$tag.exe").FullName,
+            (Get-Item "dist/FocusStage-$tag-win-x64.zip").FullName,
+            (Get-Item "dist/SHA256SUMS.txt").FullName
+          )
+          $exists = $false
+          & gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) { $exists = $true }
+          if ($exists) {
+            & gh release upload $tag @files --clobber
+          } else {
+            & gh release create $tag @files --title "FocusStage $tag" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to publish GitHub Release for $tag"
+          }

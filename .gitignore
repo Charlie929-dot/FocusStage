@@ -1,6 +1,7 @@
 target/
 tray/bin/
 tray/obj/
+dist/
 .tmp_test/
 *.user
 *.suo
