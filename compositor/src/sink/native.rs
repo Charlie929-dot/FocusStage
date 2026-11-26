@@ -245,6 +245,12 @@ enum HostEvent {
         all_proxy: Option<String>,
         #[serde(default)]
         no_proxy: Option<String>,
+        #[serde(default)]
+        direct_http_proxy: Option<String>,
+        #[serde(default)]
+        direct_https_proxy: Option<String>,
+        #[serde(default)]
+        direct_socks_proxy: Option<String>,
     },
 }
 
@@ -347,6 +353,9 @@ impl HostEvent {
                 https_proxy,
                 all_proxy,
                 no_proxy,
+                direct_http_proxy,
+                direct_https_proxy,
+                direct_socks_proxy,
             } => Input::HostProxyChanged {
                 enabled,
                 bridge_port,
@@ -354,6 +363,9 @@ impl HostEvent {
                 https_proxy,
                 all_proxy,
                 no_proxy,
+                direct_http_proxy,
+                direct_https_proxy,
+                direct_socks_proxy,
             },
         })
     }
@@ -870,8 +882,29 @@ mod tests {
                 bridge_port: 54321,
                 http_proxy: Some(hp),
                 all_proxy: Some(ap),
+                direct_http_proxy: None,
+                direct_https_proxy: None,
+                direct_socks_proxy: None,
                 ..
             }) if hp == "http://127.0.0.1:54321" && ap == "socks5://127.0.0.1:54321"
+        ));
+
+        let ev_direct = serde_json::from_str::<HostEvent>(
+            r#"{"type":"host_proxy_changed","enabled":true,"bridge_port":54321,"http_proxy":"http://127.0.0.1:54321","https_proxy":"http://127.0.0.1:54321","all_proxy":"socks5h://127.0.0.1:54321","no_proxy":"localhost,127.0.0.1","direct_http_proxy":"http://127.0.0.1:7897","direct_https_proxy":"http://127.0.0.1:7897","direct_socks_proxy":"socks5h://127.0.0.1:7897"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            ev_direct.into_sink_event(),
+            Some(SinkInputEvent::HostProxyChanged {
+                enabled: true,
+                bridge_port: 54321,
+                direct_http_proxy: Some(dh),
+                direct_https_proxy: Some(dhs),
+                direct_socks_proxy: Some(ds),
+                ..
+            }) if dh == "http://127.0.0.1:7897"
+                && dhs == "http://127.0.0.1:7897"
+                && ds == "socks5h://127.0.0.1:7897"
         ));
     }
 }

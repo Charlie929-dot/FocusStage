@@ -1,5 +1,10 @@
+mod dns;
+mod engine;
+mod socks5;
+
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
+use std::time::Duration;
 
 use clap::Parser;
 use futures_util::TryStreamExt;
@@ -8,17 +13,38 @@ use netlink_packet_route::rule::{RuleAction, RuleAttribute, RulePortRange};
 use netlink_packet_route::IpProtocol;
 use rtnetlink::{Handle, IpVersion, LinkMessageBuilder, LinkUnspec, RouteMessageBuilder};
 use tokio::io::AsyncReadExt;
-use tun2proxy::{ArgDns, Args, CancellationToken, LevelFilter, ProxyParameters};
+use tokio_util::sync::CancellationToken;
+
+use crate::engine::EngineConfig;
 
 const TUN_ADDR: Ipv4Addr = Ipv4Addr::new(198, 19, 254, 1);
 const TUN_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 252);
 const TUN_DEST: Ipv4Addr = Ipv4Addr::new(198, 19, 254, 2);
-const TUN_MTU: u16 = 1500;
+const TUN_IPV6_ADDR: Ipv6Addr = Ipv6Addr::new(0xfd98, 0x0019, 0x0254, 0, 0, 0, 0, 1);
+const TUN_IPV6_PREFIX: u8 = 126;
+const TUN_MTU: u16 = 9000;
+const TUN_TCP_BUFFER_SIZE: u32 = 512 * 1024;
+const TUN_MAX_SESSIONS: usize = 4096;
+const TUN_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const ROUTE_TABLE: u32 = 200;
 const DNS_RULE_PREF: u32 = 1;
 const SUPPRESS_PREF: u32 = 5200;
-const TUN_RULE_PREF: u32 = 5201;
+const BYPASS_RULE_PREF: u32 = 5201;
+const TUN_RULE_PREF: u32 = 5202;
 const MAIN_TABLE: u32 = 254;
+
+// Bypass local/LAN/CGNAT/Tailscale/multicast traffic from table 200.
+// Do NOT bypass 198.18.0.0/15 (VirtualDns Fake-IP pool) or 198.19.254.0/30 (TUN link).
+const BYPASS_CIDRS: &[(Ipv4Addr, u8)] = &[
+    (Ipv4Addr::new(10, 0, 0, 0), 8),
+    (Ipv4Addr::new(100, 64, 0, 0), 10),
+    (Ipv4Addr::new(127, 0, 0, 0), 8),
+    (Ipv4Addr::new(169, 254, 0, 0), 16),
+    (Ipv4Addr::new(172, 16, 0, 0), 12),
+    (Ipv4Addr::new(192, 168, 0, 0), 16),
+    (Ipv4Addr::new(224, 0, 0, 0), 4),
+    (Ipv4Addr::new(255, 255, 255, 255), 32),
+];
 
 #[derive(Debug, Parser)]
 #[command(name = "focusstage-tun", about = "FocusStage WSL transparent proxy TUN helper")]
@@ -78,8 +104,8 @@ fn read_resolv_nameservers() -> Vec<Ipv4Addr> {
     out
 }
 
-async fn cleanup_routing_async(handle: &Handle) {
-    let mut rules = handle.rule().get(IpVersion::V4).execute();
+async fn cleanup_rules_for_family(handle: &Handle, family: IpVersion) {
+    let mut rules = handle.rule().get(family).execute();
     let mut to_delete = Vec::new();
     while let Ok(Some(rule)) = rules.try_next().await {
         let table = rule
@@ -94,20 +120,29 @@ async fn cleanup_routing_async(handle: &Handle) {
             RuleAttribute::Priority(p) => Some(*p),
             _ => None,
         });
-        if table == ROUTE_TABLE || priority == Some(SUPPRESS_PREF) || priority == Some(TUN_RULE_PREF) {
+        if table == ROUTE_TABLE
+            || priority == Some(SUPPRESS_PREF)
+            || priority == Some(BYPASS_RULE_PREF)
+            || priority == Some(TUN_RULE_PREF)
+        {
             to_delete.push(rule);
         }
     }
     for rule in to_delete {
         let _ = handle.rule().del(rule).execute().await;
     }
+}
 
-    let query = RouteMessageBuilder::<Ipv4Addr>::new()
+async fn cleanup_routing_async(handle: &Handle) {
+    cleanup_rules_for_family(handle, IpVersion::V4).await;
+    cleanup_rules_for_family(handle, IpVersion::V6).await;
+
+    let query_v4 = RouteMessageBuilder::<Ipv4Addr>::new()
         .table_id(ROUTE_TABLE)
         .build();
-    let mut routes = handle.route().get(query).execute();
-    let mut routes_to_delete = Vec::new();
-    while let Ok(Some(route)) = routes.try_next().await {
+    let mut routes_v4 = handle.route().get(query_v4).execute();
+    let mut v4_to_delete = Vec::new();
+    while let Ok(Some(route)) = routes_v4.try_next().await {
         let table = route
             .attributes
             .iter()
@@ -117,10 +152,32 @@ async fn cleanup_routing_async(handle: &Handle) {
             })
             .unwrap_or(route.header.table as u32);
         if table == ROUTE_TABLE {
-            routes_to_delete.push(route);
+            v4_to_delete.push(route);
         }
     }
-    for route in routes_to_delete {
+    for route in v4_to_delete {
+        let _ = handle.route().del(route).execute().await;
+    }
+
+    let query_v6 = RouteMessageBuilder::<Ipv6Addr>::new()
+        .table_id(ROUTE_TABLE)
+        .build();
+    let mut routes_v6 = handle.route().get(query_v6).execute();
+    let mut v6_to_delete = Vec::new();
+    while let Ok(Some(route)) = routes_v6.try_next().await {
+        let table = route
+            .attributes
+            .iter()
+            .find_map(|a| match a {
+                RouteAttribute::Table(t) => Some(*t),
+                _ => None,
+            })
+            .unwrap_or(route.header.table as u32);
+        if table == ROUTE_TABLE {
+            v6_to_delete.push(route);
+        }
+    }
+    for route in v6_to_delete {
         let _ = handle.route().del(route).execute().await;
     }
 }
@@ -137,7 +194,43 @@ async fn link_index(handle: &Handle, dev: &str) -> Result<u32, String> {
     }
 }
 
-async fn setup_routing_async(handle: &Handle, tun_name: &str) -> Result<(), String> {
+async fn setup_ipv6_routing_async(handle: &Handle, if_index: u32) -> Result<(), String> {
+    handle
+        .address()
+        .add(if_index, IpAddr::V6(TUN_IPV6_ADDR), TUN_IPV6_PREFIX)
+        .execute()
+        .await
+        .map_err(|e| format!("failed to add IPv6 address to TUN: {e}"))?;
+
+    let fake_v6_route = RouteMessageBuilder::<Ipv6Addr>::new()
+        .destination_prefix(dns::FAKE_IPV6_NET, dns::FAKE_IPV6_PREFIX)
+        .table_id(ROUTE_TABLE)
+        .output_interface(if_index)
+        .build();
+    handle
+        .route()
+        .add(fake_v6_route)
+        .replace()
+        .execute()
+        .await
+        .map_err(|e| format!("failed to add Fake-IPv6 route to table {ROUTE_TABLE}: {e}"))?;
+
+    handle
+        .rule()
+        .add()
+        .v6()
+        .action(RuleAction::ToTable)
+        .table_id(ROUTE_TABLE)
+        .priority(TUN_RULE_PREF)
+        .destination_prefix(dns::FAKE_IPV6_NET, dns::FAKE_IPV6_PREFIX)
+        .execute()
+        .await
+        .map_err(|e| format!("failed to add Fake-IPv6 rule: {e}"))?;
+
+    Ok(())
+}
+
+async fn setup_routing_async(handle: &Handle, tun_name: &str) -> Result<bool, String> {
     cleanup_routing_async(handle).await;
 
     // Allow DNS replies from WSL's local tunneling address (10.255.255.254 on lo)
@@ -212,6 +305,20 @@ async fn setup_routing_async(handle: &Handle, tun_name: &str) -> Result<(), Stri
         .await
         .map_err(|e| format!("failed to add suppress_prefixlength rule: {e}"))?;
 
+    for &(net, prefix_len) in BYPASS_CIDRS {
+        handle
+            .rule()
+            .add()
+            .v4()
+            .action(RuleAction::ToTable)
+            .table_id(MAIN_TABLE)
+            .priority(BYPASS_RULE_PREF)
+            .destination_prefix(net, prefix_len)
+            .execute()
+            .await
+            .map_err(|e| format!("failed to add bypass rule for {net}/{prefix_len}: {e}"))?;
+    }
+
     handle
         .rule()
         .add()
@@ -223,15 +330,30 @@ async fn setup_routing_async(handle: &Handle, tun_name: &str) -> Result<(), Stri
         .await
         .map_err(|e| format!("failed to add TUN table rule: {e}"))?;
 
-    Ok(())
+    let ipv6_ready = match setup_ipv6_routing_async(handle, if_index).await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!("IPv6 Fake-IP routing unavailable (falling back to IPv4-only): {err}");
+            false
+        }
+    };
+
+    Ok(ipv6_ready)
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .without_time()
+        .try_init();
+
     let cli = Cli::parse();
     let tun_name = validate_tun_name(&cli.tun)?.to_string();
     let proxy_addr = validate_loopback_socks5(&cli.proxy)?;
-    let proxy_url = format!("socks5://{proxy_addr}");
 
     let mut tun_config = tun::Configuration::default();
     tun_config
@@ -243,27 +365,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .up();
     tun_config.platform_config(|cfg| {
         #[allow(deprecated)]
-        cfg.packet_information(true);
+        cfg.packet_information(false);
         cfg.ensure_root_privileges(false);
     });
 
     let device = tun::create_as_async(&tun_config)?;
+    let (tun_writer, tun_reader) = device.split()?;
 
     let (connection, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(connection);
 
-    if let Err(err) = setup_routing_async(&handle, &tun_name).await {
-        cleanup_routing_async(&handle).await;
-        return Err(err.into());
-    }
-
-    let mut args = Args::default();
-    args.proxy(ProxyParameters::try_from(proxy_url.as_str())?);
-    args.dns(ArgDns::Virtual);
-    args.tun(tun_name);
-    args.setup(false);
-    args.ipv6_enabled(false);
-    args.verbosity(LevelFilter::Warn);
+    let ipv6_fake_dns = match setup_routing_async(&handle, &tun_name).await {
+        Ok(v6) => v6,
+        Err(err) => {
+            cleanup_routing_async(&handle).await;
+            return Err(err.into());
+        }
+    };
 
     let shutdown = CancellationToken::new();
 
@@ -311,7 +429,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let run_res = tun2proxy::run(device, TUN_MTU, args, shutdown).await;
+    let cfg = EngineConfig {
+        proxy_addr: SocketAddr::V4(proxy_addr),
+        mtu: TUN_MTU,
+        tcp_recv_buffer_size: TUN_TCP_BUFFER_SIZE,
+        tcp_send_buffer_size: TUN_TCP_BUFFER_SIZE,
+        max_sessions: TUN_MAX_SESSIONS,
+        ipv6_fake_dns,
+        udp_idle_timeout: TUN_UDP_IDLE_TIMEOUT,
+    };
+
+    let run_res = engine::run_engine(tun_reader, tun_writer, cfg, shutdown).await;
     cleanup_routing_async(&handle).await;
     run_res?;
     Ok(())
@@ -320,6 +448,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_bypassed_ip(ip: Ipv4Addr) -> bool {
+        let addr = u32::from(ip);
+        BYPASS_CIDRS.iter().any(|&(net, prefix_len)| {
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                !0u32 << (32 - prefix_len)
+            };
+            (addr & mask) == (u32::from(net) & mask)
+        })
+    }
 
     #[test]
     fn validates_loopback_socks5_only() {
@@ -335,5 +475,22 @@ mod tests {
         assert!(validate_tun_name("").is_err());
         assert!(validate_tun_name("too-long-interface-name").is_err());
         assert!(validate_tun_name("fs;rm -rf /").is_err());
+    }
+
+    #[test]
+    fn tun_tuning_constants_match_smoltcp_engine() {
+        assert_eq!(TUN_MTU, 9000);
+        assert_eq!(TUN_TCP_BUFFER_SIZE, 512 * 1024);
+        assert!(TUN_MAX_SESSIONS >= 4096);
+    }
+
+    #[test]
+    fn bypass_cidrs_cover_lan_and_tailscale_without_fake_ip_pool() {
+        assert!(is_bypassed_ip(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(is_bypassed_ip(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(is_bypassed_ip(Ipv4Addr::new(172, 16, 0, 1)));
+        assert!(is_bypassed_ip(Ipv4Addr::new(100, 79, 13, 24)));
+        assert!(!is_bypassed_ip(Ipv4Addr::new(198, 18, 0, 1)));
+        assert!(!is_bypassed_ip(Ipv4Addr::new(8, 8, 8, 8)));
     }
 }

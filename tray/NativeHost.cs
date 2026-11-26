@@ -138,7 +138,6 @@ internal static class NativeHost
             try
             {
                 _proxyBridge = new ProxyBridge((bridge, state) => Emit(bridge.BuildHostEventPayload(state)));
-                Emit(_proxyBridge.BuildHostEventPayload(_proxyBridge.CurrentState));
             }
             catch (Exception ex)
             {

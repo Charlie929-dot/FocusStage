@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "focusstage-tun"
-path = "src/bin/focusstage_tun.rs"
+path = "src/bin/focusstage_tun/main.rs"
 
 [dependencies]
 smithay = { version = "0.7.0", default-features = false, features = [
@@ -40,11 +40,10 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "io-util", "io-std", "net", "signal", "macros"] }
 tokio-util = "0.7"
 tun = { version = "0.8.14", features = ["async"] }
-tun2proxy = { version = "0.8.7", default-features = false }
+netstack-smoltcp = "0.2.5"
 rtnetlink = "0.24"
 netlink-packet-route = "0.34"
-futures-util = "0.3"
-log = "0.4"
+futures-util = { version = "0.3", features = ["sink"] }
 
 [dev-dependencies]
 wayland-client = "0.31"
