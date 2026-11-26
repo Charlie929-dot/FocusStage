@@ -359,7 +359,7 @@
               <div class="setting-row">
                 <div class="setting-info">
                   <div class="setting-name">过滤常见 WSL 标识</div>
-                  <div class="setting-desc">过滤应用的 WSL 环境变量、PATH 中的 Windows 路径和部分内核标识，让依赖这些标识的应用使用 Linux 桌面行为。已打开的应用需退出后重开；Windows 互操作可能受影响。</div>
+                  <div class="setting-desc">过滤部分 WSL 内核标识，让依赖这些标识的应用使用 Linux 桌面行为。Windows 互操作保持不变，应用仍可能通过其他方式识别 WSL。已打开的应用需退出后重开。</div>
                 </div>
                 <div class="setting-action">
                   <label class="switch"><input type="checkbox" id="toggle-linux-hide-wsl" aria-label="过滤常见 WSL 标识" disabled /><span class="switch-track"></span></label>

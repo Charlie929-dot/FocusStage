@@ -1629,6 +1629,46 @@ mod tests {
     }
 
     #[test]
+    fn fractional_client_scale_preserves_native_buffer_dimensions() {
+        use smithay::backend::renderer::element::surface::{
+            render_elements_from_surface_tree, WaylandSurfaceRenderElement,
+        };
+        use smithay::backend::renderer::element::{Element, Kind};
+
+        let event_loop: EventLoop<'static, FocusStageState> = EventLoop::try_new().unwrap();
+        let mut display = Display::new().unwrap();
+        let mut dh = display.handle();
+        let mut state = FocusStageState::new(
+            &dh, event_loop.handle(), "focusstage-buffer-scale-test".into(), 1.25, 60,
+            SavedRect { x: 0, y: 0, width: 1920, height: 1080 }, None,
+        );
+        let (server_sock, client_sock) = UnixStream::pair().unwrap();
+        let peer_data = Arc::new(ClientState::default());
+        peer_data.compositor_state.set_client_scale(1.25);
+        let peer = dh.insert_client(server_sock, peer_data).unwrap();
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue = conn.new_event_queue();
+        let qh = queue.handle();
+        let mut client = TestClient::default();
+        conn.display().get_registry(&qh, ());
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        let surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
+        let (_pool, buffer) = create_shm_buffer(client.shm.as_ref().unwrap(), &qh, 227, 237);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        let surface = peer.object_from_protocol_id::<WlSurface>(&dh, surface.id().protocol_id()).unwrap();
+        let elements: Vec<WaylandSurfaceRenderElement<_>> = render_elements_from_surface_tree(
+            &mut state.offscreen.renderer, &surface, (13, 19), 1.25, 1.0, Kind::Unspecified,
+        );
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].geometry(1.25.into()), Rectangle::new((13, 19).into(), (227, 237).into()));
+        assert_eq!(elements[0].geometry(1.5.into()).size, (272, 284).into());
+    }
+
+    #[test]
     fn wayland_popup_new_reposition_and_nested_submenu_constrain_to_stage() {
         use wayland_client::Proxy;
 

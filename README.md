@@ -83,32 +83,29 @@ WSL2
 
 #### 方式 B：从源码一键构建部署（开发者）
 
-在 Windows PowerShell 中运行开发安装器，会自动构建并安装 WSL2 端（`focusstaged` / `focusstage` / `focusstage-launch` / `focusstage-open`）及所需 Linux 桌面组件（`gnome-keyring`、`xdg-desktop-portal-gtk`、`xwayland`、`fonts-noto-cjk` 等），发布 `FocusStage.exe` 到 `%LOCALAPPDATA%\FocusStage` 并校验登记原生窗口宿主，初始化 Linux 协议关联，同时同步所有 Linux 应用到 Windows 开始菜单及桌面入口：
-
-```powershell
-# 源码位于当前 Windows 仓库时
-powershell -ExecutionPolicy Bypass -File scripts/install.ps1
-
-# 推荐：源码位于 WSL 原生文件系统（如 ~/src/FocusStage）时，直接指定 -WslRepo
-powershell -ExecutionPolicy Bypass -File scripts/install.ps1 -WslRepo ~/src/FocusStage
-```
-
-若当前就在 WSL 终端中，也可以直接运行封装脚本一键构建并默认部署到 Windows：
+**从 WSL 安装（不使用 PowerShell）**：在 WSL 终端的仓库根目录运行以下命令，可以同时安装 Linux 端和 Windows 启动器。需要启用 WSL 互操作，准备好 Rust 工具链、WSL 中的 `python3` 和 Windows 上的 .NET 8 SDK：
 
 ```bash
-./scripts/deploy.sh
-# 若在 FocusStage 托管的窗口（如 IDE）中执行，保留当前窗口宿主：
-./scripts/deploy.sh --keep-window-host
+./scripts/install.sh
+# 保留正在运行的 FocusStage 会话（在托管窗口内运行时自动保留）：
+./scripts/install.sh --keep-window-host
 ```
 
-如果直接在 Windows 文件资源管理器中从 `\\wsl.localhost\...` 打开安装脚本，请双击运行 `scripts/install.cmd`（会自动绕过 PowerShell UNC 执行策略限制并在结束时保留窗口提示）。
+脚本会安装 Linux 端及所需桌面组件，并构建、验证和部署 `FocusStage.exe` 到 `%LOCALAPPDATA%\FocusStage`，初始化 Linux 协议关联与 Windows 快捷方式。保留会话时，需要之后重启 FocusStage 才能使用新版。可用 `./scripts/install.sh --help` 查看其他选项。
+
+**从 Windows 安装**：在仓库根目录从 PowerShell 运行开发安装器，不需要批处理包装脚本：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
+```
+
+Windows 安装器可用 `-Distro` 选择发行版，或用 `-WslRepo` 指定该发行版里的源码路径。
 
 安装完成后：
 - 双击桌面或开始菜单中的 **FocusStage** 打开统一应用启动器。启动器优先使用 Windows Hello，也可通过 Ubuntu 管理员密码验证。验证后会进入 WSL 默认账号的桌面会话。`root` 直接使用现有权限，有复用授权的普通管理员可在启动器打开期间免重复执行 `sudo` 和标准 Polkit 验证。最小化会保留授权，关闭到托盘会撤销。已启动的提权进程会继续运行。
 - 安装器为 WSL 默认的非 `root` 管理员接入 PAM 和 Polkit，并关闭该账号的 `sudo` 密码缓存。若 WSL 默认账号是 `root`，Linux 密码备选会使用此前配置的非 `root` 管理员。没有这个账号时可用 Windows Hello。卸载 FocusStage 时会移除授权设置。
 - 开始菜单 `Programs\FocusStage\` 下会自动生成全部 Linux 应用的独立快捷方式（按 Linux 图标主题解析并带图标），可右键“固定到开始屏幕”或“固定到任务栏”。
-- 安装器会把 `focusstage` 注册到 Windows 用户的 Claude Code MCP 配置 `~/.claude.json`，使用 `-Distro` 指定的 WSL 发行版，默认是 `Ubuntu`（若直接从 `\\wsl.localhost\<Distro>\...` 运行安装器也会自动识别发行版）。MCP 注册需要该发行版中的 `python3`。
-- 当仓库位于 WSL UNC 路径或传入 `-WslRepo` 时，脚本会自动将 `tray/` 镜像到 Windows 临时 NTFS 目录编译再部署，绕过 9P 慢速与 UNC 限制；常用开发开关：`-WslRepo`、`-Distro`、`-SkipRustBuild`、`-SkipTrayBuild`、`-NoLaunch`、`-SkipMcpConfig`。
+- 安装器会把 `focusstage` 注册到 Windows 用户的 Claude Code MCP 配置 `~/.claude.json`，指向安装所用的 WSL 发行版。`install.sh` 默认使用当前发行版，可用 `--distro` 指定；如不需要 MCP 注册，可用 `--skip-mcp-config`（Windows 安装器用 `-SkipMcpConfig`）。
 - 运行 `powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1` 会自动读取部署时记录的 `distro.txt`（或使用 `-Distro`），清理 `~/.claude.json` MCP 条目、移除协议关联、授权配置与快捷方式并删除安装目录（Inno Setup 卸载器传入 `-KeepInstallDir` 后由安装器自身清理目录）。
 
 ### 2. 手动构建与 CLI / MCP 用法
@@ -170,8 +167,9 @@ focusstage settings get
 
 ### 3. 运行 Windows 11 启动器与托盘（`FocusStage.exe`）
 
-```powershell
-# 源码位于 Windows 本地磁盘时可直接运行调试；若源码在 WSL 文件系统建议通过 scripts/install.ps1 -WslRepo ~/src/FocusStage -SkipRustBuild 部署
+源码位于 WSL 时，通过 `./scripts/install.sh --skip-rust-build` 复用已有的 Rust 构建产物。源码位于 Windows 磁盘时也可以直接调试启动器：
+
+```cmd
 dotnet run --project tray/FocusStageTray.csproj -c Release
 ```
 
@@ -183,7 +181,7 @@ dotnet run --project tray/FocusStageTray.csproj -c Release
 
 启动器的 **舞台中心 → Linux 设置** 可选择默认浏览器和终端、同步用户级协议关联。Linux 应用通过 `xdg-open`、`gio open` 或 `focusstage open --ensure-daemon <URI>` 打开链接时，会复用已有的 Human Stage，或者启动目标应用。目标 Stage 被 Agent 租用、冻结或无法唯一确定时会返回错误。Windows 默认浏览器选项只接收 HTTP(S)。需要处理 `vscode://` 等 Linux 应用回调时，请使用 Linux 浏览器。
 
-同一页面的 **过滤常见 WSL 标识** 默认关闭。开启后，FocusStage 为新启动的非提权应用过滤 WSL 环境变量和 PATH 中的 Windows 路径，并为普通动态链接应用过滤部分 `uname` 和 `/proc` 探针。这可让依赖这些标识的应用选择 Linux 桌面行为，例如用默认 Linux 文件管理器打开目录。它不修改系统文件关联或全局 WSL 配置，也不保证覆盖所有探测方式；Snap 不加载兼容库。已运行的应用需要退出后重开，依赖 Windows 互操作的功能可能受影响。
+同一页面的 **过滤常见 WSL 标识** 默认关闭。开启后，FocusStage 为新启动的非提权动态链接应用过滤 `uname`、`/proc/version` 和 `/proc/sys/kernel/osrelease` 中的 WSL 内核标识。这可让依赖这些标识的应用选择 Linux 桌面行为，例如用默认 Linux 文件管理器打开目录。`PATH`、WSL 环境变量和互操作文件保持不变，原本可用的 Windows 命令仍可执行；通过其他信号探测的应用仍可能识别 WSL。此设置不修改系统文件关联或全局 WSL 配置，Snap 不加载兼容库。已运行的应用需要退出后重开。
 
 Chromium、Electron 和 Gecko 使用各自的 WSL 用户配置目录，关闭并重开后可以从原目录读取设置和 Cookie。再次启动已经由 FocusStage 托管的同款单实例应用时，会复用已有的 Human Stage。显式传入的 profile 参数会保留。
 

@@ -260,7 +260,7 @@ impl<R: Renderer + ImportAll> WaylandSurfaceRenderElement<R> {
     }
 
     fn size(&self, scale: impl Into<Scale<f64>>) -> Size<i32, Physical> {
-        ((self.view.dst.to_f64().to_physical(scale).to_point() + self.location).to_i32_round()
+        ((self.view.precise_dst.to_physical(scale).to_point() + self.location).to_i32_round()
             - self.location.to_i32_round())
         .to_size()
     }
@@ -335,7 +335,7 @@ impl<R: Renderer + ImportAll> Element for WaylandSurfaceRenderElement<R> {
                         // and use it to scale the damage to the rounded
                         // surface size by multiplying the output scale
                         // with the result.
-                        let surface_scale = dst_size.to_f64() / self.view.dst.to_f64().to_physical(scale);
+                        let surface_scale = dst_size.to_f64() / self.view.precise_dst.to_physical(scale);
                         rect.to_physical_precise_up(surface_scale * scale)
                     })
             })
@@ -347,14 +347,15 @@ impl<R: Renderer + ImportAll> Element for WaylandSurfaceRenderElement<R> {
             return OpaqueRegions::default();
         }
 
+        let bounds = Rectangle::from_size(self.size(scale));
         self.opaque_regions
             .iter()
-            .map(|r| {
+            .filter_map(|r| {
                 let loc = r.loc.to_physical_precise_round(scale);
                 let size = ((r.size.to_f64().to_physical(scale).to_point() + self.location).to_i32_round()
                     - self.location.to_i32_round())
                 .to_size();
-                Rectangle::new(loc, size)
+                Rectangle::new(loc, size).intersection(bounds)
             })
             .collect::<OpaqueRegions<_, _>>()
     }

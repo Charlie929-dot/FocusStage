@@ -269,6 +269,11 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            for (popup, _) in state.x11_override_windows.values().flatten() {
+                if let Some(surface) = popup.wl_surface() {
+                    send_frames_surface_tree(&surface, now_ms);
+                }
+            }
         }
 
         // Flush Wayland replies before blocking on clients, the host, or the frame timer.

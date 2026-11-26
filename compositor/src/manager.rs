@@ -881,22 +881,12 @@ fn stage_command(wayland_socket: &str, stage: &Stage, app: &str, args: &[String]
     }
     cmd.args(args).envs(&stage.launch_env);
     if !stage.persistent_helper && !stage.run_as_root && is_wsl2() && xdg::hide_wsl_enabled() {
-        let existing_path = stage
-            .launch_env
-            .get("PATH")
-            .cloned()
-            .or_else(|| std::env::var("PATH").ok());
         let existing_preload = stage
             .launch_env
             .get("LD_PRELOAD")
             .cloned()
             .or_else(|| std::env::var("LD_PRELOAD").ok());
-        apply_hide_wsl_stage_env(
-            &mut cmd,
-            &resolved_app,
-            existing_path.as_deref(),
-            existing_preload.as_deref(),
-        );
+        apply_wsl_kernel_mask(&mut cmd, &resolved_app, existing_preload.as_deref());
     }
     if let Some(dir) = &stage.launch_cwd {
         cmd.current_dir(dir);
@@ -940,44 +930,7 @@ fn ensure_wsl_mask_so() -> Option<PathBuf> {
     }).clone()
 }
 
-fn is_windows_mnt_path(entry: &str) -> bool {
-    let Some(rest) = entry.strip_prefix("/mnt/") else {
-        return false;
-    };
-    let mut parts = rest.splitn(2, '/');
-    let Some(drive) = parts.next() else {
-        return false;
-    };
-    drive.len() == 1 && drive.as_bytes()[0].is_ascii_alphabetic()
-}
-
-fn filter_windows_path(path_value: &str) -> String {
-    path_value
-        .split(':')
-        .filter(|entry| !entry.is_empty() && !is_windows_mnt_path(entry))
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
-fn apply_hide_wsl_stage_env(
-    cmd: &mut Command,
-    resolved_app: &str,
-    existing_path: Option<&str>,
-    existing_preload: Option<&str>,
-) {
-    for key in [
-        "WSL_DISTRO_NAME",
-        "WSL_INTEROP",
-        "WSL2_GUI_APPS_ENABLED",
-        "WSLENV",
-        "DONT_PROMPT_WSL_INSTALL",
-    ] {
-        cmd.env_remove(key);
-    }
-    if let Some(path_val) = existing_path {
-        let filtered = filter_windows_path(path_val);
-        cmd.env("PATH", if filtered.is_empty() { "/usr/local/bin:/usr/bin:/bin" } else { &filtered });
-    }
+fn apply_wsl_kernel_mask(cmd: &mut Command, resolved_app: &str, existing_preload: Option<&str>) {
     let is_snap = resolved_app.starts_with("/snap/") || resolved_app.starts_with("/var/lib/snapd/")
         || resolved_app == "/usr/bin/snap" || resolved_app == "snap" || is_snap_launcher(resolved_app);
     if !is_snap {
@@ -1374,55 +1327,63 @@ mod tests {
     }
 
     #[test]
-    fn hide_wsl_stage_env_strips_wsl_vars_windows_paths_and_sets_preload() {
-        assert_eq!(
-            filter_windows_path("/home/scl/.local/bin:/usr/bin:/mnt/c/Windows/system32:/mnt/d/tools:/mnt/wslg/bin"),
-            "/home/scl/.local/bin:/usr/bin:/mnt/wslg/bin"
-        );
-
+    fn wsl_kernel_mask_preserves_explicit_interop_environment() {
+        let interop_env = [
+            ("PATH", "/usr/bin:/mnt/c/Windows/System32/WindowsPowerShell/v1.0"),
+            ("WSL_DISTRO_NAME", "Ubuntu-24.04"),
+            ("WSL_INTEROP", "/run/WSL/42_interop"),
+            ("WSL2_GUI_APPS_ENABLED", "1"),
+            ("WSLENV", "EXAMPLE/p"),
+            ("DONT_PROMPT_WSL_INSTALL", "1"),
+        ];
         let mut cmd = Command::new("/usr/bin/env");
-        apply_hide_wsl_stage_env(
-            &mut cmd,
-            "/opt/T3 Code/t3code",
-            Some("/usr/local/bin:/usr/bin:/mnt/c/Windows/System32"),
-            None,
-        );
+        cmd.envs(interop_env);
+        apply_wsl_kernel_mask(&mut cmd, "/opt/T3 Code/t3code", None);
         let envs: HashMap<_, _> = cmd.get_envs().collect();
-        assert_eq!(envs.get(std::ffi::OsStr::new("WSL_DISTRO_NAME")), Some(&None));
-        assert_eq!(envs.get(std::ffi::OsStr::new("WSL_INTEROP")), Some(&None));
-        assert_eq!(envs.get(std::ffi::OsStr::new("WSL2_GUI_APPS_ENABLED")), Some(&None));
-        assert_eq!(envs.get(std::ffi::OsStr::new("DONT_PROMPT_WSL_INSTALL")), Some(&None));
-        assert_eq!(
-            envs.get(std::ffi::OsStr::new("PATH")).and_then(|v| *v).and_then(|v| v.to_str()),
-            Some("/usr/local/bin:/usr/bin")
-        );
-        let preload = envs
-            .get(std::ffi::OsStr::new("LD_PRELOAD"))
-            .and_then(|v| *v)
-            .and_then(|v| v.to_str())
-            .expect("LD_PRELOAD should be set for non-snap app");
-        assert!(preload.contains("focusstage-wsl-mask-"));
-        assert!(Path::new(preload).is_file());
+        for (key, value) in interop_env {
+            assert_eq!(envs[std::ffi::OsStr::new(key)], Some(std::ffi::OsStr::new(value)));
+        }
+        let mask = ensure_wsl_mask_so().unwrap();
+        assert_eq!(envs[std::ffi::OsStr::new("LD_PRELOAD")], Some(mask.as_os_str()));
+        assert!(mask.is_file());
     }
 
     #[test]
-    fn hide_wsl_preserves_snap_loader_and_does_not_restore_windows_only_path() {
+    fn wsl_kernel_mask_leaves_environment_inherited() {
+        let mut cmd = Command::new("/usr/bin/env");
+        apply_wsl_kernel_mask(&mut cmd, "/usr/bin/env", None);
+        let mask = ensure_wsl_mask_so().unwrap();
+        assert_eq!(
+            cmd.get_envs().collect::<Vec<_>>(),
+            vec![(std::ffi::OsStr::new("LD_PRELOAD"), Some(mask.as_os_str()))]
+        );
+    }
+
+    #[test]
+    fn wsl_kernel_mask_does_not_replace_snap_preload() {
         let mut cmd = Command::new("/usr/bin/snap");
         cmd.env("LD_PRELOAD", "/usr/lib/existing.so");
-        apply_hide_wsl_stage_env(
-            &mut cmd,
-            "/usr/bin/snap",
-            Some("/mnt/c/Windows/System32:/mnt/d/tools"),
-            Some("/usr/lib/existing.so"),
+        apply_wsl_kernel_mask(&mut cmd, "/usr/bin/snap", Some("/usr/lib/existing.so"));
+        assert_eq!(
+            cmd.get_envs().collect::<Vec<_>>(),
+            vec![(std::ffi::OsStr::new("LD_PRELOAD"), Some(std::ffi::OsStr::new("/usr/lib/existing.so")))]
         );
-        let envs: HashMap<_, _> = cmd.get_envs().collect();
-        assert_eq!(envs[std::ffi::OsStr::new("PATH")], Some(std::ffi::OsStr::new("/usr/local/bin:/usr/bin:/bin")));
-        assert_eq!(envs[std::ffi::OsStr::new("LD_PRELOAD")], Some(std::ffi::OsStr::new("/usr/lib/existing.so")));
     }
 
     #[test]
     fn wsl_compatibility_library_preserves_proc_open_flags() {
         const PROBE: &str = "FOCUSSTAGE_TEST_WSL_PROC_PROBE";
+        const INTEROP_PROBE: &str = "FOCUSSTAGE_TEST_WSL_INTEROP_PATHS";
+        let visible_interop_paths = || {
+            [
+                "/run/WSL",
+                "/proc/sys/fs/binfmt_misc/WSLInterop",
+                "/proc/sys/fs/binfmt_misc/WSLInterop-late",
+            ]
+            .into_iter()
+            .map(|path| if Path::new(path).exists() { '1' } else { '0' })
+            .collect::<String>()
+        };
         if let Some(raw_release) = std::env::var_os(PROBE) {
             use std::io::Read;
             use std::os::unix::fs::OpenOptionsExt;
@@ -1453,7 +1414,7 @@ mod tests {
             let flags = unsafe { libc::fcntl(path_only.as_raw_fd(), libc::F_GETFL) };
             assert_ne!(flags, -1);
             assert_ne!(flags & libc::O_PATH, 0);
-            assert!(!Path::new("/run/WSL").exists());
+            assert_eq!(visible_interop_paths(), std::env::var(INTEROP_PROBE).unwrap());
             return;
         }
 
@@ -1461,6 +1422,7 @@ mod tests {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "manager::tests::wsl_compatibility_library_preserves_proc_open_flags"])
                 .env(PROBE, kernel_release().trim())
+                .env(INTEROP_PROBE, visible_interop_paths())
                 .env("LD_PRELOAD", ensure_wsl_mask_so().unwrap())
                 .output()
                 .unwrap();

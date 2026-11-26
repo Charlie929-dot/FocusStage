@@ -419,13 +419,10 @@ impl SurfaceView {
         let src = viewport
             .src
             .unwrap_or_else(|| Rectangle::from_size(surface_size.to_f64()));
-        let dst = viewport.size().unwrap_or(
-            surface_size
-                .to_f64()
-                .to_client(1.)
-                .to_logical(client_scale)
-                .to_i32_round(),
-        );
+        let precise_dst = viewport
+            .size()
+            .map(|size| size.to_f64())
+            .unwrap_or_else(|| surface_size.to_f64().to_client(1.).to_logical(client_scale));
         let offset = if states.role == Some("subsurface") {
             states
                 .cached_state
@@ -435,7 +432,12 @@ impl SurfaceView {
         } else {
             Default::default()
         };
-        SurfaceView { src, dst, offset }
+        SurfaceView {
+            src,
+            dst: precise_dst.to_i32_round(),
+            precise_dst,
+            offset,
+        }
     }
 
     pub(crate) fn rect_to_global<N>(&self, rect: Rectangle<N, Logical>) -> Rectangle<f64, Logical>
@@ -460,8 +462,8 @@ impl SurfaceView {
 
     fn scale(&self) -> Scale<f64> {
         Scale::from((
-            self.dst.w as f64 / self.src.size.w,
-            self.dst.h as f64 / self.src.size.h,
+            self.precise_dst.w / self.src.size.w,
+            self.precise_dst.h / self.src.size.h,
         ))
     }
 }

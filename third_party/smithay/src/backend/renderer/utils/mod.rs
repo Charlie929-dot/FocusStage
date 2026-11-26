@@ -541,6 +541,7 @@ pub struct SurfaceView {
     pub src: Rectangle<f64, Logical>,
     /// The logical destination size used for scaling
     pub dst: Size<i32, Logical>,
+    pub(crate) precise_dst: Size<f64, Logical>,
     /// The logical offset for a sub-surface
     pub offset: Point<i32, Logical>,
 }

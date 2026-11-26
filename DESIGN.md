@@ -239,7 +239,7 @@ FocusStage 要实现的体验：
     - **外观与快捷栏**：多套内置主题、四色自定义配色、字体方案、网格尺寸及 Dock 快捷栏管理。
 - **前端解耦与分发**：
   - WebView2 界面资源内嵌于 `FocusStage.exe`（通过 `LauncherAssetServer` 挂载），与 WSL 控制面完全解耦；
-  - 提供独立终端用户安装包（`packaging/FocusStage.iss` + `scripts/install-release.ps1`）与 GitHub Actions 自动发版流（`.github/workflows/release.yml`），以及面向开发者的 `scripts/install.ps1`（支持 `-WslRepo` 与原生 NTFS 暂存编译 `tray/`）。
+  - 提供独立终端用户安装包（`packaging/FocusStage.iss` + `scripts/install-release.ps1`）与 GitHub Actions 自动发版流（`.github/workflows/release.yml`）。源码安装保留两个入口：WSL 下运行 `scripts/install.sh`（无需 PowerShell），Windows 下运行 `scripts/install.ps1`。
 
 ---
 

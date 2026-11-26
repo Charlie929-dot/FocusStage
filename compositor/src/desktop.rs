@@ -7,31 +7,49 @@ pub const WRAPPER_PREFIX: &str = "focusstage-";
 
 /// Resolve the Windows user profile that owns this WSL session (e.g. `/mnt/c/Users/HP`).
 ///
-/// WSL does not tell Linux processes which Windows user started the distro, so ask
-/// `powershell.exe` instead of guessing a directory under `/mnt/c/Users`.
+/// Read the Windows environment instead of guessing a directory under `/mnt/c/Users`.
 pub fn windows_user_home() -> Option<PathBuf> {
     static HOME: OnceLock<PathBuf> = OnceLock::new();
     if let Some(home) = HOME.get() {
         return Some(home.clone());
     }
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; [Environment]::GetFolderPath('UserProfile')",
-        ])
-        .output()
-        .ok()?;
+    let args = ["/d", "/u", "/c", "set", "USERPROFILE"];
+    let output = Command::new("cmd.exe").args(args).output().ok().or_else(|| {
+        let cmd = wsl_path(r"C:\Windows\System32\cmd.exe")?;
+        Command::new(cmd).args(args).output().ok()
+    })?;
     if !output.status.success() {
         return None;
     }
-    let profile = String::from_utf8(output.stdout).ok()?;
-    let profile = profile.trim().trim_start_matches('\u{feff}');
-    let home = PathBuf::from(crate::protocol::windows_path_to_wsl(profile));
+    let profile = parse_windows_env(&output.stdout, "USERPROFILE")?;
+    let home = wsl_path(&profile)?;
     if !home.is_dir() {
         return None;
     }
     Some(HOME.get_or_init(|| home).clone())
+}
+
+fn wsl_path(path: &str) -> Option<PathBuf> {
+    let output = Command::new("wslpath").args(["-u", path]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = std::str::from_utf8(&output.stdout).ok()?.trim_end_matches(['\r', '\n']);
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+fn parse_windows_env(output: &[u8], name: &str) -> Option<String> {
+    let units = output.chunks_exact(2);
+    if !units.remainder().is_empty() {
+        return None;
+    }
+    let units: Vec<_> = units.map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]])).collect();
+    let text = String::from_utf16(&units).ok()?;
+    text.trim_start_matches('\u{feff}')
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .find(|(key, value)| key.eq_ignore_ascii_case(name) && !value.is_empty())
+        .map(|(_, value)| value.to_owned())
 }
 
 #[derive(Debug)]
@@ -420,6 +438,17 @@ pub fn discover_launcher_apps(resolve_icons: bool) -> Vec<crate::protocol::Deskt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_exact_windows_environment_variable_as_utf16() {
+        let output: Vec<_> = "USERPROFILE_OTHER=ignored\r\nUserProfile=C:\\Users\\測試 & a=b\r\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(parse_windows_env(&output, "USERPROFILE").as_deref(), Some(r"C:\Users\測試 & a=b"));
+        assert_eq!(parse_windows_env(&output, "HOME"), None);
+        assert_eq!(parse_windows_env(&output[..output.len() - 1], "USERPROFILE"), None);
+    }
 
     #[test]
     fn rejects_desktop_entries_with_unavailable_try_exec() {
