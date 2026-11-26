@@ -361,6 +361,7 @@ impl FocusStageState {
                     })
                     .unwrap_or(false);
                 if !has_ptr {
+                    self.clear_cursor_focus(stage_id);
                     if let Some(stage) = self.stages.get_mut(stage_id) {
                         stage.input.current_pointer_target = None;
                     }
@@ -375,6 +376,7 @@ impl FocusStageState {
             }
         }
 
+        self.enter_cursor_focus(stage_id, serial, &new_target);
         if let Some(stage) = self.stages.get_mut(stage_id) {
             stage.input.x11_axis_primed = false;
             stage.input.current_pointer_target = Some(new_target);
@@ -393,6 +395,7 @@ impl FocusStageState {
     }
 
     pub(crate) fn clear_stage_pointer_target(&mut self, stage_id: &str) {
+        self.clear_cursor_focus(stage_id);
         let input = &mut self.stages.get_mut(stage_id).unwrap().input;
         input.x11_axis_primed = false;
         let Some(target) = input.current_pointer_target.take().filter(|t| t.alive()) else { return; };
@@ -412,6 +415,8 @@ impl FocusStageState {
     }
 
     pub(crate) fn clear_window_inputs(&mut self, stage_id: &str, window_id: &str) {
+        self.dismiss_window_popups(stage_id, window_id);
+        self.clear_window_cursor_focus(stage_id, window_id);
         if self.stages[stage_id].input.drag.as_ref().is_some_and(|d| d.window_id == window_id) {
             self.cancel_stage_drag(stage_id);
         }
@@ -457,15 +462,13 @@ impl FocusStageState {
                     wl_tl.send_pending_configure();
                 }
                 let wl_surf = wl_tl.wl_surface().clone();
-                let kbd_valid = cur_kbd.as_ref().is_some_and(|t| {
-                    t.alive()
-                        && matches!(t, StageInputTarget::Wayland(s) if s == &wl_surf || PopupManager::popups_for_surface(&wl_surf).any(|(p, _)| p.wl_surface() == s))
-                });
+                let keyboard = self.stages[stage_id].input.popups.top_for_root(&wl_surf).unwrap_or(&wl_surf).clone();
+                let kbd_valid = cur_kbd.as_ref().is_some_and(|target| target.alive() && target.wl_surface().as_ref() == Some(&keyboard));
                 if !kbd_valid {
                     let serial = SERIAL_COUNTER.next_serial();
                     self.set_keyboard_target(
                         stage_id,
-                        StageInputTarget::Wayland(wl_surf.clone()),
+                        StageInputTarget::Wayland(keyboard),
                         mods_state,
                         serial,
                     );
@@ -595,6 +598,7 @@ impl FocusStageState {
         let input = &mut self.stages.get_mut(stage_id).unwrap().input;
         input.pressed_buttons.clear();
         input.pointer_press = None;
+        input.popups.clear_serials();
     }
 
     /// Return the surface and its origin in the same coordinates used for rendering.
@@ -647,9 +651,12 @@ impl FocusStageState {
             return;
         }
         let input = &mut self.stages.get_mut(stage_id).unwrap().input;
+        let has_popup_grab = input.popups.top().is_some();
         let grab = match &input.current_pointer_target {
             Some(target @ StageInputTarget::Wayland(surface)) if target.alive()
-                && !input.pressed_buttons.is_empty() && input.pointer_window_id.as_deref() == window_id =>
+                && !input.pressed_buttons.is_empty()
+                && input.pointer_window_id.as_deref() == window_id
+                && (!has_popup_grab || input.popups.contains_surface(&crate::popup::surface_root(surface))) =>
             {
                 Some((surface.clone(), input.pointer_surface_origin))
             }
@@ -739,6 +746,10 @@ impl FocusStageState {
         &mut self, stage_id: &str, window_id: Option<&str>, x: f64, y: f64, button: u32, pressed: bool, time: u32,
     ) {
         let had_drag = self.stages.get(stage_id).is_some_and(|stage| stage.input.drag.is_some());
+        if !had_drag && self.consume_popup_button(stage_id, window_id, (x, y).into(), button, pressed) {
+            self.send_window_pointer_motion_at(stage_id, window_id, x, y, time);
+            return;
+        }
         self.send_window_pointer_motion_at(stage_id, window_id, x, y, time);
         let Some(stage) = self.stages.get_mut(stage_id) else { return; };
         let Some(toplevel) = stage.input_toplevel(window_id).cloned() else { return; };
@@ -787,6 +798,7 @@ impl FocusStageState {
                 if first_press {
                     input.pointer_press = Some((serial, target.clone()));
                 }
+                input.popups.record_input(serial, &target, pressed);
                 let grab_ended = !pressed && input.pressed_buttons.is_empty();
                 PointerTarget::button(&target, &seat, self, &ev);
                 PointerTarget::frame(&target, &seat, self);
@@ -1036,10 +1048,7 @@ impl FocusStageState {
         match toplevel {
             StageToplevel::Wayland(tl) => {
                 let wl_surf = tl.wl_surface();
-                let kbd_target = PopupManager::popups_for_surface(wl_surf)
-                    .next()
-                    .map(|(p, _)| p.wl_surface().clone())
-                    .unwrap_or_else(|| wl_surf.clone());
+                let kbd_target = self.stages[stage_id].input.popups.top_for_root(wl_surf).unwrap_or(wl_surf).clone();
 
                 self.set_keyboard_target(
                     stage_id,
@@ -1049,8 +1058,13 @@ impl FocusStageState {
                 );
 
                 if let (Some(client), Some(kbd_handle)) = (kbd_target.client(), seat.get_keyboard()) {
+                    let mut sent = false;
                     for kbd in kbd_handle.client_keyboards(&client) {
                         kbd.key(serial.into(), time, evdev_code, wl_key_state);
+                        sent = true;
+                    }
+                    if sent {
+                        self.stages.get_mut(stage_id).unwrap().input.popups.record_input(serial, &kbd_target, pressed);
                     }
                 }
                 if mods_state != prev_mods {

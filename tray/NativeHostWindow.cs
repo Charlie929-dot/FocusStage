@@ -307,9 +307,8 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         _renderer.SetAgentOverlay(state);
         if (!state.Active)
         {
-            _bannerHovered = false;
             _swallowBannerLeftUp = false;
-            _renderer.SetBannerHovered(false);
+            UpdateBannerHover(false);
         }
         SyncOverlayTimer();
         if (Handle != 0)
@@ -352,7 +351,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
                 message.Result = HitTest(NativePoint.FromLParam(message.LParam));
                 return;
             case WmSetCursor when LowWord(message.LParam) == HtClient:
-                SetCursor((_bannerHovered ? Cursors.Hand : Cursors.Arrow).Handle);
+                SetCursor(_bannerHovered ? Cursors.Hand.Handle : AppCursorHandle);
                 message.Result = 1;
                 return;
             case WmNcActivate:
@@ -621,6 +620,7 @@ internal sealed partial class NativeHostWindow : NativeWindow, IDisposable
         if (_stageId is not null)
             SetStageAppId(Handle, null);
         DestroyHandle();
+        ReleaseBitmapCursor();
         _appIcon?.Dispose();
         _renderer.Dispose();
     }

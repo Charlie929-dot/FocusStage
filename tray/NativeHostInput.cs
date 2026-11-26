@@ -624,6 +624,7 @@ internal sealed partial class NativeHostWindow
             return;
         _bannerHovered = hovered;
         _renderer.SetBannerHovered(hovered);
+        RefreshAppCursor();
         if (Handle != 0)
             InvalidateRect(Handle, 0, false);
     }

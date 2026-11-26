@@ -247,19 +247,20 @@ impl XwmHandler for FocusStageState {
         let Some(stage) = self.xwm_to_stage.get(&xwm).and_then(|sid| self.stages.get(sid)) else {
             return;
         };
-        if let Some(ref content) = stage.clipboard.content {
-            let bytes = match content {
-                ClipboardContent::Text(t) => t.as_bytes().to_vec(),
-                ClipboardContent::ImagePng(png) => png.clone(),
-            };
+        if let Some(src) = stage.clipboard.client_source.as_ref().filter(|src| src.is_alive()) {
+            if let Some(mime) = resolve_x11_live_mime(&stage.clipboard.mime_types, &mime_type) {
+                src.send(mime, fd.as_fd());
+            }
+        } else if let Some(bytes) = stage
+            .clipboard
+            .content
+            .as_ref()
+            .and_then(|content| resolve_x11_cached_bytes(content, &mime_type))
+        {
             std::thread::spawn(move || {
                 let mut file = std::fs::File::from(fd);
                 let _ = file.write_all(&bytes);
             });
-        } else if let Some(ref src) = stage.clipboard.client_source {
-            if src.is_alive() {
-                src.send(mime_type, fd.as_fd());
-            }
         }
     }
 
@@ -355,6 +356,59 @@ mod tests {
         let unmanaged = x11_requested_geometry(current, position, dimensions, false, false);
         assert_eq!(unmanaged, Rectangle::new((200, 100).into(), (1536, 800).into()));
     }
+
+    #[test]
+    fn x11_selection_resolution_preserves_live_formats_and_maps_text_aliases() {
+        let offered = vec!["text/html".to_string(), "UTF8_STRING".to_string()];
+        assert_eq!(
+            resolve_x11_live_mime(&offered, "text/html").as_deref(),
+            Some("text/html")
+        );
+        assert_eq!(
+            resolve_x11_live_mime(&offered, "text/plain;charset=utf-8").as_deref(),
+            Some("UTF8_STRING")
+        );
+        assert_eq!(
+            resolve_x11_live_mime(&offered, "text/plain").as_deref(),
+            Some("UTF8_STRING")
+        );
+        assert_eq!(resolve_x11_live_mime(&offered, "image/png"), None);
+
+        let text = ClipboardContent::Text("hello".into());
+        assert_eq!(
+            resolve_x11_cached_bytes(&text, "UTF8_STRING"),
+            Some(b"hello".to_vec())
+        );
+        assert_eq!(resolve_x11_cached_bytes(&text, "text/html"), None);
+
+        let image = ClipboardContent::ImagePng(vec![1, 2, 3]);
+        assert_eq!(
+            resolve_x11_cached_bytes(&image, "image/png"),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(resolve_x11_cached_bytes(&image, "UTF8_STRING"), None);
+    }
+}
+
+fn resolve_x11_live_mime(offered: &[String], requested_mime: &str) -> Option<String> {
+    if offered.iter().any(|mime| mime == requested_mime) {
+        Some(requested_mime.to_string())
+    } else if matches!(requested_mime, "text/plain;charset=utf-8" | "text/plain") {
+        // Smithay's XWM translates UTF8_STRING/TEXT requests to text/plain* before calling send_selection.
+        crate::clipboard::pick_text_mime(offered)
+    } else {
+        None
+    }
+}
+
+fn resolve_x11_cached_bytes(content: &ClipboardContent, requested_mime: &str) -> Option<Vec<u8>> {
+    if !content.x11_mime_types().iter().any(|mime| mime == requested_mime) {
+        return None;
+    }
+    Some(match content {
+        ClipboardContent::Text(text) => text.as_bytes().to_vec(),
+        ClipboardContent::ImagePng(png) => png.clone(),
+    })
 }
 
 fn create_x11_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {

@@ -131,12 +131,10 @@ impl Dispatch<WlDataDeviceManager, ()> for FocusStageState {
 
                 // If the Stage already has a clipboard selection, advertise it immediately.
                 if let Some(stage) = state.stages.get(&stage_id) {
-                    if let Some(ref content) = stage.clipboard.content {
+                    if let Some(src) = stage.clipboard.client_source.as_ref().filter(|src| src.is_alive()) {
+                        send_source_offer_to_device(dh, &device, src.clone(), &stage.clipboard.mime_types);
+                    } else if let Some(ref content) = stage.clipboard.content {
                         send_content_offer_to_device(dh, &device, content.clone());
-                    } else if let Some(ref src) = stage.clipboard.client_source {
-                        if src.is_alive() {
-                            send_source_offer_to_device(dh, &device, src.clone(), &stage.clipboard.mime_types);
-                        }
                     }
                 }
             }
@@ -161,8 +159,8 @@ impl DataDeviceHandler for FocusStageState {
 
 impl Dispatch<WlDataOffer, DataOfferUserData> for FocusStageState {
     fn request(
-        _state: &mut Self,
-        _client: &Client,
+        state: &mut Self,
+        client: &Client,
         _resource: &WlDataOffer,
         request: wl_data_offer::Request,
         data: &DataOfferUserData,
@@ -170,7 +168,7 @@ impl Dispatch<WlDataOffer, DataOfferUserData> for FocusStageState {
         _data_init: &mut DataInit<'_, Self>,
     ) {
         match request {
-            wl_data_offer::Request::Receive { mime_type, fd } => match &data.backend {
+            wl_data_offer::Request::Receive { mime_type, fd } if data.mime_types.contains(&mime_type) => match &data.backend {
                 OfferBackend::StaticContent(content) => {
                     let bytes = match content {
                         ClipboardContent::Text(text) => text.as_bytes().to_vec(),
@@ -191,6 +189,21 @@ impl Dispatch<WlDataOffer, DataOfferUserData> for FocusStageState {
                 OfferBackend::ClientSource(src) => {
                     if src.is_alive() {
                         src.send(mime_type, fd.as_fd());
+                    } else if let Some(bytes) = state
+                        .stage_id_for_client(&client.id())
+                        .and_then(|sid| state.stages.get(&sid))
+                        .filter(|stage| stage.clipboard.client_source.as_ref() == Some(src))
+                        .and_then(|stage| stage.clipboard.content.as_ref())
+                        .filter(|content| content.mime_types().contains(&mime_type))
+                        .map(|content| match content {
+                            ClipboardContent::Text(text) => text.as_bytes().to_vec(),
+                            ClipboardContent::ImagePng(png) => png.clone(),
+                        })
+                    {
+                        std::thread::spawn(move || {
+                            let mut file = std::fs::File::from(fd);
+                            let _ = file.write_all(&bytes);
+                        });
                     }
                 }
             },

@@ -120,6 +120,8 @@ pub struct StageInputState {
     pub current_keyboard_target: Option<StageInputTarget>,
     /// Current surface holding `wl_pointer` focus on this Stage
     pub current_pointer_target: Option<StageInputTarget>,
+    pub(crate) cursor: Option<crate::cursor::CursorFocus>,
+    pub(crate) popups: crate::popup::StagePopups,
     /// Whether a temporary custom keymap is currently uploaded to clients
     pub custom_keymap_active: bool,
     /// Round-robin Unicode keysym slots mapped on unused high evdev keycodes (231..=239, 241..=247)
@@ -165,6 +167,8 @@ impl StageInputState {
             captured_drag_target: None,
             current_keyboard_target: None,
             current_pointer_target: None,
+            cursor: None,
+            popups: Default::default(),
             custom_keymap_active: false,
             unicode_slots: [
                 (231, None),
@@ -285,6 +289,7 @@ pub struct StageWindow {
     pub host_close_requested: bool,
     pub mapped: bool,
     pub dirty: bool,
+    pub(crate) cursor_default: bool,
     pub(crate) content_seq: u64,
 }
 
@@ -481,6 +486,7 @@ impl Stage {
             host_close_requested: false,
             mapped: false,
             dirty: true,
+            cursor_default: true,
             content_seq: 0,
         });
         id

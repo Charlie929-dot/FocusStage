@@ -376,7 +376,7 @@ where
                     None => return,
                 };
 
-                if !allow_setting_cursor(handle, Serial(serial), &pointer.id()) {
+                if !state.allow_cursor_request(handle, Serial(serial), &pointer.id()) {
                     return;
                 }
 
@@ -427,7 +427,7 @@ where
                     .cloned();
 
                 if let Some(seat) = seat {
-                    state.cursor_image(&seat, cursor_image)
+                    state.client_cursor_image(&seat, Serial(serial), cursor_image)
                 }
             }
             Request::Release => {

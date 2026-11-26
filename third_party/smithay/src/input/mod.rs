@@ -159,6 +159,22 @@ pub trait SeatHandler: Sized {
     /// Callback that will be notified whenever a client requests to set a custom cursor image.
     fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
 
+    /// Validate a Wayland cursor request against the compositor's pointer focus model.
+    #[cfg(feature = "wayland_frontend")]
+    fn allow_cursor_request(&self, pointer: &PointerHandle<Self>, serial: Serial, object: &wayland_server::backend::ObjectId) -> bool
+    where
+        Self: 'static,
+        Self::PointerFocus: crate::wayland::seat::WaylandFocus,
+    {
+        crate::wayland::seat::pointer::allow_setting_cursor(pointer, serial, object)
+    }
+
+    /// Deliver a validated cursor request, retaining the enter serial for virtual focus routing.
+    #[cfg(feature = "wayland_frontend")]
+    fn client_cursor_image(&mut self, seat: &Seat<Self>, _serial: Serial, image: CursorImageStatus) {
+        self.cursor_image(seat, image);
+    }
+
     /// Callback that will be notified whenever the keyboard led state changes.
     fn led_state_changed(&mut self, _seat: &Seat<Self>, _led_state: LedState) {}
 }

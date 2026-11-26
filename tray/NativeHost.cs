@@ -56,7 +56,8 @@ internal static class NativeHost
         string User = "", string[]? Users = null, string Prompt = "",
         bool EchoOn = false, string? Info = null, string? Error = null,
         bool Retry = false, bool Succeeded = false, bool Fullscreen = false,
-        uint Serial = 0, string[]? Paths = null);
+        uint Serial = 0, string[]? Paths = null, string Shape = "default",
+        string? Png = null, int HotspotX = 0, int HotspotY = 0);
 
     private static void OpenWebUrl(string url)
     {
@@ -312,6 +313,9 @@ internal static class NativeHost
                     break;
                 case "title":
                     window?.SetTitle(command.Title);
+                    break;
+                case "cursor":
+                    window?.SetAppCursor(command.Shape, command.Png, command.HotspotX, command.HotspotY);
                     break;
                 case "parent" when window is not null:
                     window.ParentId = command.ParentWindowId;

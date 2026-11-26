@@ -132,6 +132,13 @@ pub struct WindowState {
     pub tiled: [bool; 4],
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum NativeCursor {
+    Named(&'static str),
+    Hidden,
+    Bitmap { png: Vec<u8>, hotspot_x: i32, hotspot_y: i32 },
+}
+
 pub trait DisplaySink {
     fn show(&mut self, window: WindowInfo<'_>);
     fn hide(&mut self, window_id: &str);
@@ -141,6 +148,7 @@ pub trait DisplaySink {
     }
     fn present_owned(&mut self, window_id: &str, width: u32, height: u32, bgra: Vec<u8>);
     fn set_title(&mut self, window_id: &str, title: &str);
+    fn set_cursor(&mut self, _window_id: &str, _cursor: NativeCursor) {}
     fn set_parent(&mut self, _window_id: &str, _parent_window_id: Option<&str>) {}
     fn begin_move(&mut self, _window_id: &str) {}
     fn begin_resize(&mut self, _window_id: &str, _direction: u32) {}

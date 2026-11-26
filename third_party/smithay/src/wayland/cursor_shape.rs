@@ -114,7 +114,7 @@ use crate::input::pointer::{CursorIcon, CursorImageStatus};
 use crate::input::SeatHandler;
 use crate::input::WeakSeat;
 use crate::utils::Serial;
-use crate::wayland::seat::{pointer::allow_setting_cursor, WaylandFocus};
+use crate::wayland::seat::WaylandFocus;
 
 use super::seat::PointerUserData;
 use super::tablet_manager::{TabletSeatHandler, TabletToolUserData};
@@ -270,12 +270,12 @@ where
                             return;
                         };
 
-                        if !allow_setting_cursor(&handle, Serial(serial), &resource.id()) {
+                        if !state.allow_cursor_request(&handle, Serial(serial), &resource.id()) {
                             return;
                         }
 
                         let cursor_icon = shape_to_cursor_icon(shape);
-                        state.cursor_image(&seat, CursorImageStatus::Named(cursor_icon));
+                        state.client_cursor_image(&seat, Serial(serial), CursorImageStatus::Named(cursor_icon));
                     }
                     CursorShapeDeviceUserDataInner::Tablet(tablet) => {
                         let Ok(tablet) = tablet.upgrade() else {

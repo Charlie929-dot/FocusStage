@@ -44,6 +44,14 @@ enum HostCommand<'a> {
         window_id: &'a str,
         title: &'a str,
     },
+    Cursor {
+        window_id: &'a str,
+        shape: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        png: Option<String>,
+        hotspot_x: i32,
+        hotspot_y: i32,
+    },
     Parent {
         window_id: &'a str,
         parent_window_id: Option<&'a str>,
@@ -593,6 +601,16 @@ impl DisplaySink for NativeSink {
         self.command(HostCommand::Title { window_id, title });
     }
 
+    fn set_cursor(&mut self, window_id: &str, cursor: super::NativeCursor) {
+        use super::NativeCursor::*;
+        let (shape, png, hotspot_x, hotspot_y) = match cursor {
+            Named(name) => (name, None, 0, 0),
+            Hidden => ("hidden", None, 0, 0),
+            Bitmap { png, hotspot_x, hotspot_y } => ("bitmap", Some(base64::engine::general_purpose::STANDARD.encode(png)), hotspot_x, hotspot_y),
+        };
+        self.command(HostCommand::Cursor { window_id, shape, png, hotspot_x, hotspot_y });
+    }
+
     fn set_parent(&mut self, window_id: &str, parent_window_id: Option<&str>) {
         self.command(HostCommand::Parent {
             window_id,
@@ -906,5 +924,48 @@ mod tests {
                 && dhs == "http://127.0.0.1:7897"
                 && ds == "socks5h://127.0.0.1:7897"
         ));
+    }
+
+    #[test]
+    fn cursor_commands_serialize_named_hidden_and_bitmap() {
+        let named = serde_json::to_value(HostCommand::Cursor {
+            window_id: "stage-1/1",
+            shape: "text",
+            png: None,
+            hotspot_x: 0,
+            hotspot_y: 0,
+        })
+        .unwrap();
+        assert_eq!(named["type"], "cursor");
+        assert_eq!(named["window_id"], "stage-1/1");
+        assert_eq!(named["shape"], "text");
+        assert!(named.get("png").is_none());
+        assert_eq!(named["hotspot_x"], 0);
+        assert_eq!(named["hotspot_y"], 0);
+
+        let hidden = serde_json::to_value(HostCommand::Cursor {
+            window_id: "stage-1/1",
+            shape: "hidden",
+            png: None,
+            hotspot_x: 0,
+            hotspot_y: 0,
+        })
+        .unwrap();
+        assert_eq!(hidden["shape"], "hidden");
+        assert!(hidden.get("png").is_none());
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n");
+        let bitmap = serde_json::to_value(HostCommand::Cursor {
+            window_id: "stage-1/1",
+            shape: "bitmap",
+            png: Some(encoded.clone()),
+            hotspot_x: 4,
+            hotspot_y: 7,
+        })
+        .unwrap();
+        assert_eq!(bitmap["shape"], "bitmap");
+        assert_eq!(bitmap["png"], encoded);
+        assert_eq!(bitmap["hotspot_x"], 4);
+        assert_eq!(bitmap["hotspot_y"], 7);
     }
 }

@@ -133,6 +133,7 @@ impl FocusStageState {
         let mut seat = seat_state.new_wl_seat(dh, "seat-0");
         let _ = seat.add_keyboard(Default::default(), 200, 25);
         let _ = seat.add_pointer();
+        smithay::wayland::cursor_shape::CursorShapeManagerState::new::<Self>(dh);
 
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(dh);
         let viewporter_state = ViewporterState::new::<Self>(dh);
@@ -380,6 +381,7 @@ impl CompositorHandler for FocusStageState {
             );
         }
         on_commit_buffer_handler::<Self>(surface);
+        self.cursor_committed(surface);
         significant |= damage_area > TINY_DAMAGE_AREA || previous_views.into_iter().any(|(surface, previous)| {
             with_renderer_surface_state(&surface, |state| state.view()).flatten() != previous
         });
@@ -466,8 +468,12 @@ impl XdgShellHandler for FocusStageState {
         self.sync_surface_output(surface.wl_surface());
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
-        // Virtual focus stays active; allow popup without stealing focus from other Stages.
+    fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        self.grab_stage_popup(surface, seat, serial);
+    }
+
+    fn popup_destroyed(&mut self, surface: PopupSurface) {
+        self.popup_gone(surface);
     }
 
     fn reposition_request(
@@ -581,7 +587,11 @@ impl OutputHandler for FocusStageState {}
 
 impl FractionalScaleHandler for FocusStageState {
     fn new_fractional_scale(&mut self, surface: WlSurface) {
-        if self.window_for_surface(&surface).is_some() {
+        if self
+            .window_for_surface(&surface)
+            .or_else(|| self.window_for_cursor_surface(&surface))
+            .is_some()
+        {
             self.sync_surface_output(&surface);
         }
     }
@@ -597,8 +607,16 @@ impl SeatHandler for FocusStageState {
     }
 
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
+    fn allow_cursor_request(&self, _: &smithay::input::pointer::PointerHandle<Self>, serial: Serial, object: &smithay::reexports::wayland_server::backend::ObjectId) -> bool {
+        self.cursor_request_allowed(serial, object)
+    }
+    fn client_cursor_image(&mut self, _: &Seat<Self>, serial: Serial, image: CursorImageStatus) {
+        self.update_cursor_image(serial, image);
+    }
 }
+
+impl smithay::wayland::tablet_manager::TabletSeatHandler for FocusStageState {}
+smithay::delegate_cursor_shape!(FocusStageState);
 
 impl XdgDecorationHandler for FocusStageState {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
@@ -655,6 +673,10 @@ mod tests {
         wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
     };
     use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+    use wayland_protocols::wp::cursor_shape::v1::client::{
+        wp_cursor_shape_device_v1 as c_cursor_shape_device,
+        wp_cursor_shape_manager_v1 as c_cursor_shape_manager,
+    };
     use wayland_protocols::wp::fractional_scale::v1::client::{
         wp_fractional_scale_manager_v1 as c_scale_manager, wp_fractional_scale_v1 as c_scale,
     };
@@ -718,6 +740,12 @@ mod tests {
         seat: Option<wl_seat::WlSeat>,
         data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
         pointer_enters: Vec<(u32, f64, f64)>,
+        pointer: Option<wl_pointer::WlPointer>,
+        cursor_shape_manager: Option<c_cursor_shape_manager::WpCursorShapeManagerV1>,
+        frame_callbacks: usize,
+        pointer_enter_serial: u32,
+        button_events: usize,
+        popup_done: Vec<u32>,
         pointer_press_serial: Option<u32>,
         client_drag_offer: Option<(u32, wl_data_offer::WlDataOffer)>,
         drag_drops: usize,
@@ -773,6 +801,9 @@ mod tests {
                     "wp_fractional_scale_manager_v1" => {
                         state.fractional_scale = Some(reg.bind(name, 1, qh, ()));
                     }
+                    "wp_cursor_shape_manager_v1" => {
+                        state.cursor_shape_manager = Some(reg.bind(name, version.min(2), qh, ()));
+                    }
                     "zwp_text_input_manager_v3" => {
                         state.text_input_manager = Some(reg.bind(name, 1, qh, ()));
                     }
@@ -781,7 +812,7 @@ mod tests {
                     }
                     "wl_seat" => {
                         let seat: wl_seat::WlSeat = reg.bind(name, version.min(7), qh, ());
-                        let _ = seat.get_pointer(qh, ());
+                        state.pointer = Some(seat.get_pointer(qh, ()));
                         state.seat = Some(seat);
                     }
                     _ => {}
@@ -803,7 +834,11 @@ mod tests {
         fn event(_: &mut Self, _: &wl_subsurface::WlSubsurface, _: wl_subsurface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
     }
     impl Dispatch<wl_callback::WlCallback, ()> for TestClient {
-        fn event(_: &mut Self, _: &wl_callback::WlCallback, _: wl_callback::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+        fn event(state: &mut Self, _: &wl_callback::WlCallback, event: wl_callback::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+            if matches!(event, wl_callback::Event::Done { .. }) {
+                state.frame_callbacks += 1;
+            }
+        }
     }
     impl Dispatch<wl_shm::WlShm, ()> for TestClient {
         fn event(_: &mut Self, _: &wl_shm::WlShm, _: wl_shm::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
@@ -867,6 +902,8 @@ mod tests {
     }
     wayland_client::delegate_noop!(TestClient: ignore wl_keyboard::WlKeyboard);
     wayland_client::delegate_noop!(TestClient: ignore c_text_manager::ZwpTextInputManagerV3);
+    wayland_client::delegate_noop!(TestClient: ignore c_cursor_shape_manager::WpCursorShapeManagerV1);
+    wayland_client::delegate_noop!(TestClient: ignore c_cursor_shape_device::WpCursorShapeDeviceV1);
 
     impl Dispatch<c_text::ZwpTextInputV3, ()> for TestClient {
         fn event(
@@ -886,12 +923,15 @@ mod tests {
     impl Dispatch<wl_pointer::WlPointer, ()> for TestClient {
         fn event(state: &mut Self, _: &wl_pointer::WlPointer, event: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
             match event {
-                wl_pointer::Event::Enter { surface, surface_x, surface_y, .. } => {
+                wl_pointer::Event::Enter { surface, surface_x, surface_y, serial } => {
+                    state.pointer_enter_serial = serial;
                     state.pointer_enters.push((surface.id().protocol_id(), surface_x, surface_y));
                 }
                 wl_pointer::Event::Button { serial, state: wayland_client::WEnum::Value(wl_pointer::ButtonState::Pressed), .. } => {
                     state.pointer_press_serial = Some(serial);
+                    state.button_events += 1;
                 }
+                wl_pointer::Event::Button { .. } => state.button_events += 1,
                 _ => {}
             }
         }
@@ -964,6 +1004,7 @@ mod tests {
                         state.popup1_repositioned.push(token);
                     }
                 }
+                c_popup::Event::PopupDone => state.popup_done.push(id),
                 _ => {}
             }
         }
@@ -993,12 +1034,38 @@ mod tests {
         w: i32,
         h: i32,
     ) -> (wl_shm_pool::WlShmPool, wl_buffer::WlBuffer) {
+        create_shm_buffer_rgba(shm, qh, w, h, [0, 0, 0, 0])
+    }
+
+    fn create_shm_buffer_rgba(
+        shm: &wl_shm::WlShm,
+        qh: &QueueHandle<TestClient>,
+        w: i32,
+        h: i32,
+        bgra: [u8; 4],
+    ) -> (wl_shm_pool::WlShmPool, wl_buffer::WlBuffer) {
         let size = (w * h * 4) as usize;
         let name = CString::new("fs-test-shm").unwrap();
         let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
         assert!(fd >= 0);
         let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
         unsafe { libc::ftruncate(fd, size as libc::off_t) };
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, size) };
+        for px in bytes.chunks_exact_mut(4) {
+            px.copy_from_slice(&bgra);
+        }
+        unsafe { libc::munmap(ptr, size) };
         let pool = shm.create_pool(std::os::fd::AsFd::as_fd(&owned), size as i32, qh, ());
         let buf = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, qh, ());
         (pool, buf)
@@ -1024,6 +1091,7 @@ mod tests {
         host_clipboard_images: Vec<Vec<u8>>,
         overlays: Vec<RecordedOverlay>,
         fullscreen_requests: Vec<(String, bool)>,
+        cursors: Vec<(String, crate::sink::NativeCursor)>,
         file_drags_started: Vec<(String, u32, Vec<String>)>,
         file_drags_cancelled: Vec<(String, u32)>,
     }
@@ -1039,6 +1107,9 @@ mod tests {
         }
         fn destroy(&mut self, id: &str) { self.0.lock().unwrap().destroyed.push(id.into()); }
         fn set_title(&mut self, _: &str, _: &str) {}
+        fn set_cursor(&mut self, id: &str, cursor: crate::sink::NativeCursor) {
+            self.0.lock().unwrap().cursors.push((id.into(), cursor));
+        }
         fn set_fullscreen(&mut self, window_id: &str, fullscreen: bool) {
             self.0.lock().unwrap().fullscreen_requests.push((window_id.into(), fullscreen));
         }
@@ -1722,6 +1793,11 @@ mod tests {
         pump(&mut display, &mut state, &conn, &mut queue, &mut client);
 
         // 1. Direct popup near bottom-right corner (720, 520), size 200x200, FlipX|FlipY -> (520, 320, 200, 200)
+        client.seat.as_ref().unwrap().get_keyboard(&qh, ());
+        state.send_stage_button(&stage_id, 720.0, 520.0, 273, true);
+        state.send_stage_button(&stage_id, 720.0, 520.0, 273, false);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let press = client.pointer_press_serial.unwrap();
         let pos1 = wm_base.create_positioner(&qh, ());
         pos1.set_size(200, 200);
         pos1.set_anchor_rect(720, 520, 1, 1);
@@ -1734,6 +1810,7 @@ mod tests {
         client.popup1_xdg_id = Some(p1_xdg.id().protocol_id());
         let p1 = p1_xdg.get_popup(Some(&tl_xdg), &pos1, &qh, ());
         client.popup1_id = Some(p1.id().protocol_id());
+        p1.grab(client.seat.as_ref().unwrap(), press);
         p1_wl.commit();
         pump(&mut display, &mut state, &conn, &mut queue, &mut client);
 
@@ -1782,6 +1859,7 @@ mod tests {
         client.popup2_xdg_id = Some(p2_xdg.id().protocol_id());
         let _p2 = p2_xdg.get_popup(Some(&p1_xdg), &pos2, &qh, ());
         client.popup2_id = Some(_p2.id().protocol_id());
+        _p2.grab(client.seat.as_ref().unwrap(), press);
         p2_wl.commit();
         pump(&mut display, &mut state, &conn, &mut queue, &mut client);
 
@@ -1811,6 +1889,26 @@ mod tests {
             client.pointer_enters.last().copied(),
             Some((p2_wl.id().protocol_id(), 5.0, 5.0))
         );
+
+        let keyboard = |state: &FocusStageState| state.stages[&stage_id].input.current_keyboard_target.as_ref().unwrap().wl_surface().unwrap().id().protocol_id();
+        assert_eq!(keyboard(&state), p2_wl.id().protocol_id());
+        state.stages.get_mut(&stage_id).unwrap().windows[0].dirty = false;
+        _p2.destroy();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert!(state.stages[&stage_id].windows[0].dirty);
+        assert_eq!(keyboard(&state), p1_wl.id().protocol_id());
+
+        let before = client.button_events;
+        state.send_stage_button(&stage_id, 20.0, 20.0, 272, true);
+        state.send_stage_button(&stage_id, 20.0, 20.0, 272, false);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(client.popup_done, [p1.id().protocol_id()]);
+        assert_eq!(client.button_events, before);
+        assert_eq!(keyboard(&state), tl_wl.id().protocol_id());
+        state.send_stage_button(&stage_id, 20.0, 20.0, 272, true);
+        state.send_stage_button(&stage_id, 20.0, 20.0, 272, false);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(client.button_events, before + 2);
 
         let _ = event_loop.dispatch(Some(std::time::Duration::ZERO), &mut state);
     }
@@ -1926,6 +2024,25 @@ mod tests {
             Some(crate::stage::ClipboardContent::ImagePng(fake_png.clone()))
         );
         assert!(state.stages[&sid_agent].clipboard.content.is_none());
+
+        let manager = c2.data_device_manager.clone().unwrap();
+        let _late = manager.get_data_device(c2.seat.as_ref().unwrap(), &qh2, ());
+        pump(&mut display, &mut state, &conn2, &mut q2, &mut c2);
+        let late_offer = c2.active_selection.clone().unwrap();
+        assert!(c2.offer_mimes[&late_offer.id().protocol_id()].iter().any(|mime| mime == "text/html"));
+        assert!(read_offer(&late_offer, "text/rtf", &mut display, &mut state, &conn2, &mut q2, &mut c2).is_empty());
+        c2.source_payloads.insert(src2.id().protocol_id(), b"<b>native format</b>".to_vec());
+        assert_eq!(read_offer(&late_offer, "text/html", &mut display, &mut state, &conn2, &mut q2, &mut c2), b"<b>native format</b>");
+        src2.destroy();
+        pump(&mut display, &mut state, &conn2, &mut q2, &mut c2);
+        assert_eq!(
+            read_offer(&late_offer, "image/png", &mut display, &mut state, &conn2, &mut q2, &mut c2),
+            fake_png
+        );
+        let _after_source_exit = manager.get_data_device(c2.seat.as_ref().unwrap(), &qh2, ());
+        pump(&mut display, &mut state, &conn2, &mut q2, &mut c2);
+        let cached_offer = c2.active_selection.clone().unwrap();
+        assert_eq!(c2.offer_mimes[&cached_offer.id().protocol_id()], ["image/png"]);
 
         pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
         let offer1_img = c1.active_selection.clone().expect("stage 1 should receive PNG offer from stage 2");
@@ -2209,5 +2326,502 @@ mod tests {
         assert!(matches!(release(&mut state, &new_lease), ControlResponse::Ok));
         assert!(matches!(release(&mut state, "unknown"),
             ControlResponse::Error { code, .. } if code == "invalid_lease"));
+    }
+
+    #[test]
+    fn wayland_popup_grab_lifecycle_and_idle_parent_repaint() {
+        use wayland_client::Proxy;
+
+        let event_loop: EventLoop<'static, FocusStageState> = EventLoop::try_new().unwrap();
+        let mut display: Display<FocusStageState> = Display::new().unwrap();
+        let mut dh = display.handle();
+        let log = Arc::new(Mutex::new(WindowLog::default()));
+        let mut state = FocusStageState::new(
+            &dh,
+            event_loop.handle(),
+            "focusstage-popup-lifecycle-test".into(),
+            1.0,
+            60,
+            SavedRect { x: 0, y: 0, width: 1920, height: 1080 },
+            Some(Box::new(TestSink(log.clone()))),
+        );
+
+        let (server_sock, client_sock) = UnixStream::pair().unwrap();
+        let _peer = dh.insert_client(server_sock, Arc::new(ClientState::default())).unwrap();
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue = conn.new_event_queue();
+        let qh = queue.handle();
+        let mut client = TestClient::default();
+        let _reg = conn.display().get_registry(&qh, ());
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        let compositor = client.compositor.as_ref().unwrap().clone();
+        let wm_base = client.wm_base.as_ref().unwrap().clone();
+        let shm = client.shm.as_ref().unwrap().clone();
+        let seat = client.seat.as_ref().unwrap().clone();
+        seat.get_keyboard(&qh, ());
+
+        let tl_wl = compositor.create_surface(&qh, ());
+        let tl_xdg = wm_base.get_xdg_surface(&tl_wl, &qh, ());
+        client.toplevel_xdg_id = Some(tl_xdg.id().protocol_id());
+        let _tl = tl_xdg.get_toplevel(&qh, ());
+        tl_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        let stage_id = state.stages.keys().next().unwrap().clone();
+        let w1_id = state.stages[&stage_id].windows[0].id.clone();
+
+        let (_pool_tl, buf_tl) = create_shm_buffer_rgba(&shm, &qh, 800, 600, [255, 0, 0, 255]);
+        tl_xdg.set_window_geometry(0, 0, 800, 600);
+        tl_wl.attach(Some(&buf_tl), 0, 0);
+        tl_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        let pixel_at = |state: &mut FocusStageState, wid: &str, x: usize, y: usize| -> [u8; 4] {
+            let mut out = Vec::new();
+            let window = state.stages[&stage_id].window(wid).unwrap();
+            let (w, _h) = state
+                .offscreen
+                .render_window_bgra_into(Some(window), window.logical_size, 1.0, &[], &mut out)
+                .unwrap();
+            let idx = (y * w as usize + x) * 4;
+            out[idx..idx + 4].try_into().unwrap()
+        };
+        let keyboard_id = |state: &FocusStageState| {
+            state.stages[&stage_id]
+                .input
+                .current_keyboard_target
+                .as_ref()
+                .unwrap()
+                .wl_surface()
+                .unwrap()
+                .id()
+                .protocol_id()
+        };
+
+        // 1. Invalid grab serial is immediately dismissed and marks parent dirty.
+        state.send_window_button_at(&stage_id, Some(&w1_id), 20.0, 20.0, 273, true, 1);
+        state.send_window_button_at(&stage_id, Some(&w1_id), 20.0, 20.0, 273, false, 2);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let press_serial = client.pointer_press_serial.unwrap();
+
+        let bad_pos = wm_base.create_positioner(&qh, ());
+        bad_pos.set_size(120, 120);
+        bad_pos.set_anchor_rect(100, 100, 1, 1);
+        let p_bad_wl = compositor.create_surface(&qh, ());
+        let p_bad_xdg = wm_base.get_xdg_surface(&p_bad_wl, &qh, ());
+        let p_bad = p_bad_xdg.get_popup(Some(&tl_xdg), &bad_pos, &qh, ());
+        state.stages.get_mut(&stage_id).unwrap().window_mut(&w1_id).unwrap().dirty = false;
+        p_bad.grab(&seat, press_serial + 999);
+        p_bad_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert!(client.popup_done.contains(&p_bad.id().protocol_id()));
+        assert!(state.stages[&stage_id].window(&w1_id).unwrap().dirty);
+        p_bad.destroy();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        // 2. Nested grab reusing original grab serial after an intermediate key event,
+        //    inside-popup click delivers normally, outside click dismisses with no click-through.
+        let pos1 = wm_base.create_positioner(&qh, ());
+        pos1.set_size(200, 200);
+        pos1.set_anchor_rect(100, 100, 1, 1);
+        pos1.set_anchor(c_pos::Anchor::BottomRight);
+        pos1.set_gravity(c_pos::Gravity::BottomRight);
+        let p1_wl = compositor.create_surface(&qh, ());
+        let p1_xdg = wm_base.get_xdg_surface(&p1_wl, &qh, ());
+        client.popup1_xdg_id = Some(p1_xdg.id().protocol_id());
+        let p1 = p1_xdg.get_popup(Some(&tl_xdg), &pos1, &qh, ());
+        client.popup1_id = Some(p1.id().protocol_id());
+        p1.grab(&seat, press_serial);
+        p1_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let (_pool1, buf1) = create_shm_buffer_rgba(&shm, &qh, 200, 200, [0, 255, 0, 255]);
+        p1_xdg.ack_configure(client.popup1_last_serial.unwrap());
+        p1_xdg.set_window_geometry(0, 0, 200, 200);
+        p1_wl.attach(Some(&buf1), 0, 0);
+        p1_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(keyboard_id(&state), p1_wl.id().protocol_id());
+
+        // Intermediate keyboard event updates last_press/last_release, yet nested popup reusing press_serial is accepted.
+        state.send_stage_evdev_key(&stage_id, 30, true);
+        state.send_stage_evdev_key(&stage_id, 30, false);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        let pos2 = wm_base.create_positioner(&qh, ());
+        pos2.set_size(100, 100);
+        pos2.set_anchor_rect(10, 10, 1, 1);
+        pos2.set_anchor(c_pos::Anchor::BottomRight);
+        pos2.set_gravity(c_pos::Gravity::BottomRight);
+        let p2_wl = compositor.create_surface(&qh, ());
+        let p2_xdg = wm_base.get_xdg_surface(&p2_wl, &qh, ());
+        client.popup2_xdg_id = Some(p2_xdg.id().protocol_id());
+        let p2 = p2_xdg.get_popup(Some(&p1_xdg), &pos2, &qh, ());
+        client.popup2_id = Some(p2.id().protocol_id());
+        p2.grab(&seat, press_serial);
+        p2_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert!(!client.popup_done.contains(&p2.id().protocol_id()));
+        let (_pool2, buf2) = create_shm_buffer_rgba(&shm, &qh, 100, 100, [0, 0, 255, 255]);
+        p2_xdg.ack_configure(client.popup2_last_serial.unwrap());
+        p2_xdg.set_window_geometry(0, 0, 100, 100);
+        p2_wl.attach(Some(&buf2), 0, 0);
+        p2_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(keyboard_id(&state), p2_wl.id().protocol_id());
+
+        let before = client.button_events;
+        state.send_window_button_at(&stage_id, Some(&w1_id), 120.0, 120.0, 272, true, 3);
+        state.send_window_button_at(&stage_id, Some(&w1_id), 120.0, 120.0, 272, false, 4);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(client.button_events, before + 2);
+        assert!(!client.popup_done.contains(&p1.id().protocol_id()));
+        assert!(!client.popup_done.contains(&p2.id().protocol_id()));
+
+        let before_outside = client.button_events;
+        state.send_window_button_at(&stage_id, Some(&w1_id), 20.0, 20.0, 272, true, 5);
+        state.send_window_button_at(&stage_id, Some(&w1_id), 20.0, 20.0, 272, false, 6);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert!(client.popup_done.contains(&p2.id().protocol_id()));
+        assert!(client.popup_done.contains(&p1.id().protocol_id()));
+        assert_eq!(client.button_events, before_outside);
+        assert_eq!(keyboard_id(&state), tl_wl.id().protocol_id());
+
+        state.send_window_button_at(&stage_id, Some(&w1_id), 20.0, 20.0, 272, true, 7);
+        state.send_window_button_at(&stage_id, Some(&w1_id), 20.0, 20.0, 272, false, 8);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert_eq!(client.button_events, before_outside + 2);
+        p2.destroy();
+        p1.destroy();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        // 3. Destroying grabbed and ungrabbed popups repaints completely idle parent with no ghost pixels.
+        client.popup1_xdg_id = None;
+        client.popup2_xdg_id = None;
+        let fresh_press = client.pointer_press_serial.unwrap();
+        for grabbed in [true, false] {
+            let pos = wm_base.create_positioner(&qh, ());
+            pos.set_size(120, 120);
+            pos.set_anchor_rect(100, 100, 1, 1);
+            pos.set_anchor(c_pos::Anchor::BottomRight);
+            pos.set_gravity(c_pos::Gravity::BottomRight);
+            let p_wl = compositor.create_surface(&qh, ());
+            let p_xdg = wm_base.get_xdg_surface(&p_wl, &qh, ());
+            let p = p_xdg.get_popup(Some(&tl_xdg), &pos, &qh, ());
+            if grabbed {
+                p.grab(&seat, fresh_press);
+            }
+            p_wl.commit();
+            pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+            let (_pool_p, buf_p) = create_shm_buffer_rgba(&shm, &qh, 120, 120, [0, 255, 0, 255]);
+            p_xdg.set_window_geometry(0, 0, 120, 120);
+            p_wl.attach(Some(&buf_p), 0, 0);
+            p_wl.commit();
+            pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+            assert_eq!(pixel_at(&mut state, &w1_id, 120, 120), [0, 255, 0, 255]);
+
+            state.stages.get_mut(&stage_id).unwrap().window_mut(&w1_id).unwrap().dirty = false;
+            let seq_before = state.stages[&stage_id].frame_seq;
+            let settle_before = state.stages[&stage_id].settle_seq;
+            p.destroy();
+            pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+            assert!(state.stages[&stage_id].window(&w1_id).unwrap().dirty);
+            assert!(state.stages[&stage_id].frame_seq > seq_before);
+            assert!(state.stages[&stage_id].settle_seq > settle_before);
+            assert_eq!(pixel_at(&mut state, &w1_id, 120, 120), [255, 0, 0, 255]);
+        }
+
+        // 4. Host deactivation and same-Stage window switching dismiss active popups without click-through.
+        let pos4 = wm_base.create_positioner(&qh, ());
+        pos4.set_size(100, 100);
+        pos4.set_anchor_rect(100, 100, 1, 1);
+        let p4_wl = compositor.create_surface(&qh, ());
+        let p4_xdg = wm_base.get_xdg_surface(&p4_wl, &qh, ());
+        let p4 = p4_xdg.get_popup(Some(&tl_xdg), &pos4, &qh, ());
+        p4.grab(&seat, fresh_press);
+        p4_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        state.update_window_from_sink(
+            &w1_id,
+            crate::sink::WindowState {
+                rect: SavedRect { x: 0, y: 0, width: 800, height: 600 },
+                scale: 1.0,
+                monitor: None,
+                pixel_size: None,
+                activated: false,
+                maximized: false,
+                fullscreen: false,
+                resizing: false,
+                tiled: [false; 4],
+            },
+        );
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert!(client.popup_done.contains(&p4.id().protocol_id()));
+        p4.destroy();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        let tl2_wl = compositor.create_surface(&qh, ());
+        let tl2_xdg = wm_base.get_xdg_surface(&tl2_wl, &qh, ());
+        let _tl2 = tl2_xdg.get_toplevel(&qh, ());
+        tl2_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let (_pool_tl2, buf_tl2) = create_shm_buffer_rgba(&shm, &qh, 400, 300, [0, 0, 255, 255]);
+        tl2_wl.attach(Some(&buf_tl2), 0, 0);
+        tl2_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let w2_id = state.stages[&stage_id].windows[1].id.clone();
+
+        state.activate_sink_window(&stage_id, &w1_id);
+        state.send_window_button_at(&stage_id, Some(&w1_id), 20.0, 20.0, 273, true, 9);
+        state.send_window_button_at(&stage_id, Some(&w1_id), 20.0, 20.0, 273, false, 10);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        let p5_serial = client.pointer_press_serial.unwrap();
+        let pos5 = wm_base.create_positioner(&qh, ());
+        pos5.set_size(100, 100);
+        pos5.set_anchor_rect(100, 100, 1, 1);
+        let p5_wl = compositor.create_surface(&qh, ());
+        let p5_xdg = wm_base.get_xdg_surface(&p5_wl, &qh, ());
+        let p5 = p5_xdg.get_popup(Some(&tl_xdg), &pos5, &qh, ());
+        p5.grab(&seat, p5_serial);
+        p5_wl.commit();
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+
+        assert!(state.has_active_popup(&stage_id));
+        let before_switch = client.button_events;
+        state.send_window_button_at(&stage_id, Some(&w2_id), 20.0, 20.0, 272, true, 11);
+        state.activate_sink_window(&stage_id, &w2_id);
+        state.send_window_button_at(&stage_id, Some(&w2_id), 20.0, 20.0, 272, false, 12);
+        pump(&mut display, &mut state, &conn, &mut queue, &mut client);
+        assert!(client.popup_done.contains(&p5.id().protocol_id()));
+        assert_eq!(client.button_events, before_switch);
+        assert_eq!(state.stages[&stage_id].active_window().unwrap().id, w2_id);
+    }
+
+    #[test]
+    fn wayland_cursor_shape_custom_surface_scale_and_serial_isolation() {
+        use crate::sink::NativeCursor;
+        use wayland_client::Proxy;
+
+        let event_loop: EventLoop<'static, FocusStageState> = EventLoop::try_new().unwrap();
+        let mut display: Display<FocusStageState> = Display::new().unwrap();
+        let mut dh = display.handle();
+        let log = Arc::new(Mutex::new(WindowLog::default()));
+        let mut state = FocusStageState::new(
+            &dh,
+            event_loop.handle(),
+            "focusstage-cursor-test".into(),
+            1.0,
+            60,
+            SavedRect { x: 0, y: 0, width: 1920, height: 1080 },
+            Some(Box::new(TestSink(log.clone()))),
+        );
+
+        let mut connect = || {
+            let (server_sock, client_sock) = UnixStream::pair().unwrap();
+            let peer = dh.insert_client(server_sock, Arc::new(ClientState::default())).unwrap();
+            let conn = Connection::from_socket(client_sock).unwrap();
+            let queue = conn.new_event_queue();
+            conn.display().get_registry(&queue.handle(), ());
+            (peer, conn, queue, TestClient::default())
+        };
+
+        let (_peer1, conn1, mut q1, mut c1) = connect();
+        let (_peer2, conn2, mut q2, mut c2) = connect();
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+        pump(&mut display, &mut state, &conn2, &mut q2, &mut c2);
+
+        let qh1 = q1.handle();
+        let qh2 = q2.handle();
+        let comp1 = c1.compositor.as_ref().unwrap().clone();
+        let wm1 = c1.wm_base.as_ref().unwrap().clone();
+        let shm1 = c1.shm.as_ref().unwrap().clone();
+
+        let tl1_wl = comp1.create_surface(&qh1, ());
+        let tl1_xdg = wm1.get_xdg_surface(&tl1_wl, &qh1, ());
+        let _tl1 = tl1_xdg.get_toplevel(&qh1, ());
+        tl1_wl.commit();
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+        let (_pool1, buf1) = create_shm_buffer_rgba(&shm1, &qh1, 400, 300, [255, 255, 255, 255]);
+        tl1_wl.attach(Some(&buf1), 0, 0);
+        tl1_wl.commit();
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+
+        let sid1 = state.stages.keys().next().unwrap().clone();
+        let w1_id = state.stages[&sid1].windows[0].id.clone();
+
+        // Add subsurface to test enter serial rotation within the same window.
+        let sub_wl = comp1.create_surface(&qh1, ());
+        let sub = c1.subcompositor.as_ref().unwrap().get_subsurface(&sub_wl, &tl1_wl, &qh1, ());
+        sub.set_position(200, 0);
+        let (_pool_sub, buf_sub) = create_shm_buffer_rgba(&shm1, &qh1, 100, 100, [100, 100, 100, 255]);
+        sub_wl.attach(Some(&buf_sub), 0, 0);
+        sub_wl.commit();
+        tl1_wl.commit();
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+
+        // 1. Named cursor shape via wp_cursor_shape_v1.
+        state.send_window_pointer_motion_at(&sid1, Some(&w1_id), 50.0, 50.0, 1);
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+        let serial1 = c1.pointer_enter_serial;
+        let shape_dev1 = c1
+            .cursor_shape_manager
+            .as_ref()
+            .unwrap()
+            .get_pointer(c1.pointer.as_ref().unwrap(), &qh1, ());
+        let shape_dev2 = c2
+            .cursor_shape_manager
+            .as_ref()
+            .unwrap()
+            .get_pointer(c2.pointer.as_ref().unwrap(), &qh2, ());
+
+        log.lock().unwrap().cursors.clear();
+        shape_dev1.set_shape(serial1, c_cursor_shape_device::Shape::Text);
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+        state.tick_cursors(10);
+        state.tick_cursors(20);
+        assert_eq!(log.lock().unwrap().cursors, vec![(w1_id.clone(), NativeCursor::Named("text"))]);
+
+        // 2. Same-window subsurface transition avoids Arrow flicker, stale serial and cross-client serials are ignored.
+        log.lock().unwrap().cursors.clear();
+        state.send_window_pointer_motion_at(&sid1, Some(&w1_id), 220.0, 20.0, 2);
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+        let serial2 = c1.pointer_enter_serial;
+        assert_ne!(serial2, serial1);
+        assert!(log.lock().unwrap().cursors.is_empty());
+
+        shape_dev1.set_shape(serial1, c_cursor_shape_device::Shape::Wait);
+        shape_dev2.set_shape(serial2, c_cursor_shape_device::Shape::Wait);
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+        pump(&mut display, &mut state, &conn2, &mut q2, &mut c2);
+        shape_dev1.set_shape(serial2, c_cursor_shape_device::Shape::Pointer);
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+        state.tick_cursors(30);
+        assert_eq!(
+            log.lock().unwrap().cursors,
+            vec![(w1_id.clone(), NativeCursor::Named("pointer"))]
+        );
+
+        // 3. Hidden cursor.
+        log.lock().unwrap().cursors.clear();
+        c1.pointer.as_ref().unwrap().set_cursor(serial2, None, 0, 0);
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+        state.tick_cursors(40);
+        assert_eq!(log.lock().unwrap().cursors, vec![(w1_id.clone(), NativeCursor::Hidden)]);
+
+        // 4. Custom cursor surface: straight-alpha PNG, frame callbacks, offset delta, and scale updates.
+        let cursor_surf = comp1.create_surface(&qh1, ());
+        let _cursor_scale = c1
+            .fractional_scale
+            .as_ref()
+            .unwrap()
+            .get_fractional_scale(&cursor_surf, &qh1, cursor_surf.id().protocol_id());
+        let (_pool_c1, buf_c1) = create_shm_buffer_rgba(&shm1, &qh1, 16, 16, [0, 255, 0, 255]);
+        cursor_surf.attach(Some(&buf_c1), 0, 0);
+        cursor_surf.frame(&qh1, ());
+        cursor_surf.commit();
+        c1.pointer.as_ref().unwrap().set_cursor(serial2, Some(&cursor_surf), 5, 7);
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+
+        let decode_png = |png: &[u8]| -> (u32, u32, [u8; 4]) {
+            let decoder = png::Decoder::new(std::io::Cursor::new(png));
+            let mut reader = decoder.read_info().unwrap();
+            let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+            let info = reader.next_frame(&mut buf).unwrap();
+            let cx = (info.width / 2) as usize;
+            let cy = (info.height / 2) as usize;
+            let idx = (cy * info.width as usize + cx) * 4;
+            (info.width, info.height, buf[idx..idx + 4].try_into().unwrap())
+        };
+
+        log.lock().unwrap().cursors.clear();
+        let cb_before = c1.frame_callbacks;
+        state.tick_cursors(50);
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+        assert!(c1.frame_callbacks > cb_before);
+        assert_eq!(c1.preferred_scales[&cursor_surf.id().protocol_id()], 120);
+        let cursors = std::mem::take(&mut log.lock().unwrap().cursors);
+        assert_eq!(cursors.len(), 1);
+        match &cursors[0] {
+            (wid, NativeCursor::Bitmap { png, hotspot_x, hotspot_y }) => {
+                assert_eq!(wid, &w1_id);
+                assert_eq!((*hotspot_x, *hotspot_y), (5, 7));
+                assert_eq!(decode_png(png), (16, 16, [0, 255, 0, 255]));
+            }
+            other => panic!("expected bitmap cursor, got {other:?}"),
+        }
+
+        // Animated commit with wl_surface.offset adjusts hotspot and re-emits bitmap.
+        let (_pool_c2, buf_c2) = create_shm_buffer_rgba(&shm1, &qh1, 16, 16, [255, 0, 0, 255]);
+        cursor_surf.attach(Some(&buf_c2), 0, 0);
+        cursor_surf.offset(2, 1);
+        cursor_surf.commit();
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+        log.lock().unwrap().cursors.clear();
+        state.tick_cursors(60);
+        let cursors = std::mem::take(&mut log.lock().unwrap().cursors);
+        assert_eq!(cursors.len(), 1);
+        match &cursors[0] {
+            (_, NativeCursor::Bitmap { png, hotspot_x, hotspot_y }) => {
+                assert_eq!((*hotspot_x, *hotspot_y), (3, 6));
+                assert_eq!(decode_png(png), (16, 16, [0, 0, 255, 255]));
+            }
+            other => panic!("expected updated bitmap cursor, got {other:?}"),
+        }
+
+        // Scale update re-renders cursor bitmap and syncs preferred fractional scale on cursor surface.
+        state.update_window_from_sink(
+            &w1_id,
+            crate::sink::WindowState {
+                rect: SavedRect { x: 0, y: 0, width: 400, height: 300 },
+                scale: 2.0,
+                monitor: None,
+                pixel_size: Some([800, 600]),
+                activated: true,
+                maximized: false,
+                fullscreen: false,
+                resizing: false,
+                tiled: [false; 4],
+            },
+        );
+        pump(&mut display, &mut state, &conn1, &mut q1, &mut c1);
+        assert_eq!(c1.preferred_scales[&cursor_surf.id().protocol_id()], 240);
+        log.lock().unwrap().cursors.clear();
+        state.tick_cursors(70);
+        let cursors = std::mem::take(&mut log.lock().unwrap().cursors);
+        assert_eq!(cursors.len(), 1);
+        match &cursors[0] {
+            (_, NativeCursor::Bitmap { png, hotspot_x, hotspot_y }) => {
+                assert_eq!((*hotspot_x, *hotspot_y), (6, 12));
+                assert_eq!(decode_png(png), (32, 32, [0, 0, 255, 255]));
+            }
+            other => panic!("expected 2x bitmap cursor, got {other:?}"),
+        }
+
+        // 5. Agent takeover resets cursor to default; returning to human restores cursor; pointer leave resets to default.
+        log.lock().unwrap().cursors.clear();
+        state.stages.get_mut(&sid1).unwrap().input_owner = crate::protocol::InputOwner::Agent {
+            lease_id: "lease-cursor".into(),
+            agent_name: None,
+        };
+        state.tick_cursors(80);
+        assert_eq!(
+            log.lock().unwrap().cursors,
+            vec![(w1_id.clone(), NativeCursor::Named("default"))]
+        );
+
+        log.lock().unwrap().cursors.clear();
+        state.stages.get_mut(&sid1).unwrap().input_owner = crate::protocol::InputOwner::Human;
+        state.tick_cursors(90);
+        assert!(matches!(
+            log.lock().unwrap().cursors.as_slice(),
+            [(wid, NativeCursor::Bitmap { .. })] if wid == &w1_id
+        ));
+
+        log.lock().unwrap().cursors.clear();
+        state.leave_window_pointer(&sid1, &w1_id);
+        assert_eq!(
+            log.lock().unwrap().cursors,
+            vec![(w1_id.clone(), NativeCursor::Named("default"))]
+        );
     }
 }

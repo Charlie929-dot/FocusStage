@@ -261,6 +261,7 @@ fn main() -> anyhow::Result<()> {
         // The pending check above still bounds transport to one frame per window.
         if tick_due.replace(false) {
             let now_ms = state.now_ms();
+            state.tick_cursors(now_ms);
             for window in state.stages.values().flat_map(|stage| &stage.windows) {
                 if let Some(surface) = window.toplevel.wl_surface() {
                     send_frames_surface_tree(&surface, now_ms);
@@ -324,11 +325,21 @@ fn dispatch_sink_events(state: &mut FocusStageState) -> bool {
                     if cancelled {
                         state.cancel_stage_drag(&stage_id);
                     }
-                    if pressed {
+                    let dismiss_before_activate = pressed
+                        && state.has_active_popup(&stage_id)
+                        && state
+                            .stages
+                            .get(&stage_id)
+                            .and_then(|s| s.active_window())
+                            .is_none_or(|w| w.id != window_id);
+                    if pressed && !dismiss_before_activate {
                         state.activate_sink_window(&stage_id, &window_id);
                     }
                     state.set_captured_drag_target(&stage_id, &window_id, drag_target);
                     state.send_window_button_at(&stage_id, Some(&window_id), x, y, button, pressed, state.now_ms());
+                    if dismiss_before_activate {
+                        state.activate_sink_window(&stage_id, &window_id);
+                    }
                 }
             }
             SinkInputEvent::FileDragEnded { window_id, serial, dropped, continuing, drag_target } => {

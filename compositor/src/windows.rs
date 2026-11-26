@@ -1,6 +1,7 @@
 use smithay::desktop::{find_popup_root_surface, PopupManager};
+use smithay::input::pointer::CursorImageStatus;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State;
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource};
 use smithay::wayland::compositor::get_parent;
 
 use crate::protocol::{DisplayState, InputOwner, SavedRect};
@@ -29,6 +30,7 @@ impl FocusStageState {
     pub fn sync_surface_output(&self, surface: &WlSurface) {
         let (monitor, scale) = self
             .window_for_surface(surface)
+            .or_else(|| self.window_for_cursor_surface(surface))
             .map_or((None, self.default_scale), |w| (w.monitor, w.scale));
         self.virtual_outputs.enter_tree(surface, monitor, scale);
     }
@@ -360,6 +362,7 @@ impl FocusStageState {
             .active_window()
             .is_none_or(|w| w.id != window_id)
         {
+            self.dismiss_stage_popups(stage_id);
             self.release_all_stage_inputs(stage_id);
         }
         self.stages.get_mut(stage_id).unwrap().active_window_id = Some(window_id.to_string());
@@ -407,7 +410,8 @@ impl FocusStageState {
             state.activated = stage.active_window().is_some_and(|w| w.id == window_id);
         } else if state.activated {
             self.activate_sink_window(&stage_id, window_id);
-        } else if stage.active_window_id.as_deref() == Some(window_id) {
+        } else if stage.active_window().is_some_and(|w| w.id == window_id) {
+            self.dismiss_stage_popups(&stage_id);
             self.release_all_stage_inputs(&stage_id);
         }
         self.configure_sink_window(window_id, state.rect, Some(state));
@@ -503,6 +507,18 @@ impl FocusStageState {
                 for (popup, _) in PopupManager::popups_for_surface(&surface) {
                     self.sync_surface_output(popup.wl_surface());
                 }
+            }
+            if let Some(cursor) = self
+                .stages
+                .get(stage_id)
+                .and_then(|stage| stage.input.cursor.as_ref())
+                .filter(|focus| focus.window == window_id)
+                .and_then(|focus| match &focus.image {
+                    CursorImageStatus::Surface(cursor) if cursor.is_alive() => Some(cursor.clone()),
+                    _ => None,
+                })
+            {
+                self.sync_surface_output(&cursor);
             }
         }
     }

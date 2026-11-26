@@ -37,6 +37,7 @@ pub fn wayland_window_geometry_loc(surface: &WlSurface) -> Point<i32, smithay::u
 pub struct OffscreenCore {
     pub renderer: PixmanRenderer,
     cached_image: Option<(i32, i32, pixman::Image<'static, 'static>)>,
+    cursor_cached_image: Option<(i32, i32, pixman::Image<'static, 'static>)>,
 }
 
 impl OffscreenCore {
@@ -44,6 +45,7 @@ impl OffscreenCore {
         Self {
             renderer: PixmanRenderer::new().expect("create PixmanRenderer"),
             cached_image: None,
+            cursor_cached_image: None,
         }
     }
 
@@ -76,7 +78,6 @@ impl OffscreenCore {
         let [phys_w, phys_h] = window.and_then(|w| w.pixel_size).map(|size| size.map(|v| v as i32))
             .unwrap_or_else(|| [logical_w, logical_h].map(|v| (v as f64 * scale).round().max(1.0) as i32));
         let phys_size: Size<i32, Physical> = Size::from((phys_w, phys_h));
-        let buf_size: Size<i32, BufferCoords> = Size::from((phys_w, phys_h));
         let damage = Rectangle::from_size(phys_size);
 
         let mut elements: Vec<WaylandSurfaceRenderElement<PixmanRenderer>> = Vec::new();
@@ -166,7 +167,83 @@ impl OffscreenCore {
             return Ok(None);
         }
 
-        let mut img = match self.cached_image.take() {
+        self.rasterize(&elements, phys_size, scale, Color32F::new(0.08, 0.09, 0.11, 1.0), false, out)?;
+        Ok(Some((phys_w as u32, phys_h as u32)))
+    }
+
+    pub(crate) fn cursor_bitmap(&mut self, surface: &WlSurface, scale: f64) -> crate::sink::NativeCursor {
+        use smithay::input::pointer::CursorImageSurfaceData;
+        let bounds = smithay::desktop::utils::bbox_from_surface_tree(surface, (0, 0));
+        if bounds.size.w <= 0 || bounds.size.h <= 0 {
+            return crate::sink::NativeCursor::Hidden;
+        }
+        let size = bounds.size.to_physical_precise_round(scale);
+        if !(1..=1024).contains(&size.w) || !(1..=1024).contains(&size.h) {
+            return crate::sink::NativeCursor::Named("default");
+        }
+        let origin: Point<i32, Physical> = bounds.loc.to_physical_precise_round(scale);
+        let hotspot = with_states(surface, |states| {
+            states
+                .data_map
+                .get::<CursorImageSurfaceData>()
+                .map(|attrs| attrs.lock().unwrap().hotspot)
+        })
+        .unwrap_or_default()
+        .to_physical_precise_round(scale)
+            - origin;
+        let elements = render_elements_from_surface_tree(
+            &mut self.renderer,
+            surface,
+            (-origin.x, -origin.y),
+            scale,
+            1.0,
+            Kind::Unspecified,
+        );
+        if elements.is_empty() {
+            return crate::sink::NativeCursor::Hidden;
+        }
+        let mut pixels = Vec::new();
+        if self
+            .rasterize(
+                &elements,
+                size,
+                scale,
+                Color32F::new(0.0, 0.0, 0.0, 0.0),
+                true,
+                &mut pixels,
+            )
+            .is_err()
+        {
+            return crate::sink::NativeCursor::Named("default");
+        }
+        match encode_png(size.w as u32, size.h as u32, &pixels) {
+            Ok(png) => crate::sink::NativeCursor::Bitmap {
+                png,
+                hotspot_x: hotspot.x,
+                hotspot_y: hotspot.y,
+            },
+            Err(_) => crate::sink::NativeCursor::Named("default"),
+        }
+    }
+
+    fn rasterize(
+        &mut self,
+        elements: &[WaylandSurfaceRenderElement<PixmanRenderer>],
+        phys_size: Size<i32, Physical>,
+        scale: f64,
+        clear: Color32F,
+        use_cursor_cache: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let (phys_w, phys_h) = (phys_size.w, phys_size.h);
+        let buf_size: Size<i32, BufferCoords> = Size::from((phys_w, phys_h));
+        let damage = Rectangle::from_size(phys_size);
+        let cache = if use_cursor_cache {
+            &mut self.cursor_cached_image
+        } else {
+            &mut self.cached_image
+        };
+        let mut img = match cache.take() {
             Some((cw, ch, img)) if cw == phys_w && ch == phys_h => img,
             _ => self
                 .renderer
@@ -187,10 +264,10 @@ impl OffscreenCore {
                     .map_err(|e| format!("begin pixman frame: {e}"))?;
 
                 frame
-                    .clear(Color32F::new(0.08, 0.09, 0.11, 1.0), &[damage])
+                    .clear(clear, &[damage])
                     .map_err(|e| format!("clear frame: {e}"))?;
 
-                draw_render_elements(&mut frame, scale, &elements, &[damage])
+                draw_render_elements(&mut frame, scale, elements, &[damage])
                     .map_err(|e| format!("draw elements: {e}"))?;
 
                 let _sync = frame
@@ -221,9 +298,13 @@ impl OffscreenCore {
             Ok(())
         })();
 
-        self.cached_image = Some((phys_w, phys_h, img));
-        render_res?;
-        Ok(Some((phys_w as u32, phys_h as u32)))
+        let cache = if use_cursor_cache {
+            &mut self.cursor_cached_image
+        } else {
+            &mut self.cached_image
+        };
+        *cache = Some((phys_w, phys_h, img));
+        render_res
     }
 
     pub fn render_stage_bgra(
