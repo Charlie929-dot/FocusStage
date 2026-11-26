@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
@@ -25,6 +26,7 @@ internal sealed record SystemProxyState(
     UpstreamTarget? DefaultTcpUpstream,
     UpstreamTarget? ExplicitSocksUpstream,
     string? HttpProxyEnv,
+    string? HttpsProxyEnv,
     string? AllProxyEnv,
     string NoProxyEnv)
 {
@@ -34,11 +36,24 @@ internal sealed record SystemProxyState(
 
 internal sealed class ProxyBridge : IDisposable
 {
+    private const int Socks5ProbeSuccessTtlSeconds = 300;
+    private const int Socks5ProbeFailureTtlSeconds = 60;
+    private const int CacheTtlSeconds = 60;
+    private const int MaxPacCacheEntries = 2048;
+    private const int MaxDnsCacheEntries = 1024;
+    private const int RelayBufferSize = 65536;
+
     private readonly TcpListener _listener;
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<string, (bool SupportsSocks5, DateTime CheckedUtc)> _probeCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, Lazy<Task<bool>>> _inflightProbes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, (UpstreamTarget? Target, DateTime CachedUtc)> _pacCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, (IPAddress Address, DateTime CachedUtc)> _dnsCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Action<ProxyBridge, SystemProxyState> _onStateChanged;
     private readonly object _stateLock = new();
+    private readonly object _winHttpLock = new();
+    private IntPtr _winHttpSession;
+    private long _stateEpoch;
     private SystemProxyState _currentState;
     private bool _disposed;
 
@@ -52,7 +67,7 @@ internal sealed class ProxyBridge : IDisposable
         Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
         _currentState = ReadSystemProxyState();
         _ = Task.Run(AcceptLoopAsync);
-        _ = Task.Run(WatchRegistryLoopAsync);
+        _ = Task.Run(EmitInitialAndWatchRegistryLoopAsync);
     }
 
     public SystemProxyState CurrentState
@@ -78,6 +93,23 @@ internal sealed class ProxyBridge : IDisposable
             };
         }
 
+        bool noPac = string.IsNullOrWhiteSpace(state.AutoConfigUrl);
+        string? directHttp = noPac ? state.HttpProxyEnv : null;
+        string? directHttps = noPac ? (state.HttpsProxyEnv ?? state.HttpProxyEnv) : null;
+        string? directSocks = null;
+        if (noPac)
+        {
+            if (state.ExplicitSocksUpstream is { } s)
+            {
+                directSocks = $"socks5h://{FormatHostPort(s.Host, s.Port)}";
+            }
+            else if (state.DefaultTcpUpstream is { } tcp
+                && TryGetCachedSocks5Support(tcp.Host, tcp.Port) == true)
+            {
+                directSocks = $"socks5h://{FormatHostPort(tcp.Host, tcp.Port)}";
+            }
+        }
+
         return new
         {
             type = "host_proxy_changed",
@@ -85,13 +117,34 @@ internal sealed class ProxyBridge : IDisposable
             bridge_port = Port,
             http_proxy = $"http://127.0.0.1:{Port}",
             https_proxy = $"http://127.0.0.1:{Port}",
-            all_proxy = $"socks5://127.0.0.1:{Port}",
+            all_proxy = $"socks5h://127.0.0.1:{Port}",
             no_proxy = state.NoProxyEnv,
+            direct_http_proxy = directHttp,
+            direct_https_proxy = directHttps,
+            direct_socks_proxy = directSocks,
         };
     }
 
-    private async Task WatchRegistryLoopAsync()
+    private async Task EmitInitialAndWatchRegistryLoopAsync()
     {
+        try
+        {
+            var initial = CurrentState;
+            await PreProbeStateAsync(initial, _cts.Token);
+            if (!_cts.IsCancellationRequested)
+            {
+                _onStateChanged(this, initial);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        catch
+        {
+            // Keep watching even if initial probe/emit hit a transient error.
+        }
+
         while (!_cts.IsCancellationRequested)
         {
             try
@@ -105,12 +158,19 @@ internal sealed class ProxyBridge : IDisposable
                     if (changed)
                     {
                         _currentState = next;
+                        Interlocked.Increment(ref _stateEpoch);
                         _probeCache.Clear();
+                        _inflightProbes.Clear();
+                        _pacCache.Clear();
                     }
                 }
                 if (changed)
                 {
-                    _onStateChanged(this, next);
+                    await PreProbeStateAsync(next, _cts.Token);
+                    if (!_cts.IsCancellationRequested)
+                    {
+                        _onStateChanged(this, next);
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -121,6 +181,18 @@ internal sealed class ProxyBridge : IDisposable
             {
                 // Keep watching on transient registry access errors.
             }
+        }
+    }
+
+    private async Task PreProbeStateAsync(SystemProxyState state, CancellationToken ct)
+    {
+        if (state.Enabled
+            && string.IsNullOrWhiteSpace(state.AutoConfigUrl)
+            && state.ExplicitSocksUpstream is null
+            && state.DefaultTcpUpstream is { } tcp
+            && tcp.Kind != UpstreamKind.Socks5)
+        {
+            await GetSocks5SupportAsync(tcp.Host, tcp.Port, ct);
         }
     }
 
@@ -161,20 +233,20 @@ internal sealed class ProxyBridge : IDisposable
             try
             {
                 var stream = client.GetStream();
-                var first = new byte[1];
-                int n = await stream.ReadAsync(first.AsMemory(0, 1), ct);
-                if (n <= 0)
+                using var reader = new BufferedStreamReader(stream);
+                if (!await reader.EnsureAvailableAsync(1, ct))
                 {
                     return;
                 }
 
-                if (first[0] == 0x05)
+                if (reader.PeekByte() == 0x05)
                 {
-                    await HandleSocks5ClientAsync(client, stream, ct);
+                    reader.Consume(1);
+                    await HandleSocks5ClientAsync(stream, reader, ct);
                 }
                 else
                 {
-                    await HandleHttpClientAsync(stream, first[0], ct);
+                    await HandleHttpClientAsync(stream, reader, ct);
                 }
             }
             catch
@@ -184,16 +256,13 @@ internal sealed class ProxyBridge : IDisposable
         }
     }
 
-    private async Task HandleSocks5ClientAsync(TcpClient client, NetworkStream stream, CancellationToken ct)
+    private async Task HandleSocks5ClientAsync(NetworkStream stream, BufferedStreamReader reader, CancellationToken ct)
     {
-        var lenBuf = new byte[1];
-        if (!await ReadExactAsync(stream, lenBuf, ct))
-            return;
-        int nMethods = lenBuf[0];
+        int nMethods = await reader.ReadByteAsync(ct);
         if (nMethods <= 0)
             return;
         var methods = new byte[nMethods];
-        if (!await ReadExactAsync(stream, methods, ct))
+        if (!await reader.ReadExactAsync(methods, ct))
             return;
 
         bool supportsNoAuth = Array.IndexOf(methods, (byte)0x00) >= 0;
@@ -205,14 +274,14 @@ internal sealed class ProxyBridge : IDisposable
         await stream.WriteAsync(new byte[] { 0x05, 0x00 }, ct);
 
         var header = new byte[4];
-        if (!await ReadExactAsync(stream, header, ct))
+        if (!await reader.ReadExactAsync(header, ct))
             return;
         if (header[0] != 0x05)
             return;
 
         byte cmd = header[1];
         byte atyp = header[3];
-        var target = await ReadSocks5AddressAsync(stream, atyp, ct);
+        var target = await ReadSocks5AddressAsync(reader, atyp, ct);
         if (target is null)
         {
             await SendSocks5ReplyAsync(stream, 0x08, null, ct);
@@ -222,15 +291,28 @@ internal sealed class ProxyBridge : IDisposable
 
         if (cmd == 0x01) // CONNECT
         {
+            byte[]? clientTrailing = reader.DetachRemaining();
+            reader.Dispose();
+
             TcpClient? upstreamConn = null;
             try
             {
-                upstreamConn = await OpenTcpTargetAsync(dstHost, dstPort, ct);
+                byte[]? serverTrailing;
+                (upstreamConn, serverTrailing) = await OpenTcpTargetAsync(dstHost, dstPort, ct);
                 var boundEp = upstreamConn.Client.LocalEndPoint as IPEndPoint;
                 await SendSocks5ReplyAsync(stream, 0x00, boundEp, ct);
                 using (upstreamConn)
                 {
-                    await RelayBidirectionalAsync(stream, upstreamConn.GetStream(), ct);
+                    var upStream = upstreamConn.GetStream();
+                    if (clientTrailing is { Length: > 0 })
+                    {
+                        await upStream.WriteAsync(clientTrailing, ct);
+                    }
+                    if (serverTrailing is { Length: > 0 })
+                    {
+                        await stream.WriteAsync(serverTrailing, ct);
+                    }
+                    await RelayBidirectionalAsync(stream, upStream, ct);
                 }
             }
             catch
@@ -247,7 +329,8 @@ internal sealed class ProxyBridge : IDisposable
         }
         else if (cmd == 0x03) // UDP ASSOCIATE
         {
-            await HandleSocks5UdpAssociateAsync(client, stream, ct);
+            reader.Dispose();
+            await HandleSocks5UdpAssociateAsync(stream, ct);
         }
         else
         {
@@ -255,7 +338,7 @@ internal sealed class ProxyBridge : IDisposable
         }
     }
 
-    private async Task HandleSocks5UdpAssociateAsync(TcpClient tcpClient, NetworkStream tcpStream, CancellationToken ct)
+    private async Task HandleSocks5UdpAssociateAsync(NetworkStream tcpStream, CancellationToken ct)
     {
         using var localUdp = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
         var boundPort = ((IPEndPoint)localUdp.Client.LocalEndPoint!).Port;
@@ -301,12 +384,11 @@ internal sealed class ProxyBridge : IDisposable
                 if (!TryParseSocks5UdpDatagram(recv.Buffer, out var dstHost, out var dstPort, out var payload))
                     continue;
 
-                var route = await ResolveRouteAsync(dstHost, dstPort, preferUdp: true, act);
+                var route = await ResolveRouteAsync(dstHost, dstPort, preferUdp: true, preferHttp: false, act);
                 if (route.Kind == UpstreamKind.Direct)
                 {
-                    var ips = await Dns.GetHostAddressesAsync(dstHost, act);
-                    if (ips.Length == 0) continue;
-                    var destIp = ips[0];
+                    var destIp = await ResolveUdpDestinationAsync(dstHost, act);
+                    if (destIp is null) continue;
                     var destEp = new IPEndPoint(destIp, dstPort);
                     var sock = directSockets.GetOrAdd(destIp.AddressFamily, af =>
                     {
@@ -340,7 +422,7 @@ internal sealed class ProxyBridge : IDisposable
                     {
                         if (clientUdpEp is not null)
                         {
-                            var pkt = BuildSocks5UdpDatagram(fromHost, fromPort, data);
+                            var pkt = BuildSocks5UdpDatagram(fromHost, fromPort, data.Span);
                             await localUdp.SendAsync(pkt, clientUdpEp, act);
                         }
                     }, act));
@@ -363,25 +445,61 @@ internal sealed class ProxyBridge : IDisposable
         }
     }
 
-    private async Task HandleHttpClientAsync(NetworkStream clientStream, byte firstByte, CancellationToken ct)
+    private async Task<IPAddress?> ResolveUdpDestinationAsync(string host, CancellationToken ct)
     {
-        var headerBytes = new List<byte>(1024) { firstByte };
-        var one = new byte[1];
-        int match = 0;
-        while (headerBytes.Count < 65536)
+        if (IPAddress.TryParse(host, out var literal))
         {
-            int n = await clientStream.ReadAsync(one.AsMemory(0, 1), ct);
-            if (n <= 0) return;
-            byte b = one[0];
-            headerBytes.Add(b);
-            if ((match == 0 || match == 2) && b == '\r') match++;
-            else if ((match == 1 || match == 3) && b == '\n') match++;
-            else match = b == '\r' ? 1 : 0;
-            if (match == 4) break;
+            return literal;
         }
-        if (match != 4) return;
 
-        var headerText = Encoding.ASCII.GetString(headerBytes.ToArray());
+        var now = DateTime.UtcNow;
+        if (_dnsCache.TryGetValue(host, out var cached)
+            && (now - cached.CachedUtc).TotalSeconds < CacheTtlSeconds)
+        {
+            return cached.Address;
+        }
+
+        var ips = await Dns.GetHostAddressesAsync(host, ct);
+        if (ips.Length == 0)
+        {
+            return null;
+        }
+
+        var chosen = Array.Find(ips, ip => ip.AddressFamily == AddressFamily.InterNetwork) ?? ips[0];
+        if (_dnsCache.Count >= MaxDnsCacheEntries)
+        {
+            _dnsCache.Clear();
+        }
+        _dnsCache[host] = (chosen, DateTime.UtcNow);
+        return chosen;
+    }
+
+    private async Task HandleHttpClientAsync(NetworkStream clientStream, BufferedStreamReader reader, CancellationToken ct)
+    {
+        int headerLen;
+        int searchFrom = 0;
+        while (true)
+        {
+            headerLen = reader.TryFindHeaderEnd(65536, ref searchFrom, out int checkLen);
+            if (headerLen >= 0)
+            {
+                break;
+            }
+            if (checkLen >= 65536)
+            {
+                return;
+            }
+            if (!await reader.FillAsync(ct))
+            {
+                return;
+            }
+        }
+
+        byte[] headerBytes = reader.TakeHeaderBytes(headerLen);
+        byte[]? clientTrailing = reader.DetachRemaining();
+        reader.Dispose();
+
+        var headerText = Encoding.ASCII.GetString(headerBytes);
         var lines = headerText.Split("\r\n", StringSplitOptions.None);
         if (lines.Length == 0) return;
         var reqParts = lines[0].Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
@@ -396,21 +514,37 @@ internal sealed class ProxyBridge : IDisposable
             if (!TrySplitHostPort(target, 443, out var host, out var port))
                 return;
 
-            var route = await ResolveRouteAsync(host, port, preferUdp: false, ct);
+            var route = await ResolveRouteAsync(host, port, preferUdp: false, preferHttp: true, ct);
             if (route.Kind == UpstreamKind.Http)
             {
                 using var upstream = new TcpClient { NoDelay = true };
                 await upstream.ConnectAsync(route.Host, route.Port, ct);
                 var upStream = upstream.GetStream();
-                await upStream.WriteAsync(headerBytes.ToArray(), ct);
+                await upStream.WriteAsync(headerBytes, ct);
+                if (clientTrailing is { Length: > 0 })
+                {
+                    await upStream.WriteAsync(clientTrailing, ct);
+                }
                 await RelayBidirectionalAsync(clientStream, upStream, ct);
                 return;
             }
 
-            using var conn = await OpenTcpTargetWithRouteAsync(route, host, port, ct);
-            var okResp = Encoding.ASCII.GetBytes($"{version} 200 Connection Established\r\n\r\n");
-            await clientStream.WriteAsync(okResp, ct);
-            await RelayBidirectionalAsync(clientStream, conn.GetStream(), ct);
+            var (conn, serverTrailing) = await OpenTcpTargetWithRouteAsync(route, host, port, ct);
+            using (conn)
+            {
+                var okResp = Encoding.ASCII.GetBytes($"{version} 200 Connection Established\r\n\r\n");
+                await clientStream.WriteAsync(okResp, ct);
+                var connStream = conn.GetStream();
+                if (clientTrailing is { Length: > 0 })
+                {
+                    await connStream.WriteAsync(clientTrailing, ct);
+                }
+                if (serverTrailing is { Length: > 0 })
+                {
+                    await clientStream.WriteAsync(serverTrailing, ct);
+                }
+                await RelayBidirectionalAsync(clientStream, connStream, ct);
+            }
             return;
         }
 
@@ -421,44 +555,63 @@ internal sealed class ProxyBridge : IDisposable
 
         string httpHost = uri.Host;
         int httpPort = uri.IsDefaultPort ? (uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase) ? 443 : 80) : uri.Port;
-        var httpRoute = await ResolveRouteAsync(httpHost, httpPort, preferUdp: false, ct);
+        var httpRoute = await ResolveRouteAsync(httpHost, httpPort, preferUdp: false, preferHttp: true, ct);
 
         if (httpRoute.Kind == UpstreamKind.Http)
         {
             using var upstream = new TcpClient { NoDelay = true };
             await upstream.ConnectAsync(httpRoute.Host, httpRoute.Port, ct);
             var upStream = upstream.GetStream();
-            await upStream.WriteAsync(headerBytes.ToArray(), ct);
+            await upStream.WriteAsync(headerBytes, ct);
+            if (clientTrailing is { Length: > 0 })
+            {
+                await upStream.WriteAsync(clientTrailing, ct);
+            }
             await RelayBidirectionalAsync(clientStream, upStream, ct);
             return;
         }
 
-        using var targetConn = await OpenTcpTargetWithRouteAsync(httpRoute, httpHost, httpPort, ct);
-        var rewritten = new StringBuilder();
-        rewritten.Append(method).Append(' ').Append(uri.PathAndQuery).Append(' ').Append(version).Append("\r\n");
-        for (int i = 1; i < lines.Length; i++)
+        var (targetConn, targetServerTrailing) = await OpenTcpTargetWithRouteAsync(httpRoute, httpHost, httpPort, ct);
+        using (targetConn)
         {
-            var line = lines[i];
-            if (line.Length == 0) break;
-            if (line.StartsWith("Proxy-Connection:", StringComparison.OrdinalIgnoreCase) ||
-                line.StartsWith("Connection:", StringComparison.OrdinalIgnoreCase))
-                continue;
-            rewritten.Append(line).Append("\r\n");
+            var rewritten = new StringBuilder();
+            rewritten.Append(method).Append(' ').Append(uri.PathAndQuery).Append(' ').Append(version).Append("\r\n");
+            for (int i = 1; i < lines.Length; i++)
+            {
+                var line = lines[i];
+                if (line.Length == 0) break;
+                if (line.StartsWith("Proxy-Connection:", StringComparison.OrdinalIgnoreCase) ||
+                    line.StartsWith("Connection:", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                rewritten.Append(line).Append("\r\n");
+            }
+            rewritten.Append("Connection: close\r\n");
+            rewritten.Append("\r\n");
+            var outStream = targetConn.GetStream();
+            await outStream.WriteAsync(Encoding.ASCII.GetBytes(rewritten.ToString()), ct);
+            if (clientTrailing is { Length: > 0 })
+            {
+                await outStream.WriteAsync(clientTrailing, ct);
+            }
+            if (targetServerTrailing is { Length: > 0 })
+            {
+                await clientStream.WriteAsync(targetServerTrailing, ct);
+            }
+            await RelayBidirectionalAsync(clientStream, outStream, ct);
         }
-        rewritten.Append("Connection: close\r\n");
-        rewritten.Append("\r\n");
-        var outStream = targetConn.GetStream();
-        await outStream.WriteAsync(Encoding.ASCII.GetBytes(rewritten.ToString()), ct);
-        await RelayBidirectionalAsync(clientStream, outStream, ct);
     }
 
-    private async Task<TcpClient> OpenTcpTargetAsync(string host, int port, CancellationToken ct)
+    private async Task<(TcpClient Client, byte[]? TrailingBytes)> OpenTcpTargetAsync(string host, int port, CancellationToken ct)
     {
-        var route = await ResolveRouteAsync(host, port, preferUdp: false, ct);
+        var route = await ResolveRouteAsync(host, port, preferUdp: false, preferHttp: false, ct);
         return await OpenTcpTargetWithRouteAsync(route, host, port, ct);
     }
 
-    private async Task<TcpClient> OpenTcpTargetWithRouteAsync(UpstreamTarget route, string host, int port, CancellationToken ct)
+    private async Task<(TcpClient Client, byte[]? TrailingBytes)> OpenTcpTargetWithRouteAsync(
+        UpstreamTarget route,
+        string host,
+        int port,
+        CancellationToken ct)
     {
         if (route.Kind == UpstreamKind.Direct)
         {
@@ -466,7 +619,7 @@ internal sealed class ProxyBridge : IDisposable
             try
             {
                 await client.ConnectAsync(host, port, ct);
-                return client;
+                return (client, null);
             }
             catch
             {
@@ -482,8 +635,8 @@ internal sealed class ProxyBridge : IDisposable
             {
                 await client.ConnectAsync(route.Host, route.Port, ct);
                 var s = client.GetStream();
-                await Socks5ConnectAsync(s, host, port, ct);
-                return client;
+                byte[]? trailing = await Socks5ConnectAsync(s, host, port, ct);
+                return (client, trailing);
             }
             catch
             {
@@ -502,13 +655,13 @@ internal sealed class ProxyBridge : IDisposable
             var hostHeader = host.Contains(':') ? $"[{host}]:{port}" : $"{host}:{port}";
             var req = Encoding.ASCII.GetBytes($"CONNECT {hostHeader} HTTP/1.1\r\nHost: {hostHeader}\r\nProxy-Connection: Keep-Alive\r\n\r\n");
             await s.WriteAsync(req, ct);
-            var resp = await ReadHttpResponseHeaderAsync(s, ct);
+            var (resp, trailing) = await ReadHttpResponseHeaderAsync(s, ct);
             if (!resp.StartsWith("HTTP/", StringComparison.OrdinalIgnoreCase) ||
                 (!resp.Contains(" 200 ", StringComparison.Ordinal) && !resp.Contains(" 200\r\n", StringComparison.Ordinal)))
             {
                 throw new IOException($"HTTP proxy CONNECT failed: {resp.Split('\r', '\n')[0]}");
             }
-            return httpClient;
+            return (httpClient, trailing);
         }
         catch
         {
@@ -517,7 +670,12 @@ internal sealed class ProxyBridge : IDisposable
         }
     }
 
-    private async Task<UpstreamTarget> ResolveRouteAsync(string dstHost, int dstPort, bool preferUdp, CancellationToken ct)
+    private async Task<UpstreamTarget> ResolveRouteAsync(
+        string dstHost,
+        int dstPort,
+        bool preferUdp,
+        bool preferHttp,
+        CancellationToken ct)
     {
         var state = CurrentState;
         if (!state.Enabled)
@@ -532,10 +690,14 @@ internal sealed class ProxyBridge : IDisposable
 
         if (state.DefaultTcpUpstream is null && !string.IsNullOrWhiteSpace(state.AutoConfigUrl))
         {
-            var pacTarget = ResolvePacProxy(state.AutoConfigUrl, dstHost, dstPort);
+            var pacTarget = await ResolvePacProxyAsync(state.AutoConfigUrl, dstHost, dstPort, ct);
             if (pacTarget is null)
             {
                 return new UpstreamTarget(UpstreamKind.Direct, dstHost, dstPort);
+            }
+            if (preferHttp && pacTarget.Value.Kind == UpstreamKind.Http)
+            {
+                return pacTarget.Value;
             }
             return await FinalizeUpstreamKindAsync(pacTarget.Value, ct);
         }
@@ -547,10 +709,68 @@ internal sealed class ProxyBridge : IDisposable
 
         if (state.DefaultTcpUpstream is { } tcpUp)
         {
+            if (preferHttp && tcpUp.Kind == UpstreamKind.Http)
+            {
+                return tcpUp;
+            }
             return await FinalizeUpstreamKindAsync(tcpUp, ct);
         }
 
         return new UpstreamTarget(UpstreamKind.Direct, dstHost, dstPort);
+    }
+
+    private bool? TryGetCachedSocks5Support(string host, int port) =>
+        TryGetCachedSocks5Support($"{host}:{port}", out bool supported) ? supported : null;
+
+    private bool TryGetCachedSocks5Support(string key, out bool supportsSocks5)
+    {
+        if (_probeCache.TryGetValue(key, out var cached))
+        {
+            int ttl = cached.SupportsSocks5 ? Socks5ProbeSuccessTtlSeconds : Socks5ProbeFailureTtlSeconds;
+            if ((DateTime.UtcNow - cached.CheckedUtc).TotalSeconds < ttl)
+            {
+                supportsSocks5 = cached.SupportsSocks5;
+                return true;
+            }
+        }
+        supportsSocks5 = false;
+        return false;
+    }
+
+    private async Task<bool> GetSocks5SupportAsync(string host, int port, CancellationToken ct)
+    {
+        var key = $"{host}:{port}";
+        if (TryGetCachedSocks5Support(key, out bool cached))
+        {
+            return cached;
+        }
+
+        long epoch = Volatile.Read(ref _stateEpoch);
+        var lazy = _inflightProbes.GetOrAdd(key, _ => new Lazy<Task<bool>>(
+            () => ProbeAndCacheSocks5Async(key, host, port, epoch, _cts.Token),
+            LazyThreadSafetyMode.ExecutionAndPublication));
+
+        try
+        {
+            return await lazy.Value.WaitAsync(ct);
+        }
+        finally
+        {
+            if (lazy.IsValueCreated && lazy.Value.IsCompleted)
+            {
+                _inflightProbes.TryRemove(new KeyValuePair<string, Lazy<Task<bool>>>(key, lazy));
+            }
+        }
+    }
+
+    private async Task<bool> ProbeAndCacheSocks5Async(string key, string host, int port, long epoch, CancellationToken ct)
+    {
+        bool supportsSocks5 = await ProbeSocks5SupportAsync(host, port, ct);
+        if (Volatile.Read(ref _stateEpoch) == epoch)
+        {
+            _probeCache[key] = (supportsSocks5, DateTime.UtcNow);
+        }
+        return supportsSocks5;
     }
 
     private async Task<UpstreamTarget> FinalizeUpstreamKindAsync(UpstreamTarget candidate, CancellationToken ct)
@@ -560,23 +780,21 @@ internal sealed class ProxyBridge : IDisposable
             return candidate;
         }
 
-        var key = $"{candidate.Host}:{candidate.Port}";
-        if (_probeCache.TryGetValue(key, out var cached) && (DateTime.UtcNow - cached.CheckedUtc).TotalSeconds < 30)
-        {
-            return candidate with { Kind = cached.SupportsSocks5 ? UpstreamKind.Socks5 : UpstreamKind.Http };
-        }
-
-        bool supportsSocks5 = await ProbeSocks5SupportAsync(candidate.Host, candidate.Port, ct);
-        _probeCache[key] = (supportsSocks5, DateTime.UtcNow);
+        bool supportsSocks5 = await GetSocks5SupportAsync(candidate.Host, candidate.Port, ct);
         return candidate with { Kind = supportsSocks5 ? UpstreamKind.Socks5 : UpstreamKind.Http };
     }
+
+    private static bool IsLoopbackHost(string host) =>
+        host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+        || (IPAddress.TryParse(host, out var ip) && IPAddress.IsLoopback(ip));
 
     private static async Task<bool> ProbeSocks5SupportAsync(string host, int port, CancellationToken ct)
     {
         try
         {
+            int timeoutMs = IsLoopbackHost(host) ? 150 : 500;
             using var probeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            probeCts.CancelAfter(500);
+            probeCts.CancelAfter(timeoutMs);
             using var client = new TcpClient { NoDelay = true };
             await client.ConnectAsync(host, port, probeCts.Token);
             var s = client.GetStream();
@@ -594,11 +812,12 @@ internal sealed class ProxyBridge : IDisposable
         }
     }
 
-    private static async Task Socks5ConnectAsync(NetworkStream s, string host, int port, CancellationToken ct)
+    private static async Task<byte[]?> Socks5ConnectAsync(NetworkStream s, string host, int port, CancellationToken ct)
     {
         await s.WriteAsync(new byte[] { 0x05, 0x01, 0x00 }, ct);
+        using var reader = new BufferedStreamReader(s, 512);
         var greeting = new byte[2];
-        if (!await ReadExactAsync(s, greeting, ct) || greeting[0] != 0x05 || greeting[1] != 0x00)
+        if (!await reader.ReadExactAsync(greeting, ct) || greeting[0] != 0x05 || greeting[1] != 0x00)
         {
             throw new IOException("Upstream SOCKS5 auth handshake failed.");
         }
@@ -607,11 +826,12 @@ internal sealed class ProxyBridge : IDisposable
         await s.WriteAsync(req, ct);
 
         var respHead = new byte[4];
-        if (!await ReadExactAsync(s, respHead, ct) || respHead[0] != 0x05 || respHead[1] != 0x00)
+        if (!await reader.ReadExactAsync(respHead, ct) || respHead[0] != 0x05 || respHead[1] != 0x00)
         {
             throw new IOException($"Upstream SOCKS5 CONNECT failed (rep={respHead[1]}).");
         }
-        _ = await ReadSocks5AddressAsync(s, respHead[3], ct);
+        _ = await ReadSocks5AddressAsync(reader, respHead[3], ct);
+        return reader.DetachRemaining();
     }
 
     private static byte[] BuildSocks5AddressCommand(byte cmd, string host, int port)
@@ -644,7 +864,7 @@ internal sealed class ProxyBridge : IDisposable
         buf.Add((byte)(port & 0xFF));
     }
 
-    private static async Task<(string Host, int Port)?> ReadSocks5AddressAsync(Stream s, byte atyp, CancellationToken ct)
+    private static async Task<(string Host, int Port)?> ReadSocks5AddressAsync(BufferedStreamReader reader, byte atyp, CancellationToken ct)
     {
         string host;
         switch (atyp)
@@ -652,23 +872,23 @@ internal sealed class ProxyBridge : IDisposable
             case 0x01:
             {
                 var ip4 = new byte[4];
-                if (!await ReadExactAsync(s, ip4, ct)) return null;
+                if (!await reader.ReadExactAsync(ip4, ct)) return null;
                 host = new IPAddress(ip4).ToString();
                 break;
             }
             case 0x03:
             {
-                var lenBuf = new byte[1];
-                if (!await ReadExactAsync(s, lenBuf, ct)) return null;
-                var dom = new byte[lenBuf[0]];
-                if (!await ReadExactAsync(s, dom, ct)) return null;
+                int domLen = await reader.ReadByteAsync(ct);
+                if (domLen < 0) return null;
+                var dom = new byte[domLen];
+                if (!await reader.ReadExactAsync(dom, ct)) return null;
                 host = Encoding.UTF8.GetString(dom);
                 break;
             }
             case 0x04:
             {
                 var ip6 = new byte[16];
-                if (!await ReadExactAsync(s, ip6, ct)) return null;
+                if (!await reader.ReadExactAsync(ip6, ct)) return null;
                 host = new IPAddress(ip6).ToString();
                 break;
             }
@@ -677,7 +897,7 @@ internal sealed class ProxyBridge : IDisposable
         }
 
         var portBuf = new byte[2];
-        if (!await ReadExactAsync(s, portBuf, ct)) return null;
+        if (!await reader.ReadExactAsync(portBuf, ct)) return null;
         int port = BinaryPrimitives.ReadUInt16BigEndian(portBuf);
         return (host, port);
     }
@@ -738,31 +958,71 @@ internal sealed class ProxyBridge : IDisposable
 
     private static byte[] BuildSocks5UdpDatagram(string host, int port, ReadOnlySpan<byte> payload)
     {
-        var head = new List<byte>(32 + payload.Length) { 0x00, 0x00, 0x00 };
-        AppendSocks5Address(head, host, port);
-        var result = new byte[head.Count + payload.Length];
-        head.CopyTo(result);
-        payload.CopyTo(result.AsSpan(head.Count));
-        return result;
+        if (IPAddress.TryParse(host, out var ip))
+        {
+            Span<byte> ipBytes = stackalloc byte[16];
+            ip.TryWriteBytes(ipBytes, out int ipLen);
+            byte atyp = ipLen == 4 ? (byte)0x01 : (byte)0x04;
+            int headerLen = 4 + ipLen + 2;
+            var result = new byte[headerLen + payload.Length];
+            result[3] = atyp;
+            ipBytes[..ipLen].CopyTo(result.AsSpan(4));
+            BinaryPrimitives.WriteUInt16BigEndian(result.AsSpan(4 + ipLen, 2), (ushort)port);
+            payload.CopyTo(result.AsSpan(headerLen));
+            return result;
+        }
+        else
+        {
+            int byteCount = Encoding.UTF8.GetByteCount(host);
+            int domainLen = Math.Min(byteCount, 255);
+            int headerLen = 5 + domainLen + 2;
+            var result = new byte[headerLen + payload.Length];
+            result[3] = 0x03;
+            result[4] = (byte)domainLen;
+            if (byteCount <= 255)
+            {
+                Encoding.UTF8.GetBytes(host.AsSpan(), result.AsSpan(5, domainLen));
+            }
+            else
+            {
+                var full = Encoding.UTF8.GetBytes(host);
+                full.AsSpan(0, 255).CopyTo(result.AsSpan(5, 255));
+            }
+            BinaryPrimitives.WriteUInt16BigEndian(result.AsSpan(5 + domainLen, 2), (ushort)port);
+            payload.CopyTo(result.AsSpan(headerLen));
+            return result;
+        }
     }
 
-    private static async Task<string> ReadHttpResponseHeaderAsync(Stream s, CancellationToken ct)
+    private static async Task<(string Header, byte[]? TrailingBytes)> ReadHttpResponseHeaderAsync(Stream s, CancellationToken ct)
     {
-        var list = new List<byte>(256);
-        var one = new byte[1];
-        int match = 0;
-        while (list.Count < 16384)
+        using var reader = new BufferedStreamReader(s, 4096);
+        int headerLen = -1;
+        int searchFrom = 0;
+        while (true)
         {
-            int n = await s.ReadAsync(one.AsMemory(0, 1), ct);
-            if (n <= 0) break;
-            byte b = one[0];
-            list.Add(b);
-            if ((match == 0 || match == 2) && b == '\r') match++;
-            else if ((match == 1 || match == 3) && b == '\n') match++;
-            else match = b == '\r' ? 1 : 0;
-            if (match == 4) break;
+            headerLen = reader.TryFindHeaderEnd(16384, ref searchFrom, out int checkLen);
+            if (headerLen >= 0)
+            {
+                break;
+            }
+            if (checkLen >= 16384)
+            {
+                return (reader.ReadAllAsciiString(16384), null);
+            }
+            if (!await reader.FillAsync(ct))
+            {
+                break;
+            }
         }
-        return Encoding.ASCII.GetString(list.ToArray());
+
+        if (headerLen < 0)
+        {
+            return (reader.ReadAllAsciiString(16384), null);
+        }
+
+        string header = reader.TakeHeaderAsciiString(headerLen);
+        return (header, reader.DetachRemaining());
     }
 
     private static async Task RelayBidirectionalAsync(Stream a, Stream b, CancellationToken ct)
@@ -775,7 +1035,7 @@ internal sealed class ProxyBridge : IDisposable
 
     private static async Task CopyStreamAsync(Stream src, Stream dst, CancellationTokenSource cts)
     {
-        var buffer = new byte[32768];
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(RelayBufferSize);
         try
         {
             while (!cts.IsCancellationRequested)
@@ -783,7 +1043,6 @@ internal sealed class ProxyBridge : IDisposable
                 int read = await src.ReadAsync(buffer, cts.Token);
                 if (read <= 0) break;
                 await dst.WriteAsync(buffer.AsMemory(0, read), cts.Token);
-                await dst.FlushAsync(cts.Token);
             }
         }
         catch
@@ -791,6 +1050,7 @@ internal sealed class ProxyBridge : IDisposable
         }
         finally
         {
+            ArrayPool<byte>.Shared.Return(buffer);
             try
             {
                 if (dst is NetworkStream ns)
@@ -816,18 +1076,163 @@ internal sealed class ProxyBridge : IDisposable
         return true;
     }
 
+    private sealed class BufferedStreamReader : IDisposable
+    {
+        private readonly Stream _stream;
+        private byte[]? _buffer;
+        private int _pos;
+        private int _len;
+
+        public BufferedStreamReader(Stream stream, int initialCapacity = 4096)
+        {
+            _stream = stream;
+            _buffer = ArrayPool<byte>.Shared.Rent(initialCapacity);
+        }
+
+        private ReadOnlySpan<byte> UnreadSpan =>
+            _buffer is null ? ReadOnlySpan<byte>.Empty : _buffer.AsSpan(_pos, _len - _pos);
+
+        public int TryFindHeaderEnd(int maxBytes, ref int searchFrom, out int checkedLen)
+        {
+            var span = UnreadSpan;
+            checkedLen = Math.Min(span.Length, maxBytes);
+            int idx = span[searchFrom..checkedLen].IndexOf("\r\n\r\n"u8);
+            if (idx >= 0)
+            {
+                return searchFrom + idx + 4;
+            }
+            searchFrom = Math.Max(0, checkedLen - 3);
+            return -1;
+        }
+
+        public byte[] TakeHeaderBytes(int headerLen)
+        {
+            byte[] headerBytes = UnreadSpan[..headerLen].ToArray();
+            _pos += headerLen;
+            return headerBytes;
+        }
+
+        public string TakeHeaderAsciiString(int headerLen)
+        {
+            string header = Encoding.ASCII.GetString(UnreadSpan[..headerLen]);
+            _pos += headerLen;
+            return header;
+        }
+
+        public string ReadAllAsciiString(int maxBytes)
+        {
+            var span = UnreadSpan;
+            int len = Math.Min(span.Length, maxBytes);
+            return Encoding.ASCII.GetString(span[..len]);
+        }
+
+        public async ValueTask<bool> EnsureAvailableAsync(int minBytes, CancellationToken ct)
+        {
+            while (_len - _pos < minBytes)
+            {
+                if (!await FillAsync(ct))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        public async ValueTask<bool> FillAsync(CancellationToken ct)
+        {
+            if (_buffer is null) return false;
+            if (_pos > 0 && _pos < _len)
+            {
+                Buffer.BlockCopy(_buffer, _pos, _buffer, 0, _len - _pos);
+                _len -= _pos;
+                _pos = 0;
+            }
+            else if (_pos == _len)
+            {
+                _pos = 0;
+                _len = 0;
+            }
+
+            if (_len == _buffer.Length)
+            {
+                var grown = ArrayPool<byte>.Shared.Rent(_buffer.Length * 2);
+                Buffer.BlockCopy(_buffer, 0, grown, 0, _len);
+                ArrayPool<byte>.Shared.Return(_buffer);
+                _buffer = grown;
+            }
+
+            int n = await _stream.ReadAsync(_buffer.AsMemory(_len, _buffer.Length - _len), ct);
+            if (n <= 0) return false;
+            _len += n;
+            return true;
+        }
+
+        public byte PeekByte() => _buffer![_pos];
+
+        public async ValueTask<int> ReadByteAsync(CancellationToken ct)
+        {
+            if (!await EnsureAvailableAsync(1, ct)) return -1;
+            return _buffer![_pos++];
+        }
+
+        public async ValueTask<bool> ReadExactAsync(byte[] dst, CancellationToken ct)
+        {
+            int offset = 0;
+            int count = dst.Length;
+            while (count > 0)
+            {
+                if (_len - _pos == 0)
+                {
+                    if (!await FillAsync(ct)) return false;
+                }
+                int take = Math.Min(count, _len - _pos);
+                Buffer.BlockCopy(_buffer!, _pos, dst, offset, take);
+                _pos += take;
+                offset += take;
+                count -= take;
+            }
+            return true;
+        }
+
+        public void Consume(int count)
+        {
+            _pos += count;
+        }
+
+        public byte[]? DetachRemaining()
+        {
+            int rem = _len - _pos;
+            if (rem <= 0 || _buffer is null) return null;
+            var copy = _buffer.AsSpan(_pos, rem).ToArray();
+            _pos = _len;
+            return copy;
+        }
+
+        public void Dispose()
+        {
+            var buf = _buffer;
+            _buffer = null;
+            _pos = 0;
+            _len = 0;
+            if (buf is not null)
+            {
+                ArrayPool<byte>.Shared.Return(buf);
+            }
+        }
+    }
+
     private sealed class Socks5UdpRelay : IDisposable
     {
         private readonly string _proxyHost;
         private readonly int _proxyPort;
-        private readonly Func<string, int, byte[], Task> _onResponse;
+        private readonly Func<string, int, ReadOnlyMemory<byte>, Task> _onResponse;
         private readonly CancellationToken _ct;
         private readonly SemaphoreSlim _initLock = new(1, 1);
         private TcpClient? _ctrlTcp;
         private UdpClient? _udp;
         private IPEndPoint? _relayEp;
 
-        public Socks5UdpRelay(string proxyHost, int proxyPort, Func<string, int, byte[], Task> onResponse, CancellationToken ct)
+        public Socks5UdpRelay(string proxyHost, int proxyPort, Func<string, int, ReadOnlyMemory<byte>, Task> onResponse, CancellationToken ct)
         {
             _proxyHost = proxyHost;
             _proxyPort = proxyPort;
@@ -861,20 +1266,21 @@ internal sealed class ProxyBridge : IDisposable
                 await tcp.ConnectAsync(_proxyHost, _proxyPort, ct);
                 var s = tcp.GetStream();
                 await s.WriteAsync(new byte[] { 0x05, 0x01, 0x00 }, ct);
+                using var reader = new BufferedStreamReader(s, 512);
                 var greeting = new byte[2];
-                if (!await ReadExactAsync(s, greeting, ct) || greeting[0] != 0x05 || greeting[1] != 0x00)
+                if (!await reader.ReadExactAsync(greeting, ct) || greeting[0] != 0x05 || greeting[1] != 0x00)
                 {
                     tcp.Dispose();
                     throw new IOException("Upstream SOCKS5 UDP auth failed");
                 }
                 await s.WriteAsync(new byte[] { 0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, ct);
                 var head = new byte[4];
-                if (!await ReadExactAsync(s, head, ct) || head[0] != 0x05 || head[1] != 0x00)
+                if (!await reader.ReadExactAsync(head, ct) || head[0] != 0x05 || head[1] != 0x00)
                 {
                     tcp.Dispose();
                     throw new IOException("Upstream SOCKS5 UDP ASSOCIATE failed");
                 }
-                var relayAddr = await ReadSocks5AddressAsync(s, head[3], ct);
+                var relayAddr = await ReadSocks5AddressAsync(reader, head[3], ct);
                 if (relayAddr is null)
                 {
                     tcp.Dispose();
@@ -887,7 +1293,8 @@ internal sealed class ProxyBridge : IDisposable
                     relayHost = _proxyHost;
                 }
                 var ips = await Dns.GetHostAddressesAsync(relayHost, ct);
-                var relayEp = new IPEndPoint(ips[0], relayAddr.Value.Port);
+                var relayIp = Array.Find(ips, ip => ip.AddressFamily == AddressFamily.InterNetwork) ?? ips[0];
+                var relayEp = new IPEndPoint(relayIp, relayAddr.Value.Port);
                 var udp = new UdpClient(relayEp.AddressFamily);
 
                 _ctrlTcp = tcp;
@@ -903,7 +1310,7 @@ internal sealed class ProxyBridge : IDisposable
                             var r = await udp.ReceiveAsync(_ct);
                             if (TryParseSocks5UdpDatagram(r.Buffer, out var fh, out var fp, out var data))
                             {
-                                await _onResponse(fh, fp, data.ToArray());
+                                await _onResponse(fh, fp, data);
                             }
                         }
                     }
@@ -937,11 +1344,12 @@ internal sealed class ProxyBridge : IDisposable
         UpstreamTarget? defaultTcp = null;
         UpstreamTarget? explicitSocks = null;
         string? httpEnv = null;
+        string? httpsEnv = null;
         string? allEnv = null;
 
         if (enable == 1 && !string.IsNullOrWhiteSpace(server))
         {
-            ParseProxyServer(server, out defaultTcp, out explicitSocks, out httpEnv, out allEnv);
+            ParseProxyServer(server, out defaultTcp, out explicitSocks, out httpEnv, out httpsEnv, out allEnv);
         }
 
         bool isActive = (enable == 1 && (defaultTcp is not null || explicitSocks is not null))
@@ -956,6 +1364,7 @@ internal sealed class ProxyBridge : IDisposable
             DefaultTcpUpstream: defaultTcp,
             ExplicitSocksUpstream: explicitSocks,
             HttpProxyEnv: httpEnv,
+            HttpsProxyEnv: httpsEnv,
             AllProxyEnv: allEnv,
             NoProxyEnv: noProxy);
     }
@@ -965,11 +1374,13 @@ internal sealed class ProxyBridge : IDisposable
         out UpstreamTarget? defaultTcp,
         out UpstreamTarget? explicitSocks,
         out string? httpEnv,
+        out string? httpsEnv,
         out string? allEnv)
     {
         defaultTcp = null;
         explicitSocks = null;
         httpEnv = null;
+        httpsEnv = null;
         allEnv = null;
 
         if (!raw.Contains('='))
@@ -981,11 +1392,13 @@ internal sealed class ProxyBridge : IDisposable
                 {
                     explicitSocks = ep with { Kind = UpstreamKind.Socks5 };
                     defaultTcp = explicitSocks;
-                    allEnv = $"socks5://{FormatHostPort(ep.Host, ep.Port)}";
+                    allEnv = $"socks5h://{FormatHostPort(ep.Host, ep.Port)}";
                 }
                 else
                 {
-                    httpEnv = $"http://{FormatHostPort(ep.Host, ep.Port)}";
+                    var urlScheme = scheme == "https" ? "https" : "http";
+                    httpEnv = $"{urlScheme}://{FormatHostPort(ep.Host, ep.Port)}";
+                    httpsEnv = httpEnv;
                 }
             }
             return;
@@ -999,7 +1412,7 @@ internal sealed class ProxyBridge : IDisposable
             if (idx <= 0) continue;
             var proto = part[..idx].Trim().ToLowerInvariant();
             var addr = part[(idx + 1)..].Trim();
-            if (!TryParseEndpoint(addr, proto.StartsWith("socks") ? UpstreamKind.Socks5 : UpstreamKind.Http, out var ep, out _))
+            if (!TryParseEndpoint(addr, proto.StartsWith("socks") ? UpstreamKind.Socks5 : UpstreamKind.Http, out var ep, out var scheme))
                 continue;
 
             switch (proto)
@@ -1007,15 +1420,22 @@ internal sealed class ProxyBridge : IDisposable
                 case "socks":
                 case "socks5":
                     explicitSocks = ep with { Kind = UpstreamKind.Socks5 };
-                    allEnv = $"socks5://{FormatHostPort(ep.Host, ep.Port)}";
+                    allEnv = $"socks5h://{FormatHostPort(ep.Host, ep.Port)}";
                     break;
                 case "https":
+                {
                     https = ep;
+                    var urlScheme = scheme == "https" ? "https" : "http";
+                    httpsEnv = $"{urlScheme}://{FormatHostPort(ep.Host, ep.Port)}";
                     break;
+                }
                 case "http":
+                {
                     http = ep;
-                    httpEnv = $"http://{FormatHostPort(ep.Host, ep.Port)}";
+                    var urlScheme = scheme == "https" ? "https" : "http";
+                    httpEnv = $"{urlScheme}://{FormatHostPort(ep.Host, ep.Port)}";
                     break;
+                }
             }
         }
 
@@ -1148,57 +1568,86 @@ internal sealed class ProxyBridge : IDisposable
         return p == pattern.Length;
     }
 
-    private static UpstreamTarget? ResolvePacProxy(string pacUrl, string host, int port)
+    private async Task<UpstreamTarget?> ResolvePacProxyAsync(string pacUrl, string host, int port, CancellationToken ct)
     {
-        IntPtr session = WinHttpOpen("FocusStage/1.0", 1, null, null, 0);
+        var key = $"{pacUrl}|{host}:{port}";
+        if (_pacCache.TryGetValue(key, out var cached)
+            && (DateTime.UtcNow - cached.CachedUtc).TotalSeconds < CacheTtlSeconds)
+        {
+            return cached.Target;
+        }
+
+        long epoch = Volatile.Read(ref _stateEpoch);
+        var resolved = await Task.Run(() => ResolvePacProxySync(pacUrl, host, port), ct);
+        if (Volatile.Read(ref _stateEpoch) == epoch)
+        {
+            if (_pacCache.Count >= MaxPacCacheEntries)
+            {
+                _pacCache.Clear();
+            }
+            _pacCache[key] = (resolved, DateTime.UtcNow);
+        }
+        return resolved;
+    }
+
+    private IntPtr GetOrCreateWinHttpSession()
+    {
+        lock (_winHttpLock)
+        {
+            if (_disposed) return IntPtr.Zero;
+            if (_winHttpSession == IntPtr.Zero)
+            {
+                _winHttpSession = WinHttpOpen("FocusStage/1.0", 1, null, null, 0);
+            }
+            return _winHttpSession;
+        }
+    }
+
+    private UpstreamTarget? ResolvePacProxySync(string pacUrl, string host, int port)
+    {
+        IntPtr session = GetOrCreateWinHttpSession();
         if (session == IntPtr.Zero) return null;
+
+        var opts = new WINHTTP_AUTOPROXY_OPTIONS
+        {
+            dwFlags = 0x00000002, // WINHTTP_AUTOPROXY_CONFIG_URL
+            lpszAutoConfigUrl = pacUrl,
+            fAutoLogonIfChallenged = true,
+        };
+        var url = $"https://{FormatHostPort(host, port)}/";
+        if (!WinHttpGetProxyForUrl(session, url, ref opts, out var info))
+        {
+            return null;
+        }
         try
         {
-            var opts = new WINHTTP_AUTOPROXY_OPTIONS
-            {
-                dwFlags = 0x00000002, // WINHTTP_AUTOPROXY_CONFIG_URL
-                lpszAutoConfigUrl = pacUrl,
-                fAutoLogonIfChallenged = true,
-            };
-            var url = $"https://{FormatHostPort(host, port)}/";
-            if (!WinHttpGetProxyForUrl(session, url, ref opts, out var info))
-            {
+            if (info.dwAccessType != 3 || info.lpszProxy == IntPtr.Zero) // 3 = WINHTTP_ACCESS_TYPE_NAMED_PROXY
                 return null;
-            }
-            try
+            var proxyStr = Marshal.PtrToStringUni(info.lpszProxy) ?? "";
+            foreach (var entry in proxyStr.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             {
-                if (info.dwAccessType != 3 || info.lpszProxy == IntPtr.Zero) // 3 = WINHTTP_ACCESS_TYPE_NAMED_PROXY
+                var parts = entry.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                if (parts.Length == 0 || parts[0].Equals("DIRECT", StringComparison.OrdinalIgnoreCase))
                     return null;
-                var proxyStr = Marshal.PtrToStringUni(info.lpszProxy) ?? "";
-                foreach (var entry in proxyStr.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                if (parts.Length >= 2)
                 {
-                    var parts = entry.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-                    if (parts.Length == 0 || parts[0].Equals("DIRECT", StringComparison.OrdinalIgnoreCase))
-                        return null;
-                    if (parts.Length >= 2)
-                    {
-                        var kind = parts[0].StartsWith("SOCKS", StringComparison.OrdinalIgnoreCase)
-                            ? UpstreamKind.Socks5
-                            : UpstreamKind.Http;
-                        if (TrySplitHostPort(parts[1], 8080, out var ph, out var pp))
-                            return new UpstreamTarget(kind, ph, pp);
-                    }
-                    else if (TrySplitHostPort(parts[0], 8080, out var ph, out var pp))
-                    {
-                        return new UpstreamTarget(UpstreamKind.Http, ph, pp);
-                    }
+                    var kind = parts[0].StartsWith("SOCKS", StringComparison.OrdinalIgnoreCase)
+                        ? UpstreamKind.Socks5
+                        : UpstreamKind.Http;
+                    if (TrySplitHostPort(parts[1], 8080, out var ph, out var pp))
+                        return new UpstreamTarget(kind, ph, pp);
                 }
-                return null;
+                else if (TrySplitHostPort(parts[0], 8080, out var ph, out var pp))
+                {
+                    return new UpstreamTarget(UpstreamKind.Http, ph, pp);
+                }
             }
-            finally
-            {
-                if (info.lpszProxy != IntPtr.Zero) GlobalFree(info.lpszProxy);
-                if (info.lpszProxyBypass != IntPtr.Zero) GlobalFree(info.lpszProxyBypass);
-            }
+            return null;
         }
         finally
         {
-            WinHttpCloseHandle(session);
+            if (info.lpszProxy != IntPtr.Zero) GlobalFree(info.lpszProxy);
+            if (info.lpszProxyBypass != IntPtr.Zero) GlobalFree(info.lpszProxyBypass);
         }
     }
 
@@ -1242,6 +1691,14 @@ internal sealed class ProxyBridge : IDisposable
         _disposed = true;
         _cts.Cancel();
         try { _listener.Stop(); } catch { }
+        lock (_winHttpLock)
+        {
+            if (_winHttpSession != IntPtr.Zero)
+            {
+                WinHttpCloseHandle(_winHttpSession);
+                _winHttpSession = IntPtr.Zero;
+            }
+        }
         _cts.Dispose();
     }
 }

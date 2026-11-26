@@ -80,6 +80,9 @@ pub enum SinkInputEvent {
         https_proxy: Option<String>,
         all_proxy: Option<String>,
         no_proxy: Option<String>,
+        direct_http_proxy: Option<String>,
+        direct_https_proxy: Option<String>,
+        direct_socks_proxy: Option<String>,
     },
 }
 

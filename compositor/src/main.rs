@@ -403,6 +403,9 @@ fn dispatch_sink_events(state: &mut FocusStageState) -> bool {
                 https_proxy,
                 all_proxy,
                 no_proxy,
+                direct_http_proxy,
+                direct_https_proxy,
+                direct_socks_proxy,
             } => {
                 state.apply_host_proxy(focusstage_compositor::proxy::HostProxyConfig {
                     enabled,
@@ -411,6 +414,9 @@ fn dispatch_sink_events(state: &mut FocusStageState) -> bool {
                     https_proxy,
                     all_proxy,
                     no_proxy,
+                    direct_http_proxy,
+                    direct_https_proxy,
+                    direct_socks_proxy,
                 });
             }
         }

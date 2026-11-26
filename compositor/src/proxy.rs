@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Sender};
@@ -17,6 +19,8 @@ const PROXY_ENV_KEYS: &[&str] = &[
     "no_proxy",
 ];
 
+const DIRECT_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostProxyConfig {
     pub enabled: bool,
@@ -25,10 +29,24 @@ pub struct HostProxyConfig {
     pub https_proxy: Option<String>,
     pub all_proxy: Option<String>,
     pub no_proxy: Option<String>,
+    pub direct_http_proxy: Option<String>,
+    pub direct_https_proxy: Option<String>,
+    pub direct_socks_proxy: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveProxyConfig {
+    pub enabled: bool,
+    pub bridge_port: u16,
+    pub http_proxy: Option<String>,
+    pub https_proxy: Option<String>,
+    pub all_proxy: Option<String>,
+    pub no_proxy: Option<String>,
+    pub tun_proxy_port: Option<u16>,
 }
 
 enum EnvSyncCmd {
-    Apply(HostProxyConfig),
+    Apply(EffectiveProxyConfig),
     Reset(Option<Sender<()>>),
 }
 
@@ -76,19 +94,41 @@ impl HostProxyManager {
             return;
         }
 
-        apply_process_env(&cfg);
-        let _ = self.env_tx.send(EnvSyncCmd::Apply(cfg.clone()));
+        let effective = resolve_effective_proxy(&cfg, probe_tcp_reachable);
+        if effective.enabled {
+            info!(
+                http_proxy = ?effective.http_proxy,
+                https_proxy = ?effective.https_proxy,
+                all_proxy = ?effective.all_proxy,
+                tun_proxy_port = ?effective.tun_proxy_port,
+                bridge_port = effective.bridge_port,
+                "Resolved WSL host proxy configuration"
+            );
+        } else {
+            info!("Host proxy disabled; clearing WSL proxy environment");
+        }
 
-        if cfg.enabled && cfg.bridge_port > 0 {
-            let need_restart = self
-                .tun_child
-                .as_ref()
-                .is_none_or(|(_, _, port)| *port != cfg.bridge_port);
-            if need_restart {
+        apply_process_env(&effective);
+        let _ = self.env_tx.send(EnvSyncCmd::Apply(effective.clone()));
+
+        let tun_disabled = tun_disabled_by_env();
+        if effective.enabled && !tun_disabled {
+            if let Some(tun_port) = effective.tun_proxy_port {
+                let need_restart = self
+                    .tun_child
+                    .as_ref()
+                    .is_none_or(|(_, _, port)| *port != tun_port);
+                if need_restart {
+                    self.stop_tun();
+                    self.start_tun(tun_port);
+                }
+            } else {
                 self.stop_tun();
-                self.start_tun(cfg.bridge_port);
             }
         } else {
+            if effective.enabled && tun_disabled {
+                info!("focusstage-tun disabled via FOCUSSTAGE_DISABLE_TUN (env/gsettings sync still active)");
+            }
             self.stop_tun();
         }
 
@@ -107,13 +147,13 @@ impl HostProxyManager {
         }
     }
 
-    fn start_tun(&mut self, bridge_port: u16) {
+    fn start_tun(&mut self, proxy_port: u16) {
         let Some(tun_bin) = resolve_tun_helper_path() else {
             warn!("focusstage-tun helper not found; WSL transparent TUN proxy disabled (env/gsettings sync still active)");
             return;
         };
 
-        let proxy_arg = format!("socks5://127.0.0.1:{bridge_port}");
+        let proxy_arg = format!("socks5://127.0.0.1:{proxy_port}");
         let mut cmd = Command::new(&tun_bin);
         cmd.arg("--proxy")
             .arg(&proxy_arg)
@@ -141,8 +181,8 @@ impl HostProxyManager {
                             }
                         });
                 }
-                info!(bridge_port, bin = %tun_bin.display(), "Started WSL transparent TUN proxy");
-                self.tun_child = Some((child, stdin, bridge_port));
+                info!(proxy_port, bin = %tun_bin.display(), "Started WSL transparent TUN proxy");
+                self.tun_child = Some((child, stdin, proxy_port));
             }
             Err(err) => {
                 warn!(bin = %tun_bin.display(), "Failed to start focusstage-tun: {err}");
@@ -175,13 +215,141 @@ impl HostProxyManager {
             let _ = child.kill();
             let _ = child.wait();
         }
-        info!(bridge_port = port, "Stopped WSL transparent TUN proxy");
+        info!(proxy_port = port, "Stopped WSL transparent TUN proxy");
     }
 }
 
 impl Drop for HostProxyManager {
     fn drop(&mut self) {
         self.clear();
+    }
+}
+
+pub fn tun_disabled_by_env() -> bool {
+    std::env::var("FOCUSSTAGE_DISABLE_TUN")
+        .ok()
+        .is_some_and(|v| tun_disabled_by_env_value(&v))
+}
+
+pub fn tun_disabled_by_env_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+pub fn parse_proxy_endpoint(url: &str) -> Option<(String, u16, Option<SocketAddr>)> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let after_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, hp)| hp)
+        .unwrap_or(authority);
+    if host_port.is_empty() {
+        return None;
+    }
+
+    let (host, port_str) = if let Some(rest) = host_port.strip_prefix('[') {
+        let (h, after_bracket) = rest.split_once(']')?;
+        let p = after_bracket.strip_prefix(':')?;
+        (h, p)
+    } else {
+        let (h, p) = host_port.rsplit_once(':')?;
+        if h.contains(':') {
+            return None;
+        }
+        (h, p)
+    };
+
+    if host.is_empty() {
+        return None;
+    }
+    let port: u16 = port_str.parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+
+    let probe_addr = if host.eq_ignore_ascii_case("localhost") {
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+    } else if let Ok(ip) = host.parse::<IpAddr>() {
+        Some(SocketAddr::new(ip, port))
+    } else {
+        None
+    };
+
+    Some((host.to_string(), port, probe_addr))
+}
+
+pub fn probe_tcp_reachable(addr: SocketAddr) -> bool {
+    TcpStream::connect_timeout(&addr, DIRECT_PROBE_TIMEOUT).is_ok()
+}
+
+pub fn resolve_effective_proxy<F>(cfg: &HostProxyConfig, mut tcp_probe: F) -> EffectiveProxyConfig
+where
+    F: FnMut(SocketAddr) -> bool,
+{
+    if !cfg.enabled {
+        return EffectiveProxyConfig {
+            enabled: false,
+            bridge_port: cfg.bridge_port,
+            http_proxy: None,
+            https_proxy: None,
+            all_proxy: None,
+            no_proxy: cfg.no_proxy.clone(),
+            tun_proxy_port: None,
+        };
+    }
+
+    let mut probe_cache: HashMap<SocketAddr, bool> = HashMap::new();
+    let mut probe_url = |candidate: Option<&String>| -> Option<(String, u16, Option<SocketAddr>)> {
+        let url = candidate.map(String::as_str)?;
+        let parsed = parse_proxy_endpoint(url)?;
+        let addr = parsed.2?;
+        let ok = *probe_cache.entry(addr).or_insert_with(|| tcp_probe(addr));
+        ok.then_some(parsed)
+    };
+
+    let http_proxy = if probe_url(cfg.direct_http_proxy.as_ref()).is_some() {
+        cfg.direct_http_proxy.clone()
+    } else {
+        cfg.http_proxy.clone()
+    };
+
+    let https_proxy = if probe_url(cfg.direct_https_proxy.as_ref()).is_some() {
+        cfg.direct_https_proxy.clone()
+    } else {
+        cfg.https_proxy.clone()
+    };
+
+    let direct_socks_parsed = probe_url(cfg.direct_socks_proxy.as_ref());
+    let all_proxy = if direct_socks_parsed.is_some() {
+        cfg.direct_socks_proxy.clone()
+    } else {
+        cfg.all_proxy.clone()
+    };
+
+    let tun_proxy_port = match direct_socks_parsed {
+        Some((_, port, Some(SocketAddr::V4(v4)))) if v4.ip().is_loopback() && port > 0 => {
+            Some(port)
+        }
+        _ => (cfg.bridge_port > 0).then_some(cfg.bridge_port),
+    };
+
+    EffectiveProxyConfig {
+        enabled: true,
+        bridge_port: cfg.bridge_port,
+        http_proxy,
+        https_proxy,
+        all_proxy,
+        no_proxy: cfg.no_proxy.clone(),
+        tun_proxy_port,
     }
 }
 
@@ -206,7 +374,7 @@ fn resolve_tun_helper_path() -> Option<PathBuf> {
     None
 }
 
-fn apply_process_env(cfg: &HostProxyConfig) {
+fn apply_process_env(cfg: &EffectiveProxyConfig) {
     if !cfg.enabled {
         clear_process_env();
         return;
@@ -235,15 +403,13 @@ fn set_or_remove(key: &str, val: Option<&str>) {
     }
 }
 
-fn sync_external_proxy_settings(cfg: &HostProxyConfig) {
+fn sync_external_proxy_settings(cfg: &EffectiveProxyConfig) {
     if !cfg.enabled {
         reset_external_proxy_settings();
         return;
     }
 
-    if cfg.bridge_port > 0 {
-        sync_gsettings_manual(cfg.bridge_port, cfg.no_proxy.as_deref());
-    }
+    sync_gsettings_manual(cfg);
 
     let mut pairs = Vec::new();
     for (key, val) in [
@@ -296,22 +462,45 @@ fn reset_external_proxy_settings() {
     run_gsettings(&["set", "org.gnome.system.proxy", "mode", "none"]);
 }
 
-fn sync_gsettings_manual(port: u16, no_proxy: Option<&str>) {
-    let port_str = port.to_string();
+fn gsettings_host_port(proxy_url: Option<&str>, fallback_port: u16) -> Option<(String, String)> {
+    if let Some((host, port, _)) = proxy_url.and_then(parse_proxy_endpoint) {
+        return Some((host, port.to_string()));
+    }
+    if fallback_port > 0 {
+        return Some(("127.0.0.1".to_string(), fallback_port.to_string()));
+    }
+    None
+}
+
+fn sync_gsettings_manual(cfg: &EffectiveProxyConfig) {
+    let http_hp = gsettings_host_port(cfg.http_proxy.as_deref(), cfg.bridge_port);
+    let https_hp = gsettings_host_port(cfg.https_proxy.as_deref(), cfg.bridge_port);
+    let socks_hp = gsettings_host_port(cfg.all_proxy.as_deref(), cfg.bridge_port);
+
+    if http_hp.is_none() && https_hp.is_none() && socks_hp.is_none() {
+        return;
+    }
+
     run_gsettings(&["set", "org.gnome.system.proxy", "use-same-proxy", "false"]);
-    run_gsettings(&["set", "org.gnome.system.proxy.http", "host", "127.0.0.1"]);
-    run_gsettings(&["set", "org.gnome.system.proxy.http", "port", &port_str]);
-    run_gsettings(&["set", "org.gnome.system.proxy.https", "host", "127.0.0.1"]);
-    run_gsettings(&["set", "org.gnome.system.proxy.https", "port", &port_str]);
-    run_gsettings(&["set", "org.gnome.system.proxy.socks", "host", "127.0.0.1"]);
-    run_gsettings(&["set", "org.gnome.system.proxy.socks", "port", &port_str]);
+    if let Some((host, port)) = http_hp {
+        run_gsettings(&["set", "org.gnome.system.proxy.http", "host", &host]);
+        run_gsettings(&["set", "org.gnome.system.proxy.http", "port", &port]);
+    }
+    if let Some((host, port)) = https_hp {
+        run_gsettings(&["set", "org.gnome.system.proxy.https", "host", &host]);
+        run_gsettings(&["set", "org.gnome.system.proxy.https", "port", &port]);
+    }
+    if let Some((host, port)) = socks_hp {
+        run_gsettings(&["set", "org.gnome.system.proxy.socks", "host", &host]);
+        run_gsettings(&["set", "org.gnome.system.proxy.socks", "port", &port]);
+    }
 
     let mut hosts = vec![
         "'localhost'".to_string(),
         "'127.0.0.0/8'".to_string(),
         "'::1'".to_string(),
     ];
-    if let Some(np) = no_proxy {
+    if let Some(np) = cfg.no_proxy.as_deref() {
         for raw in np.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let clean = raw.replace('\'', "");
             if clean.is_empty() {
@@ -335,4 +524,147 @@ fn run_gsettings(args: &[&str]) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_cfg() -> HostProxyConfig {
+        HostProxyConfig {
+            enabled: true,
+            bridge_port: 32142,
+            http_proxy: Some("http://127.0.0.1:32142".to_string()),
+            https_proxy: Some("http://127.0.0.1:32142".to_string()),
+            all_proxy: Some("socks5h://127.0.0.1:32142".to_string()),
+            no_proxy: Some("localhost,127.0.0.1,::1".to_string()),
+            direct_http_proxy: Some("http://127.0.0.1:7897".to_string()),
+            direct_https_proxy: Some("http://127.0.0.1:7897".to_string()),
+            direct_socks_proxy: Some("socks5h://127.0.0.1:7897".to_string()),
+        }
+    }
+
+    #[test]
+    fn parse_proxy_endpoint_handles_ipv4_localhost_ipv6_and_domains() {
+        assert_eq!(
+            parse_proxy_endpoint("http://127.0.0.1:7897"),
+            Some((
+                "127.0.0.1".to_string(),
+                7897,
+                Some("127.0.0.1:7897".parse().unwrap())
+            ))
+        );
+        assert_eq!(
+            parse_proxy_endpoint("socks5h://localhost:1080/"),
+            Some((
+                "localhost".to_string(),
+                1080,
+                Some("127.0.0.1:1080".parse().unwrap())
+            ))
+        );
+        assert_eq!(
+            parse_proxy_endpoint("socks5h://[::1]:7897"),
+            Some(("::1".to_string(), 7897, Some("[::1]:7897".parse().unwrap())))
+        );
+        assert_eq!(
+            parse_proxy_endpoint("http://proxy.internal:8080"),
+            Some(("proxy.internal".to_string(), 8080, None))
+        );
+        assert_eq!(parse_proxy_endpoint("http://127.0.0.1:0"), None);
+    }
+
+    #[test]
+    fn resolve_effective_proxy_uses_direct_when_reachable() {
+        let mut probe_calls = 0usize;
+        let effective = resolve_effective_proxy(&sample_cfg(), |addr| {
+            probe_calls += 1;
+            addr == "127.0.0.1:7897".parse().unwrap()
+        });
+        assert_eq!(probe_calls, 1);
+        assert_eq!(
+            effective.http_proxy.as_deref(),
+            Some("http://127.0.0.1:7897")
+        );
+        assert_eq!(
+            effective.https_proxy.as_deref(),
+            Some("http://127.0.0.1:7897")
+        );
+        assert_eq!(
+            effective.all_proxy.as_deref(),
+            Some("socks5h://127.0.0.1:7897")
+        );
+        assert_eq!(effective.tun_proxy_port, Some(7897));
+    }
+
+    #[test]
+    fn resolve_effective_proxy_falls_back_to_bridge_when_unreachable_or_pac() {
+        let nat_mode = resolve_effective_proxy(&sample_cfg(), |_| false);
+        assert_eq!(
+            nat_mode.http_proxy.as_deref(),
+            Some("http://127.0.0.1:32142")
+        );
+        assert_eq!(
+            nat_mode.https_proxy.as_deref(),
+            Some("http://127.0.0.1:32142")
+        );
+        assert_eq!(
+            nat_mode.all_proxy.as_deref(),
+            Some("socks5h://127.0.0.1:32142")
+        );
+        assert_eq!(nat_mode.tun_proxy_port, Some(32142));
+
+        let mut pac_cfg = sample_cfg();
+        pac_cfg.direct_http_proxy = None;
+        pac_cfg.direct_https_proxy = None;
+        pac_cfg.direct_socks_proxy = None;
+        let pac_mode = resolve_effective_proxy(&pac_cfg, |_| true);
+        assert_eq!(
+            pac_mode.http_proxy.as_deref(),
+            Some("http://127.0.0.1:32142")
+        );
+        assert_eq!(
+            pac_mode.all_proxy.as_deref(),
+            Some("socks5h://127.0.0.1:32142")
+        );
+        assert_eq!(pac_mode.tun_proxy_port, Some(32142));
+    }
+
+    #[test]
+    fn resolve_effective_proxy_handles_http_only_and_non_loopback_socks() {
+        let mut http_only = sample_cfg();
+        http_only.direct_socks_proxy = None;
+        let resolved = resolve_effective_proxy(&http_only, |_| true);
+        assert_eq!(
+            resolved.http_proxy.as_deref(),
+            Some("http://127.0.0.1:7897")
+        );
+        assert_eq!(
+            resolved.https_proxy.as_deref(),
+            Some("http://127.0.0.1:7897")
+        );
+        assert_eq!(
+            resolved.all_proxy.as_deref(),
+            Some("socks5h://127.0.0.1:32142")
+        );
+        assert_eq!(resolved.tun_proxy_port, Some(32142));
+
+        let mut lan_socks = sample_cfg();
+        lan_socks.direct_socks_proxy = Some("socks5h://192.168.1.50:1080".to_string());
+        let resolved_lan = resolve_effective_proxy(&lan_socks, |_| true);
+        assert_eq!(
+            resolved_lan.all_proxy.as_deref(),
+            Some("socks5h://192.168.1.50:1080")
+        );
+        assert_eq!(resolved_lan.tun_proxy_port, Some(32142));
+    }
+
+    #[test]
+    fn tun_disabled_env_values_are_parsed_correctly() {
+        assert!(tun_disabled_by_env_value("1"));
+        assert!(tun_disabled_by_env_value("true"));
+        assert!(tun_disabled_by_env_value(" YES "));
+        assert!(!tun_disabled_by_env_value("0"));
+        assert!(!tun_disabled_by_env_value("false"));
+        assert!(!tun_disabled_by_env_value(""));
+    }
 }
