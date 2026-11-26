@@ -214,8 +214,22 @@
 
     btnLinuxReload: $('btn-linux-reload'),
     btnLinuxSync: $('btn-linux-sync'),
+    btnLinuxThemeReset: $('btn-linux-theme-reset'),
+    linuxColorSchemeGroup: $('linux-color-scheme-group'),
+    btnLinuxSyncWinTheme: $('btn-linux-sync-win-theme'),
+    linuxAccentRow: $('linux-accent-row'),
+    linuxAccentSwatches: $('linux-accent-swatches'),
+    selectGtkTheme: $('select-gtk-theme'),
+    selectIconTheme: $('select-icon-theme'),
+    selectCursorTheme: $('select-cursor-theme'),
+    selectLinuxFontFamily: $('select-linux-font-family'),
+    selectLinuxFontSize: $('select-linux-font-size'),
+    rangeLinuxTextScale: $('range-linux-text-scale'),
+    outputLinuxTextScale: $('output-linux-text-scale'),
+    linuxThemeNotice: $('linux-theme-notice'),
     selectBrowser: $('select-browser'),
     selectTerminal: $('select-terminal'),
+    toggleLinuxHideWsl: $('toggle-linux-hide-wsl'),
     windowsHostHint: $('windows-host-hint'),
     healthXdg: $('health-xdg'),
     healthPortal: $('health-portal'),
@@ -2162,6 +2176,48 @@
   }
 
   // ---------------- Linux Settings ----------------
+  const LINUX_ACCENT_META = {
+    blue: { label: '蓝色', color: '#3584e4' },
+    teal: { label: '青绿', color: '#2190a4' },
+    green: { label: '绿色', color: '#3a944a' },
+    yellow: { label: '黄色', color: '#c88800' },
+    orange: { label: '橙色', color: '#ed5b00' },
+    red: { label: '红色', color: '#e62d42' },
+    pink: { label: '粉色', color: '#d56199' },
+    purple: { label: '紫色', color: '#9141ac' },
+    slate: { label: '岩灰', color: '#6f8396' },
+    brown: { label: '棕色', color: '#986a44' }
+  };
+
+  function parseLinuxFontName(fontName) {
+    const text = String(fontName || '').trim();
+    if (!text) return { family: 'Sans', size: 11 };
+    const match = text.match(/^(.*?)\s+(\d+(?:\.\d+)?)$/);
+    if (!match) return { family: text, size: 11 };
+    const family = match[1].trim() || 'Sans';
+    const parsedSize = Math.round(Number(match[2]));
+    const size = Number.isFinite(parsedSize) && parsedSize >= 8 && parsedSize <= 24 ? parsedSize : 11;
+    return { family, size };
+  }
+
+  function setLinuxThemeControlsDisabled(disabled) {
+    els.btnLinuxThemeReset.disabled = disabled;
+    els.btnLinuxSyncWinTheme.disabled = disabled;
+    els.linuxColorSchemeGroup.querySelectorAll('button').forEach((btn) => {
+      btn.disabled = disabled;
+    });
+    els.linuxAccentSwatches.querySelectorAll('button').forEach((btn) => {
+      btn.disabled = disabled;
+    });
+    els.selectGtkTheme.disabled = disabled;
+    els.selectIconTheme.disabled = disabled;
+    els.selectCursorTheme.disabled = disabled;
+    els.selectLinuxFontFamily.disabled = disabled;
+    els.selectLinuxFontSize.disabled = disabled;
+    els.rangeLinuxTextScale.disabled = disabled;
+    els.toggleLinuxHideWsl.disabled = disabled;
+  }
+
   async function loadLinuxSettings(method = 'linuxSettings.get', params = {}, successToast = null) {
     if (state.linuxSettingsBusy) return;
     state.linuxSettingsBusy = true;
@@ -2169,6 +2225,7 @@
     els.selectTerminal.disabled = true;
     els.btnLinuxSync.disabled = true;
     els.btnLinuxReload.disabled = true;
+    setLinuxThemeControlsDisabled(true);
     try {
       const data = await bridge.invoke(method, params);
       state.linuxSettings = data;
@@ -2187,14 +2244,105 @@
       state.linuxSettingsBusy = false;
       els.btnLinuxSync.disabled = false;
       els.btnLinuxReload.disabled = false;
+      if (state.linuxSettings) {
+        renderLinuxSettings(state.linuxSettings);
+      }
     }
   }
 
+  function renderLinuxThemeSettings(data) {
+    const theme = data.theme;
+    if (!theme) {
+      setLinuxThemeControlsDisabled(true);
+      return;
+    }
+
+    els.btnLinuxThemeReset.disabled = false;
+    els.btnLinuxSyncWinTheme.disabled = false;
+    const winDark = data.windowsColorScheme === 'prefer-dark';
+    els.btnLinuxSyncWinTheme.textContent = winDark ? '同步 Windows (深色)' : '同步 Windows (浅色)';
+
+    els.linuxColorSchemeGroup.querySelectorAll('.segmented-btn').forEach((btn) => {
+      const active = btn.dataset.scheme === theme.colorScheme;
+      btn.classList.toggle('is-active', active);
+      btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+      btn.disabled = false;
+    });
+
+    const accentColors = Array.isArray(theme.accentColors) ? theme.accentColors : [];
+    els.linuxAccentRow.classList.toggle('is-hidden', accentColors.length === 0);
+    els.linuxAccentSwatches.innerHTML = '';
+    for (const colorId of accentColors) {
+      const meta = LINUX_ACCENT_META[colorId] || { label: colorId, color: '#6b7280' };
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'accent-swatch';
+      btn.dataset.accent = colorId;
+      btn.style.background = meta.color;
+      btn.title = meta.label;
+      btn.setAttribute('aria-label', `强调色：${meta.label}`);
+      const active = theme.accentColor === colorId;
+      btn.classList.toggle('is-active', active);
+      btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+      btn.addEventListener('click', () => {
+        if (!state.linuxSettingsBusy && theme.accentColor !== colorId) {
+          loadLinuxSettings('linuxSettings.setAccentColor', { value: colorId }, `已切换系统强调色为${meta.label}`);
+        }
+      });
+      els.linuxAccentSwatches.appendChild(btn);
+    }
+
+    populateSelect(els.selectGtkTheme, theme.gtkThemes || [], theme.gtkTheme);
+    populateSelect(els.selectIconTheme, theme.iconThemes || [], theme.iconTheme);
+    populateSelect(els.selectCursorTheme, theme.cursorThemes || [], theme.cursorTheme);
+    els.selectGtkTheme.disabled = (theme.gtkThemes || []).length === 0;
+    els.selectIconTheme.disabled = (theme.iconThemes || []).length === 0;
+    els.selectCursorTheme.disabled = (theme.cursorThemes || []).length === 0;
+
+    const parsedFont = parseLinuxFontName(theme.fontName);
+    const fontFamilies = Array.isArray(theme.fonts) ? [...theme.fonts] : [];
+    if (parsedFont.family && !fontFamilies.includes(parsedFont.family)) {
+      fontFamilies.unshift(parsedFont.family);
+    }
+    populateSelect(
+      els.selectLinuxFontFamily,
+      fontFamilies.map((f) => ({ id: f, name: f })),
+      parsedFont.family
+    );
+    els.selectLinuxFontFamily.disabled = fontFamilies.length === 0;
+
+    const sizes = [];
+    for (let s = 8; s <= 24; s += 1) {
+      sizes.push({ id: String(s), name: `${s} pt` });
+    }
+    populateSelect(els.selectLinuxFontSize, sizes, String(parsedFont.size));
+    els.selectLinuxFontSize.disabled = false;
+
+    const scale = Number(theme.textScalingFactor) || 1.0;
+    const clampedScale = Math.min(2.0, Math.max(0.75, scale));
+    els.rangeLinuxTextScale.value = clampedScale.toFixed(2);
+    els.rangeLinuxTextScale.disabled = !theme.gsettingsAvailable;
+    els.outputLinuxTextScale.textContent = `${Math.round(clampedScale * 100)}%`;
+
+    const notices = [];
+    if (!theme.gsettingsAvailable) {
+      notices.push('未检测到可用的 gsettings / GNOME 接口配置，部分主题项仅写入 GTK settings.ini。');
+    } else if (!data.portalActive) {
+      notices.push('xdg-desktop-portal 未运行，部分运行中的 Chromium / libadwaita 应用可能需要重启后生效。');
+    }
+    els.linuxThemeNotice.textContent = notices.join(' ');
+    els.linuxThemeNotice.classList.toggle('is-hidden', notices.length === 0);
+  }
+
   function renderLinuxSettings(data) {
+    renderLinuxThemeSettings(data);
+
     populateSelect(els.selectBrowser, data.browsers || [], data.browser);
     populateSelect(els.selectTerminal, data.terminals || [], data.terminal);
     els.selectBrowser.disabled = (data.browsers || []).length === 0;
     els.selectTerminal.disabled = (data.terminals || []).length === 0;
+    els.toggleLinuxHideWsl.checked = Boolean(data.hideWsl);
+    els.toggleLinuxHideWsl.disabled = false;
     els.windowsHostHint.classList.toggle('is-hidden', data.browser !== 'windows-host');
 
     els.healthXdg.textContent = data.xdgOpenInstalled ? '已安装' : '缺少 xdg-open';
@@ -2233,6 +2381,53 @@
     }
   }
 
+  els.linuxColorSchemeGroup.querySelectorAll('.segmented-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const scheme = btn.dataset.scheme;
+      const current = state.linuxSettings?.theme?.colorScheme;
+      if (scheme && scheme !== current) {
+        const label = scheme === 'prefer-dark' ? '深色模式' : scheme === 'prefer-light' ? '浅色模式' : '系统默认';
+        loadLinuxSettings('linuxSettings.setColorScheme', { value: scheme }, `已切换 Linux 颜色模式为${label}`);
+      }
+    });
+  });
+  els.btnLinuxSyncWinTheme.addEventListener('click', () => {
+    loadLinuxSettings('linuxSettings.syncWindowsColorScheme', {}, '已将 Linux 深浅色同步为当前 Windows 外观');
+  });
+  els.selectGtkTheme.addEventListener('change', () => {
+    const id = els.selectGtkTheme.value;
+    if (id) loadLinuxSettings('linuxSettings.setGtkTheme', { id }, `已设置 GTK 主题为 ${id}`);
+  });
+  els.selectIconTheme.addEventListener('change', () => {
+    const id = els.selectIconTheme.value;
+    if (id) loadLinuxSettings('linuxSettings.setIconTheme', { id }, `已设置图标主题为 ${id}`);
+  });
+  els.selectCursorTheme.addEventListener('change', () => {
+    const id = els.selectCursorTheme.value;
+    if (id) loadLinuxSettings('linuxSettings.setCursorTheme', { id }, `已设置光标主题为 ${id}`);
+  });
+  function commitLinuxFontChange() {
+    const family = els.selectLinuxFontFamily.value;
+    const size = els.selectLinuxFontSize.value || '11';
+    if (family) {
+      const value = `${family} ${size}`;
+      loadLinuxSettings('linuxSettings.setFontName', { value }, `已设置 Linux 系统字体为 ${value}`);
+    }
+  }
+  els.selectLinuxFontFamily.addEventListener('change', commitLinuxFontChange);
+  els.selectLinuxFontSize.addEventListener('change', commitLinuxFontChange);
+  els.rangeLinuxTextScale.addEventListener('input', () => {
+    const val = Number(els.rangeLinuxTextScale.value) || 1.0;
+    els.outputLinuxTextScale.textContent = `${Math.round(val * 100)}%`;
+  });
+  els.rangeLinuxTextScale.addEventListener('change', () => {
+    const value = Number(els.rangeLinuxTextScale.value || 1.0).toFixed(2);
+    loadLinuxSettings('linuxSettings.setTextScale', { value }, `已设置文字缩放比例为 ${Math.round(Number(value) * 100)}%`);
+  });
+  els.btnLinuxThemeReset.addEventListener('click', () => {
+    loadLinuxSettings('linuxSettings.resetTheme', {}, '已恢复 Linux 默认系统主题');
+  });
+
   els.selectBrowser.addEventListener('change', () => {
     const id = els.selectBrowser.value;
     if (id) loadLinuxSettings('linuxSettings.setBrowser', { id }, '已设置默认浏览器');
@@ -2240,6 +2435,14 @@
   els.selectTerminal.addEventListener('change', () => {
     const id = els.selectTerminal.value;
     if (id) loadLinuxSettings('linuxSettings.setTerminal', { id }, '已设置默认终端');
+  });
+  els.toggleLinuxHideWsl.addEventListener('change', () => {
+    const enabled = els.toggleLinuxHideWsl.checked;
+    loadLinuxSettings(
+      'linuxSettings.setHideWsl',
+      { enabled },
+      enabled ? '已开启 WSL 标识过滤（重启目标应用后生效）' : '已关闭 WSL 标识过滤（重启目标应用后生效）'
+    );
   });
   els.btnLinuxSync.addEventListener('click', () => loadLinuxSettings('linuxSettings.syncHandlers', {}, '已同步协议关联'));
   els.btnLinuxReload.addEventListener('click', () => loadLinuxSettings('linuxSettings.get', {}, '已刷新 Linux 设置'));

@@ -35,6 +35,7 @@ internal sealed class LauncherForm : Form
     private bool _webViewReady;
     private bool _appsLoaded;
     private bool _loadingApps;
+    private int _iconCacheVersion;
     private string _lastAppsSignature = "";
     private string _lastStateSignature = "";
 
@@ -729,6 +730,48 @@ internal sealed class LauncherForm : Form
             case "linuxSettings.syncHandlers":
                 return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("sync-handlers"));
 
+            case "linuxSettings.setColorScheme":
+                return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("set-color-scheme", Str("value")));
+
+            case "linuxSettings.syncWindowsColorScheme":
+                return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("set-color-scheme", GetWindowsColorScheme()));
+
+            case "linuxSettings.setAccentColor":
+                return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("set-accent-color", Str("value")));
+
+            case "linuxSettings.setGtkTheme":
+                return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("set-gtk-theme", Str("id")));
+
+            case "linuxSettings.setIconTheme":
+            {
+                var updated = await _ctx.LinuxSettingsAsync("set-icon-theme", Str("id"));
+                _assetServer.ClearIconCache();
+                _iconCacheVersion++;
+                await RefreshAppsAsync(forceRender: true);
+                return BuildLinuxSettingsPayload(updated);
+            }
+
+            case "linuxSettings.setCursorTheme":
+                return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("set-cursor-theme", Str("id")));
+
+            case "linuxSettings.setFontName":
+                return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("set-font-name", Str("value")));
+
+            case "linuxSettings.setTextScale":
+                return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("set-text-scale", Str("value")));
+
+            case "linuxSettings.resetTheme":
+            {
+                var updated = await _ctx.LinuxSettingsAsync("reset-theme");
+                _assetServer.ClearIconCache();
+                _iconCacheVersion++;
+                await RefreshAppsAsync(forceRender: true);
+                return BuildLinuxSettingsPayload(updated);
+            }
+
+            case "linuxSettings.setHideWsl":
+                return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("set-hide-wsl", Bool("enabled") ? "true" : "false"));
+
             case "accounts.get":
                 return await AccountService.GetViewAsync(_distro);
 
@@ -936,7 +979,7 @@ internal sealed class LauncherForm : Form
         if (!_webViewReady) return;
         PushEvent("apps", new
         {
-            apps = BuildAppPayloads(_apps),
+            apps = BuildAppPayloads(_apps, _iconCacheVersion),
             appsLoaded = _appsLoaded,
             layout = BuildLayoutPayload(_layout),
             reason
@@ -952,7 +995,7 @@ internal sealed class LauncherForm : Form
         return head + "|" + body;
     }
 
-    private static object[] BuildAppPayloads(List<LinuxAppDto> apps) =>
+    private static object[] BuildAppPayloads(List<LinuxAppDto> apps, int iconCacheVersion = 0) =>
         apps.Select(a => (object)new
         {
             id = a.Id,
@@ -967,7 +1010,9 @@ internal sealed class LauncherForm : Form
             args = a.Args,
             wmClass = a.WmClass,
             categories = a.Categories,
-            iconUrl = $"/icons/{Uri.EscapeDataString(a.Id)}"
+            iconUrl = iconCacheVersion > 0
+                ? $"/icons/{Uri.EscapeDataString(a.Id)}?v={iconCacheVersion}"
+                : $"/icons/{Uri.EscapeDataString(a.Id)}"
         }).ToArray();
 
     private static object BuildFolderPayload(LauncherFolder f) => new
@@ -1018,17 +1063,59 @@ internal sealed class LauncherForm : Form
             runAsRoot = s.RunAsRoot
         }).ToArray();
 
-    private static object BuildLinuxSettingsPayload(LinuxDesktopSettings s) => new
+    private static string GetWindowsColorScheme()
     {
-        browser = s.Browser,
-        browsers = s.Browsers.Select(b => new { id = b.Id, name = b.Name }).ToArray(),
-        terminal = s.Terminal,
-        terminals = s.Terminals.Select(t => new { id = t.Id, name = t.Name }).ToArray(),
-        protocols = s.Protocols,
-        xdgOpenInstalled = s.XdgOpenInstalled,
-        portalActive = s.PortalActive,
-        mimeappsSynced = s.MimeappsSynced
-    };
+        try
+        {
+            var value = Microsoft.Win32.Registry.GetValue(
+                @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                "AppsUseLightTheme",
+                1);
+            if (value is int intVal)
+            {
+                return intVal == 0 ? "prefer-dark" : "prefer-light";
+            }
+        }
+        catch
+        {
+            // Fall back to light mode if registry read is unavailable.
+        }
+        return "prefer-light";
+    }
+
+    private static object BuildLinuxSettingsPayload(LinuxDesktopSettings s)
+    {
+        var t = s.Theme;
+        return new
+        {
+            browser = s.Browser,
+            browsers = s.Browsers.Select(b => new { id = b.Id, name = b.Name }).ToArray(),
+            terminal = s.Terminal,
+            terminals = s.Terminals.Select(x => new { id = x.Id, name = x.Name }).ToArray(),
+            protocols = s.Protocols,
+            xdgOpenInstalled = s.XdgOpenInstalled,
+            portalActive = s.PortalActive,
+            mimeappsSynced = s.MimeappsSynced,
+            hideWsl = s.HideWsl,
+            windowsColorScheme = GetWindowsColorScheme(),
+            theme = t is null ? null : new
+            {
+                colorScheme = t.ColorScheme,
+                accentColor = t.AccentColor,
+                accentColors = t.AccentColors,
+                gtkTheme = t.GtkTheme,
+                gtkThemes = t.GtkThemes.Select(x => new { id = x.Id, name = x.Name }).ToArray(),
+                iconTheme = t.IconTheme,
+                iconThemes = t.IconThemes.Select(x => new { id = x.Id, name = x.Name }).ToArray(),
+                cursorTheme = t.CursorTheme,
+                cursorThemes = t.CursorThemes.Select(x => new { id = x.Id, name = x.Name }).ToArray(),
+                fontName = t.FontName,
+                fonts = t.Fonts,
+                textScalingFactor = t.TextScalingFactor,
+                gsettingsAvailable = t.GsettingsAvailable
+            }
+        };
+    }
 
     private void SendRpcSuccess(string id, object? result)
     {

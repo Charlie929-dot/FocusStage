@@ -219,6 +219,15 @@ enum SettingsCommand {
     SetTerminal { id: String },
     SyncHandlers,
     RemoveHandlers,
+    SetColorScheme { value: String },
+    SetAccentColor { value: String },
+    SetGtkTheme { id: String },
+    SetIconTheme { id: String },
+    SetCursorTheme { id: String },
+    SetFontName { value: String },
+    SetTextScale { value: String },
+    ResetTheme,
+    SetHideWsl { enabled: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -328,12 +337,30 @@ fn main() -> anyhow::Result<()> {
             SettingsCommand::SetTerminal { id } => SettingsAction::SetTerminal(id),
             SettingsCommand::SyncHandlers => SettingsAction::SyncHandlers,
             SettingsCommand::RemoveHandlers => SettingsAction::RemoveHandlers,
+            SettingsCommand::SetColorScheme { value } => SettingsAction::SetColorScheme(value),
+            SettingsCommand::SetAccentColor { value } => SettingsAction::SetAccentColor(value),
+            SettingsCommand::SetGtkTheme { id } => SettingsAction::SetGtkTheme(id),
+            SettingsCommand::SetIconTheme { id } => SettingsAction::SetIconTheme(id),
+            SettingsCommand::SetCursorTheme { id } => SettingsAction::SetCursorTheme(id),
+            SettingsCommand::SetFontName { value } => SettingsAction::SetFontName(value),
+            SettingsCommand::SetTextScale { value } => SettingsAction::SetTextScale(value),
+            SettingsCommand::ResetTheme => SettingsAction::ResetTheme,
+            SettingsCommand::SetHideWsl { enabled } => {
+                let flag = match enabled.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" | "on" | "yes" => true,
+                    "false" | "0" | "off" | "no" => false,
+                    _ => anyhow::bail!("Invalid boolean value for set-hide-wsl: {enabled}"),
+                };
+                SettingsAction::SetHideWsl(flag)
+            }
         };
         let view = if !matches!(action, SettingsAction::RemoveHandlers) {
             match ControlClient::new(&sock).call(&ControlRequest::Settings {
                 action: action.clone(),
             }) {
-                Ok(ControlResponse::Settings { view }) => Some(view),
+                Ok(ControlResponse::Settings { view }) if !view.theme.color_scheme.is_empty() => Some(view),
+                Ok(ControlResponse::Settings { .. }) => None,
+                Ok(ControlResponse::Error { code, .. }) if code == "bad_request" => None,
                 Ok(ControlResponse::Error { message, .. }) => anyhow::bail!("{message}"),
                 Ok(other) => anyhow::bail!("Unexpected response from focusstaged: {:?}", other),
                 Err(_) => None,

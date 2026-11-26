@@ -1,5 +1,5 @@
 //! User-level desktop associations shared by the CLI and the compositor.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -16,8 +16,17 @@ const WINDOWS_HANDLER: &str = "focusstage-handler-windows-browser.desktop";
 const DEFAULTS: &str = "[Default Applications]";
 const WEB_SCHEMES: [&str; 2] = ["x-scheme-handler/http", "x-scheme-handler/https"];
 const WEB_FILES: [&str; 2] = ["text/html", "application/xhtml+xml"];
+const INTERFACE_SCHEMA: &str = "org.gnome.desktop.interface";
+const COLOR_SCHEMES: [&str; 3] = ["default", "prefer-light", "prefer-dark"];
+const BUILTIN_GTK_THEMES: [&str; 4] = [
+    "Adwaita",
+    "Adwaita-dark",
+    "HighContrast",
+    "HighContrastInverse",
+];
 
 struct Paths {
+    home: PathBuf,
     config: PathBuf,
     data: PathBuf,
 }
@@ -36,6 +45,7 @@ impl Paths {
         Ok(Self {
             config: user_dir("XDG_CONFIG_HOME", ".config"),
             data: user_dir("XDG_DATA_HOME", ".local/share"),
+            home,
         })
     }
 
@@ -48,6 +58,15 @@ impl Paths {
     fn apps(&self) -> PathBuf {
         self.data.join("applications")
     }
+    fn gtk3_settings(&self) -> PathBuf {
+        self.config.join("gtk-3.0/settings.ini")
+    }
+    fn gtk4_settings(&self) -> PathBuf {
+        self.config.join("gtk-4.0/settings.ini")
+    }
+    fn icons_default_index(&self) -> PathBuf {
+        self.home.join(".icons/default/index.theme")
+    }
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -55,12 +74,31 @@ impl Paths {
 struct Preferences {
     browser: Option<String>,
     terminal: Option<String>,
+    hide_wsl: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Choice {
     pub id: String,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeSettingsView {
+    pub color_scheme: String,
+    pub accent_color: Option<String>,
+    pub accent_colors: Vec<String>,
+    pub gtk_theme: String,
+    pub gtk_themes: Vec<Choice>,
+    pub icon_theme: String,
+    pub icon_themes: Vec<Choice>,
+    pub cursor_theme: String,
+    pub cursor_themes: Vec<Choice>,
+    pub font_name: String,
+    pub fonts: Vec<String>,
+    pub text_scaling_factor: f64,
+    pub gsettings_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +111,10 @@ pub struct SettingsView {
     pub xdg_open_installed: bool,
     pub portal_active: bool,
     pub mimeapps_synced: bool,
+    #[serde(default)]
+    pub hide_wsl: bool,
+    #[serde(default)]
+    pub theme: ThemeSettingsView,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +126,15 @@ pub enum SettingsAction {
     SetBrowser(String),
     SetTerminal(String),
     RemoveHandlers,
+    SetColorScheme(String),
+    SetAccentColor(String),
+    SetGtkTheme(String),
+    SetIconTheme(String),
+    SetCursorTheme(String),
+    SetFontName(String),
+    SetTextScale(String),
+    ResetTheme,
+    SetHideWsl(bool),
 }
 
 struct Catalog {
@@ -186,6 +237,34 @@ pub fn settings(action: SettingsAction) -> Result<SettingsView> {
             prefs.terminal = Some(id);
             write_preferences(&paths, &prefs)?;
         }
+        SettingsAction::SetColorScheme(value) => {
+            apply_color_scheme(&paths, &value)?;
+        }
+        SettingsAction::SetAccentColor(value) => {
+            apply_accent_color(&value)?;
+        }
+        SettingsAction::SetGtkTheme(id) => {
+            apply_gtk_theme(&paths, &id)?;
+        }
+        SettingsAction::SetIconTheme(id) => {
+            apply_icon_theme(&paths, &id)?;
+        }
+        SettingsAction::SetCursorTheme(id) => {
+            apply_cursor_theme(&paths, &id)?;
+        }
+        SettingsAction::SetFontName(value) => {
+            apply_font_name(&paths, &value)?;
+        }
+        SettingsAction::SetTextScale(value) => {
+            apply_text_scale(&value)?;
+        }
+        SettingsAction::ResetTheme => {
+            reset_theme(&paths)?;
+        }
+        SettingsAction::SetHideWsl(enabled) => {
+            prefs.hide_wsl = enabled;
+            write_preferences(&paths, &prefs)?;
+        }
         action => {
             let overwrite = !matches!(action, SettingsAction::InitDefaults);
             if let SettingsAction::SetBrowser(id) = action {
@@ -241,6 +320,7 @@ pub fn settings(action: SettingsAction) -> Result<SettingsView> {
                 .find(|option| catalog.entry(&option.id).is_some_and(|app| app.cmd == exec))
                 .map(|choice| choice.id.clone())
         });
+    let theme = read_theme_settings(&paths);
     Ok(SettingsView {
         browser,
         browsers,
@@ -258,7 +338,15 @@ pub fn settings(action: SettingsAction) -> Result<SettingsView> {
             ])
             .status()
             .is_ok_and(|s| s.success()),
+        hide_wsl: prefs.hide_wsl,
+        theme,
     })
+}
+
+pub fn hide_wsl_enabled() -> bool {
+    Paths::user()
+        .and_then(|paths| read_preferences(&paths))
+        .is_ok_and(|prefs| prefs.hide_wsl)
 }
 
 fn sync_gsettings_terminal(app: &DesktopEntry) -> Result<()> {
@@ -284,6 +372,650 @@ fn sync_gsettings_terminal(app: &DesktopEntry) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn validate_theme_value(value: &str, label: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 128
+        || trimmed.chars().any(|c| c.is_control() || c == '=')
+    {
+        bail!("无效的{label}");
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn gsettings_output(args: &[&str]) -> Option<String> {
+    let output = Command::new("gsettings").args(args).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn gsettings_writable(key: &str) -> bool {
+    gsettings_output(&["writable", INTERFACE_SCHEMA, key])
+        .is_some_and(|out| out.trim() == "true")
+}
+
+fn gsettings_set_interface(key: &str, value: &str) -> Result<bool> {
+    if !on_path("gsettings") || !gsettings_writable(key) {
+        return Ok(false);
+    }
+    let output = Command::new("gsettings")
+        .args(["set", INTERFACE_SCHEMA, key, value])
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "gsettings 设置 {key} 失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(true)
+}
+
+fn gsettings_reset_interface(key: &str) -> Result<bool> {
+    if !on_path("gsettings") || !gsettings_writable(key) {
+        return Ok(false);
+    }
+    let output = Command::new("gsettings")
+        .args(["reset", INTERFACE_SCHEMA, key])
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "gsettings 重置 {key} 失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(true)
+}
+
+fn parse_gsettings_list(raw: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix(INTERFACE_SCHEMA) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some((key, value)) = rest.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let val = value.trim();
+        let parsed = if let Some(inner) = val.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+            inner.replace("\\'", "'")
+        } else {
+            val.to_owned()
+        };
+        map.insert(key.to_owned(), parsed);
+    }
+    map
+}
+
+fn parse_gsettings_range(raw: &str) -> Vec<String> {
+    let mut lines = raw.lines().map(str::trim);
+    if lines.next() != Some("enum") {
+        return Vec::new();
+    }
+    lines
+        .filter(|line| !line.is_empty())
+        .map(|line| line.trim_matches('\'').to_owned())
+        .collect()
+}
+
+fn theme_data_roots(paths: &Paths, subdir: &str, legacy_dotdir: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |p: PathBuf| {
+        if seen.insert(p.clone()) {
+            dirs.push(p);
+        }
+    };
+    push(paths.home.join(legacy_dotdir));
+    push(paths.data.join(subdir));
+    if let Some(raw) = std::env::var_os("XDG_DATA_DIRS") {
+        for base in std::env::split_paths(&raw) {
+            if !base.as_os_str().is_empty() {
+                push(base.join(subdir));
+            }
+        }
+    }
+    for base in ["/usr/local/share", "/usr/share"] {
+        push(PathBuf::from(base).join(subdir));
+    }
+    dirs
+}
+
+fn parse_ini_section(text: &str, target_section: &str) -> BTreeMap<String, String> {
+    let mut in_section = false;
+    let mut map = BTreeMap::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line == target_section;
+        } else if in_section {
+            if let Some((key, val)) = line.split_once('=') {
+                map.insert(key.trim().to_owned(), val.trim().to_owned());
+            }
+        }
+    }
+    map
+}
+
+fn edit_ini_section(
+    text: &str,
+    target_section: &str,
+    mut updates: BTreeMap<String, Option<String>>,
+) -> String {
+    if updates.is_empty() {
+        return text.to_owned();
+    }
+    let mut output = String::new();
+    let mut in_section = false;
+    let mut found = false;
+    let flush = |output: &mut String, updates: &mut BTreeMap<String, Option<String>>| {
+        for (key, value) in std::mem::take(updates) {
+            if let Some(val) = value {
+                output.push_str(&format!("{key}={val}\n"));
+            }
+        }
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_section {
+                flush(&mut output, &mut updates);
+            }
+            in_section = trimmed == target_section;
+            found |= in_section;
+        } else if in_section {
+            if let Some((key, _)) = trimmed.split_once('=') {
+                if let Some(replacement) = updates.remove(key.trim()) {
+                    if let Some(val) = replacement {
+                        output.push_str(&format!("{}={val}\n", key.trim()));
+                    }
+                    continue;
+                }
+            }
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    if !found && updates.values().any(Option::is_some) {
+        if !output.is_empty() && !output.ends_with("\n\n") {
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push('\n');
+        }
+        output.push_str(target_section);
+        output.push('\n');
+    }
+    flush(&mut output, &mut updates);
+    output
+}
+
+fn is_valid_gtk_theme_dir(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let has_css = [
+        "gtk-3.0/gtk.css",
+        "gtk-3.0/gtk-dark.css",
+        "gtk-4.0/gtk.css",
+        "gtk-4.0/gtk-dark.css",
+    ]
+    .iter()
+    .any(|rel| dir.join(rel).is_file());
+    if has_css {
+        return true;
+    }
+    let index = dir.join("index.theme");
+    index.is_file()
+        && fs::read_to_string(&index).is_ok_and(|content| {
+            content.contains("[X-GNOME-Metatheme]") || content.contains("GtkTheme=")
+        })
+}
+
+fn gtk_theme_supports_gtk4(paths: &Paths, id: &str) -> bool {
+    if BUILTIN_GTK_THEMES.contains(&id) {
+        return true;
+    }
+    theme_data_roots(paths, "themes", ".themes")
+        .into_iter()
+        .any(|root| {
+            let dir = root.join(id);
+            dir.join("gtk-4.0/gtk.css").is_file() || dir.join("gtk-4.0/gtk-dark.css").is_file()
+        })
+}
+
+fn discover_gtk_themes_in(dirs: &[PathBuf], current: &str) -> Vec<Choice> {
+    let mut found: BTreeMap<String, String> = BTreeMap::new();
+    for builtin in BUILTIN_GTK_THEMES {
+        found.insert((*builtin).to_owned(), (*builtin).to_owned());
+    }
+    for root in dirs {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !is_valid_gtk_theme_dir(&path) {
+                continue;
+            }
+            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let display = fs::read_to_string(path.join("index.theme"))
+                .ok()
+                .and_then(|text| parse_ini_section(&text, "[Desktop Entry]").remove("Name"))
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| id.clone());
+            found.entry(id).or_insert(display);
+        }
+    }
+    if !current.is_empty() {
+        found.entry(current.to_owned()).or_insert_with(|| current.to_owned());
+    }
+    let mut list: Vec<Choice> = found
+        .into_iter()
+        .map(|(id, name)| Choice { id, name })
+        .collect();
+    list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    list
+}
+
+fn discover_icon_themes_in(dirs: &[PathBuf], current: &str) -> Vec<Choice> {
+    let mut found: BTreeMap<String, String> = BTreeMap::new();
+    for root in dirs {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if matches!(id.as_str(), "default" | "hicolor" | "locolor") {
+                continue;
+            }
+            let Ok(index_text) = fs::read_to_string(path.join("index.theme")) else {
+                continue;
+            };
+            let section = parse_ini_section(&index_text, "[Icon Theme]");
+            if section.get("Directories").is_none_or(|d| d.trim().is_empty()) {
+                continue;
+            }
+            let hidden = section
+                .get("Hidden")
+                .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            if hidden && id != "Adwaita" && id != "HighContrast" && id != current {
+                continue;
+            }
+            let display = section
+                .get("Name[zh_CN]")
+                .or_else(|| section.get("Name"))
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| id.clone());
+            found.entry(id).or_insert(display);
+        }
+    }
+    if !current.is_empty() {
+        found.entry(current.to_owned()).or_insert_with(|| current.to_owned());
+    }
+    let mut list: Vec<Choice> = found
+        .into_iter()
+        .map(|(id, name)| Choice { id, name })
+        .collect();
+    list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    list
+}
+
+fn discover_cursor_themes_in(dirs: &[PathBuf], current: &str) -> Vec<Choice> {
+    let mut found: BTreeMap<String, String> = BTreeMap::new();
+    for root in dirs {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() || !path.join("cursors").is_dir() {
+                continue;
+            }
+            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if id == "default" {
+                continue;
+            }
+            let display = fs::read_to_string(path.join("index.theme"))
+                .ok()
+                .and_then(|text| {
+                    let sec = parse_ini_section(&text, "[Icon Theme]");
+                    sec.get("Name[zh_CN]")
+                        .or_else(|| sec.get("Name"))
+                        .cloned()
+                })
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| id.clone());
+            found.entry(id).or_insert(display);
+        }
+    }
+    if !current.is_empty() {
+        found.entry(current.to_owned()).or_insert_with(|| current.to_owned());
+    }
+    let mut list: Vec<Choice> = found
+        .into_iter()
+        .map(|(id, name)| Choice { id, name })
+        .collect();
+    list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    list
+}
+
+fn discover_font_families() -> Vec<String> {
+    let Some(output) = Command::new("fc-list")
+        .args([":", "family"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    for line in text.lines() {
+        for part in line.split(',') {
+            let name = part.trim();
+            if !name.is_empty() {
+                seen.entry(name.to_lowercase())
+                    .or_insert_with(|| name.to_owned());
+            }
+        }
+    }
+    seen.into_values().collect()
+}
+
+fn read_gtk_ini_fallback(paths: &Paths) -> BTreeMap<String, String> {
+    let text = read_optional(&paths.gtk3_settings()).unwrap_or_default();
+    parse_ini_section(&text, "[Settings]")
+}
+
+fn read_theme_settings(paths: &Paths) -> ThemeSettingsView {
+    let raw_list = gsettings_output(&["list-recursively", INTERFACE_SCHEMA]);
+    let gsettings_available = raw_list.as_ref().is_some_and(|s| !s.trim().is_empty());
+    let gmap = raw_list
+        .as_deref()
+        .map(parse_gsettings_list)
+        .unwrap_or_default();
+    let ini = read_gtk_ini_fallback(paths);
+
+    let color_scheme = gmap
+        .get("color-scheme")
+        .filter(|v| COLOR_SCHEMES.contains(&v.as_str()))
+        .cloned()
+        .unwrap_or_else(|| {
+            if ini
+                .get("gtk-application-prefer-dark-theme")
+                .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+            {
+                "prefer-dark".to_owned()
+            } else {
+                "default".to_owned()
+            }
+        });
+
+    let accent_colors = if gmap.contains_key("accent-color") || gsettings_writable("accent-color") {
+        gsettings_output(&["range", INTERFACE_SCHEMA, "accent-color"])
+            .as_deref()
+            .map(parse_gsettings_range)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let accent_color = (!accent_colors.is_empty())
+        .then(|| gmap.get("accent-color").cloned())
+        .flatten();
+
+    let gtk_theme = gmap
+        .get("gtk-theme")
+        .cloned()
+        .or_else(|| ini.get("gtk-theme-name").cloned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Adwaita".to_owned());
+
+    let icon_theme = gmap
+        .get("icon-theme")
+        .cloned()
+        .or_else(|| ini.get("gtk-icon-theme-name").cloned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Adwaita".to_owned());
+
+    let cursor_theme = gmap
+        .get("cursor-theme")
+        .cloned()
+        .or_else(|| ini.get("gtk-cursor-theme-name").cloned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Adwaita".to_owned());
+
+    let font_name = gmap
+        .get("font-name")
+        .cloned()
+        .or_else(|| ini.get("gtk-font-name").cloned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Sans 11".to_owned());
+
+    let text_scaling_factor = gmap
+        .get("text-scaling-factor")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.0);
+
+    let theme_dirs = theme_data_roots(paths, "themes", ".themes");
+    let icon_dirs = theme_data_roots(paths, "icons", ".icons");
+
+    ThemeSettingsView {
+        color_scheme,
+        accent_color,
+        accent_colors,
+        gtk_themes: discover_gtk_themes_in(&theme_dirs, &gtk_theme),
+        gtk_theme,
+        icon_themes: discover_icon_themes_in(&icon_dirs, &icon_theme),
+        icon_theme,
+        cursor_themes: discover_cursor_themes_in(&icon_dirs, &cursor_theme),
+        cursor_theme,
+        font_name,
+        fonts: discover_font_families(),
+        text_scaling_factor,
+        gsettings_available,
+    }
+}
+
+fn sync_gtk_configs(paths: &Paths, view: &ThemeSettingsView) -> Result<()> {
+    let prefer_dark = if view.color_scheme == "prefer-dark" {
+        "1"
+    } else {
+        "0"
+    };
+
+    let mut gtk3_updates = BTreeMap::new();
+    gtk3_updates.insert(
+        "gtk-application-prefer-dark-theme".to_owned(),
+        Some(prefer_dark.to_owned()),
+    );
+    if !view.gtk_theme.is_empty() {
+        gtk3_updates.insert("gtk-theme-name".to_owned(), Some(view.gtk_theme.clone()));
+    }
+    if !view.icon_theme.is_empty() {
+        gtk3_updates.insert(
+            "gtk-icon-theme-name".to_owned(),
+            Some(view.icon_theme.clone()),
+        );
+    }
+    if !view.cursor_theme.is_empty() {
+        gtk3_updates.insert(
+            "gtk-cursor-theme-name".to_owned(),
+            Some(view.cursor_theme.clone()),
+        );
+    }
+    if !view.font_name.is_empty() {
+        gtk3_updates.insert("gtk-font-name".to_owned(), Some(view.font_name.clone()));
+    }
+    let gtk3_cur = read_optional(&paths.gtk3_settings())?;
+    let gtk3_next = edit_ini_section(&gtk3_cur, "[Settings]", gtk3_updates);
+    if gtk3_next != gtk3_cur {
+        write_atomic(&paths.gtk3_settings(), gtk3_next.as_bytes())?;
+    }
+
+    let mut gtk4_updates = BTreeMap::new();
+    gtk4_updates.insert(
+        "gtk-application-prefer-dark-theme".to_owned(),
+        Some(prefer_dark.to_owned()),
+    );
+    if gtk_theme_supports_gtk4(paths, &view.gtk_theme) {
+        gtk4_updates.insert("gtk-theme-name".to_owned(), Some(view.gtk_theme.clone()));
+    } else {
+        gtk4_updates.insert("gtk-theme-name".to_owned(), None);
+    }
+    if !view.icon_theme.is_empty() {
+        gtk4_updates.insert(
+            "gtk-icon-theme-name".to_owned(),
+            Some(view.icon_theme.clone()),
+        );
+    }
+    if !view.cursor_theme.is_empty() {
+        gtk4_updates.insert(
+            "gtk-cursor-theme-name".to_owned(),
+            Some(view.cursor_theme.clone()),
+        );
+    }
+    if !view.font_name.is_empty() {
+        gtk4_updates.insert("gtk-font-name".to_owned(), Some(view.font_name.clone()));
+    }
+    let gtk4_cur = read_optional(&paths.gtk4_settings())?;
+    let gtk4_next = edit_ini_section(&gtk4_cur, "[Settings]", gtk4_updates);
+    if gtk4_next != gtk4_cur {
+        write_atomic(&paths.gtk4_settings(), gtk4_next.as_bytes())?;
+    }
+
+    if !view.cursor_theme.is_empty() {
+        let cur_idx = read_optional(&paths.icons_default_index())?;
+        let mut icon_updates = BTreeMap::new();
+        icon_updates.insert("Inherits".to_owned(), Some(view.cursor_theme.clone()));
+        let next_idx = edit_ini_section(&cur_idx, "[Icon Theme]", icon_updates);
+        if next_idx != cur_idx {
+            write_atomic(&paths.icons_default_index(), next_idx.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+fn apply_color_scheme(paths: &Paths, value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if !COLOR_SCHEMES.contains(&trimmed) {
+        bail!("不支持的颜色模式：{trimmed}");
+    }
+    gsettings_set_interface("color-scheme", trimmed)?;
+    let mut view = read_theme_settings(paths);
+    view.color_scheme = trimmed.to_owned();
+    sync_gtk_configs(paths, &view)
+}
+
+fn apply_accent_color(value: &str) -> Result<()> {
+    let trimmed = validate_theme_value(value, "强调色")?;
+    let supported = gsettings_output(&["range", INTERFACE_SCHEMA, "accent-color"])
+        .as_deref()
+        .map(parse_gsettings_range)
+        .unwrap_or_default();
+    if supported.is_empty() {
+        bail!("当前 WSL 系统的 GNOME schema 不支持强调色设置");
+    }
+    if !supported.iter().any(|c| c == &trimmed) {
+        bail!("不支持的强调色：{trimmed}");
+    }
+    if !gsettings_set_interface("accent-color", &trimmed)? {
+        bail!("当前系统不允许写入强调色设置");
+    }
+    Ok(())
+}
+
+fn apply_gtk_theme(paths: &Paths, id: &str) -> Result<()> {
+    let trimmed = validate_theme_value(id, "GTK 主题")?;
+    let current = read_theme_settings(paths);
+    if !current.gtk_themes.iter().any(|c| c.id == trimmed) {
+        bail!("未找到指定的 GTK 主题：{trimmed}");
+    }
+    gsettings_set_interface("gtk-theme", &trimmed)?;
+    let mut view = read_theme_settings(paths);
+    view.gtk_theme = trimmed;
+    sync_gtk_configs(paths, &view)
+}
+
+fn apply_icon_theme(paths: &Paths, id: &str) -> Result<()> {
+    let trimmed = validate_theme_value(id, "图标主题")?;
+    let current = read_theme_settings(paths);
+    if !current.icon_themes.iter().any(|c| c.id == trimmed) {
+        bail!("未找到指定的图标主题：{trimmed}");
+    }
+    gsettings_set_interface("icon-theme", &trimmed)?;
+    let mut view = read_theme_settings(paths);
+    view.icon_theme = trimmed;
+    sync_gtk_configs(paths, &view)
+}
+
+fn apply_cursor_theme(paths: &Paths, id: &str) -> Result<()> {
+    let trimmed = validate_theme_value(id, "光标主题")?;
+    let current = read_theme_settings(paths);
+    if !current.cursor_themes.iter().any(|c| c.id == trimmed) {
+        bail!("未找到指定的光标主题：{trimmed}");
+    }
+    gsettings_set_interface("cursor-theme", &trimmed)?;
+    let mut view = read_theme_settings(paths);
+    view.cursor_theme = trimmed;
+    sync_gtk_configs(paths, &view)
+}
+
+fn apply_font_name(paths: &Paths, value: &str) -> Result<()> {
+    let trimmed = validate_theme_value(value, "系统字体")?;
+    gsettings_set_interface("font-name", &trimmed)?;
+    let mut view = read_theme_settings(paths);
+    view.font_name = trimmed;
+    sync_gtk_configs(paths, &view)
+}
+
+fn apply_text_scale(value: &str) -> Result<()> {
+    let scale: f64 = value
+        .trim()
+        .parse()
+        .ok()
+        .filter(|v: &f64| v.is_finite() && (0.75..=2.0).contains(v))
+        .context("文字缩放比例需在 0.75 到 2.00 之间")?;
+    let formatted = format!("{scale:.2}");
+    if !gsettings_set_interface("text-scaling-factor", &formatted)? {
+        bail!("当前系统不支持通过 gsettings 修改文字缩放比例");
+    }
+    Ok(())
+}
+
+fn reset_theme(paths: &Paths) -> Result<()> {
+    for key in [
+        "color-scheme",
+        "accent-color",
+        "gtk-theme",
+        "icon-theme",
+        "cursor-theme",
+        "font-name",
+        "text-scaling-factor",
+    ] {
+        let _ = gsettings_reset_interface(key);
+    }
+    let view = read_theme_settings(paths);
+    sync_gtk_configs(paths, &view)
 }
 
 fn on_path(name: &str) -> bool {
@@ -900,5 +1632,77 @@ mod tests {
         assert_eq!(OpenTarget::parse(target.uri()).unwrap().path, target.path);
         assert!(!target.is_web());
         assert!(OpenTarget::parse("file://example.invalid/a").is_err());
+    }
+
+    #[test]
+    fn parses_gsettings_list_and_range() {
+        let raw = "\
+org.gnome.desktop.interface color-scheme 'prefer-dark'
+org.gnome.desktop.interface accent-color 'teal'
+org.gnome.desktop.interface text-scaling-factor 1.25
+org.gnome.desktop.interface font-name 'Noto Sans CJK SC 11'
+";
+        let map = parse_gsettings_list(raw);
+        assert_eq!(map.get("color-scheme").map(String::as_str), Some("prefer-dark"));
+        assert_eq!(map.get("accent-color").map(String::as_str), Some("teal"));
+        assert_eq!(map.get("text-scaling-factor").map(String::as_str), Some("1.25"));
+        assert_eq!(map.get("font-name").map(String::as_str), Some("Noto Sans CJK SC 11"));
+
+        let range = "enum\n'blue'\n'teal'\n'purple'\n";
+        assert_eq!(parse_gsettings_range(range), vec!["blue", "teal", "purple"]);
+    }
+
+    #[test]
+    fn edits_gtk_ini_section_preserving_unrelated_entries() {
+        let input = "# comment\n[Settings]\ngtk-theme-name=Adwaita\ngtk-enable-animations=1\n\n[Custom]\nfoo=bar\n";
+        let mut updates = BTreeMap::new();
+        updates.insert("gtk-theme-name".to_owned(), Some("Yaru".to_owned()));
+        updates.insert("gtk-application-prefer-dark-theme".to_owned(), Some("1".to_owned()));
+        updates.insert("gtk-enable-animations".to_owned(), None);
+        let edited = edit_ini_section(input, "[Settings]", updates);
+        assert!(edited.contains("# comment\n"));
+        assert!(edited.contains("gtk-theme-name=Yaru\n"));
+        assert!(edited.contains("gtk-application-prefer-dark-theme=1\n"));
+        assert!(!edited.contains("gtk-enable-animations"));
+        assert!(edited.contains("[Custom]\nfoo=bar\n"));
+
+        let created = edit_ini_section(
+            "",
+            "[Settings]",
+            BTreeMap::from([("gtk-application-prefer-dark-theme".to_owned(), Some("1".to_owned()))]),
+        );
+        assert_eq!(created, "[Settings]\ngtk-application-prefer-dark-theme=1\n");
+    }
+
+    #[test]
+    fn discovers_gtk_icon_and_cursor_themes_without_false_positives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let themes_dir = tmp.path().join("themes");
+        let icons_dir = tmp.path().join("icons");
+        fs::create_dir_all(themes_dir.join("Default/gtk-3.0")).unwrap();
+        fs::write(themes_dir.join("Default/gtk-3.0/gtk-keys.css"), "/* keys */").unwrap();
+        fs::create_dir_all(themes_dir.join("CustomGtk/gtk-3.0")).unwrap();
+        fs::write(themes_dir.join("CustomGtk/gtk-3.0/gtk.css"), "/* css */").unwrap();
+
+        let gtk_themes = discover_gtk_themes_in(&[themes_dir], "Adwaita");
+        assert!(gtk_themes.iter().any(|c| c.id == "CustomGtk"));
+        assert!(!gtk_themes.iter().any(|c| c.id == "Default"));
+        assert!(gtk_themes.iter().any(|c| c.id == "Adwaita"));
+
+        fs::create_dir_all(icons_dir.join("hicolor")).unwrap();
+        fs::write(icons_dir.join("hicolor/index.theme"), "[Icon Theme]\nName=Hicolor\nDirectories=16x16\n").unwrap();
+        fs::create_dir_all(icons_dir.join("Papirus")).unwrap();
+        fs::write(icons_dir.join("Papirus/index.theme"), "[Icon Theme]\nName=Papirus\nDirectories=16x16\n").unwrap();
+        fs::create_dir_all(icons_dir.join("Bibata/cursors")).unwrap();
+        fs::write(icons_dir.join("Bibata/index.theme"), "[Icon Theme]\nName=Bibata Modern\n").unwrap();
+
+        let icon_themes = discover_icon_themes_in(std::slice::from_ref(&icons_dir), "Adwaita");
+        assert!(icon_themes.iter().any(|c| c.id == "Papirus" && c.name == "Papirus"));
+        assert!(!icon_themes.iter().any(|c| c.id == "hicolor"));
+        assert!(!icon_themes.iter().any(|c| c.id == "Bibata"));
+
+        let cursor_themes = discover_cursor_themes_in(&[icons_dir], "Adwaita");
+        assert!(cursor_themes.iter().any(|c| c.id == "Bibata" && c.name == "Bibata Modern"));
+        assert!(!cursor_themes.iter().any(|c| c.id == "Papirus"));
     }
 }

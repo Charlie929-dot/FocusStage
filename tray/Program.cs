@@ -84,9 +84,32 @@ internal static class Program
 
 internal sealed record LinuxAppChoice(string Id, string Name);
 
-internal sealed record LinuxDesktopSettings(string Browser, List<LinuxAppChoice> Browsers,
-    string? Terminal, List<LinuxAppChoice> Terminals, Dictionary<string, string> Protocols,
-    bool XdgOpenInstalled, bool PortalActive, bool MimeappsSynced);
+internal sealed record LinuxThemeSettings(
+    string ColorScheme,
+    string? AccentColor,
+    List<string> AccentColors,
+    string GtkTheme,
+    List<LinuxAppChoice> GtkThemes,
+    string IconTheme,
+    List<LinuxAppChoice> IconThemes,
+    string CursorTheme,
+    List<LinuxAppChoice> CursorThemes,
+    string FontName,
+    List<string> Fonts,
+    double TextScalingFactor,
+    bool GsettingsAvailable);
+
+internal sealed record LinuxDesktopSettings(
+    string Browser,
+    List<LinuxAppChoice> Browsers,
+    string? Terminal,
+    List<LinuxAppChoice> Terminals,
+    Dictionary<string, string> Protocols,
+    bool XdgOpenInstalled,
+    bool PortalActive,
+    bool MimeappsSynced,
+    bool HideWsl = false,
+    LinuxThemeSettings? Theme = null);
 
 internal sealed class StageDto
 {

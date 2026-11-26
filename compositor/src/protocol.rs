@@ -547,6 +547,18 @@ mod tests {
             } if id == "firefox"
         ));
 
+        let theme_req = ControlRequest::Settings {
+            action: crate::xdg::SettingsAction::SetColorScheme("prefer-dark".into()),
+        };
+        let theme_raw = serde_json::to_string(&theme_req).unwrap();
+        let theme_parsed: ControlRequest = serde_json::from_str(&theme_raw).unwrap();
+        assert!(matches!(
+            theme_parsed,
+            ControlRequest::Settings {
+                action: crate::xdg::SettingsAction::SetColorScheme(ref v)
+            } if v == "prefer-dark"
+        ));
+
         let resp = ControlResponse::Apps {
             count: 1,
             apps: vec![DesktopAppInfo {

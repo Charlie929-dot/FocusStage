@@ -171,6 +171,8 @@ dotnet run --project tray/FocusStageTray.csproj -c Release
 
 启动器的 **舞台中心 → Linux 设置** 可选择默认浏览器和终端、同步用户级协议关联。Linux 应用通过 `xdg-open`、`gio open` 或 `focusstage open --ensure-daemon <URI>` 打开链接时，会复用已有的 Human Stage，或者启动目标应用。目标 Stage 被 Agent 租用、冻结或无法唯一确定时会返回错误。Windows 默认浏览器选项只接收 HTTP(S)。需要处理 `vscode://` 等 Linux 应用回调时，请使用 Linux 浏览器。
 
+同一页面的 **过滤常见 WSL 标识** 默认关闭。开启后，FocusStage 为新启动的非提权应用过滤 WSL 环境变量和 PATH 中的 Windows 路径，并为普通动态链接应用过滤部分 `uname` 和 `/proc` 探针。这可让依赖这些标识的应用选择 Linux 桌面行为，例如用默认 Linux 文件管理器打开目录。它不修改系统文件关联或全局 WSL 配置，也不保证覆盖所有探测方式；Snap 不加载兼容库。已运行的应用需要退出后重开，依赖 Windows 互操作的功能可能受影响。
+
 Chromium、Electron 和 Gecko 使用各自的 WSL 用户配置目录，关闭并重开后可以从原目录读取设置和 Cookie。再次启动已经由 FocusStage 托管的同款单实例应用时，会复用已有的 Human Stage。显式传入的 profile 参数会保留。
 
 安装器提供 GNOME Keyring。VS Code 使用 Linux Secret Service 保存加密凭据时，首次使用可能提示创建带密码的密钥环，WSL 重启后可能需要重新解锁。若 VS Code 的 `argv.json` 显式设置了 `"password-store": "basic"`，VS Code 会按该设置选择存储后端。

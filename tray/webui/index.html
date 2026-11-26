@@ -242,13 +242,93 @@
           <div id="tab-linux" class="control-pane" role="tabpanel">
             <div class="pane-header">
               <div>
-                <h1 class="pane-title">Linux 默认应用与协议关联</h1>
-                <p class="pane-subtitle">配置 WSL 内 xdg-open 链接打开方式、默认终端与协议回调路由</p>
+                <h1 class="pane-title">Linux 系统设置</h1>
+                <p class="pane-subtitle">配置 WSL 桌面系统主题外观、默认应用与 xdg-open 协议回调路由</p>
               </div>
               <div class="pane-actions">
                 <button type="button" id="btn-linux-reload" class="btn btn-secondary">重新检测</button>
                 <button type="button" id="btn-linux-sync" class="btn btn-primary">同步协议关联</button>
               </div>
+            </div>
+
+            <div class="settings-group">
+              <div class="group-heading">
+                <h2 class="group-title">系统主题与外观</h2>
+                <button type="button" id="btn-linux-theme-reset" class="btn btn-ghost btn-sm">恢复默认主题</button>
+              </div>
+
+              <div class="setting-row">
+                <div class="setting-info">
+                  <div class="setting-name">颜色模式</div>
+                  <div class="setting-desc">控制 GTK3 / GTK4 / libadwaita、Chromium 与 Electron 应用的浅色或深色外观</div>
+                </div>
+                <div class="setting-action theme-actions-inline">
+                  <div id="linux-color-scheme-group" class="segmented-control" role="group" aria-label="Linux 颜色模式">
+                    <button type="button" class="segmented-btn" data-scheme="default">系统默认</button>
+                    <button type="button" class="segmented-btn" data-scheme="prefer-light">浅色</button>
+                    <button type="button" class="segmented-btn" data-scheme="prefer-dark">深色</button>
+                  </div>
+                  <button type="button" id="btn-linux-sync-win-theme" class="btn btn-secondary btn-sm">跟随 Windows</button>
+                </div>
+              </div>
+
+              <div id="linux-accent-row" class="setting-row is-hidden">
+                <div class="setting-info">
+                  <div class="setting-name">系统强调色</div>
+                  <div class="setting-desc">控制现代 GNOME / GTK4 应用的控件高亮与选中颜色</div>
+                </div>
+                <div class="setting-action">
+                  <div id="linux-accent-swatches" class="accent-swatch-list" role="group" aria-label="Linux 系统强调色"></div>
+                </div>
+              </div>
+
+              <div class="setting-row">
+                <div class="setting-info">
+                  <div class="setting-name">GTK 主题</div>
+                  <div class="setting-desc">用于 GTK3 及传统 Linux 桌面窗口的界面主题</div>
+                </div>
+                <div class="setting-action"><select id="select-gtk-theme" class="select-input" disabled aria-label="GTK 主题"></select></div>
+              </div>
+
+              <div class="setting-row">
+                <div class="setting-info">
+                  <div class="setting-name">图标主题</div>
+                  <div class="setting-desc">Linux 应用图标与文件管理器图标包（切换后同步刷新启动器图标）</div>
+                </div>
+                <div class="setting-action"><select id="select-icon-theme" class="select-input" disabled aria-label="图标主题"></select></div>
+              </div>
+
+              <div class="setting-row">
+                <div class="setting-info">
+                  <div class="setting-name">光标主题</div>
+                  <div class="setting-desc">Linux 应用窗口内使用的鼠标指针主题</div>
+                </div>
+                <div class="setting-action"><select id="select-cursor-theme" class="select-input" disabled aria-label="光标主题"></select></div>
+              </div>
+
+              <div class="setting-row">
+                <div class="setting-info">
+                  <div class="setting-name">系统界面字体</div>
+                  <div class="setting-desc">GTK / GNOME 桌面应用默认使用的字体族与字号</div>
+                </div>
+                <div class="setting-action font-combo">
+                  <select id="select-linux-font-family" class="select-input" disabled aria-label="Linux 系统字体族"></select>
+                  <select id="select-linux-font-size" class="select-input select-input-compact" disabled aria-label="Linux 系统字号"></select>
+                </div>
+              </div>
+
+              <div class="setting-row">
+                <div class="setting-info">
+                  <div class="setting-name">文字缩放比例</div>
+                  <div class="setting-desc">独立调节 Linux 应用界面文字显示倍率（75% – 200%）</div>
+                </div>
+                <div class="setting-action scale-control">
+                  <input id="range-linux-text-scale" class="range-input" type="range" min="0.75" max="2.00" step="0.05" value="1.00" disabled aria-label="Linux 文字缩放比例" />
+                  <output id="output-linux-text-scale" class="field-output">100%</output>
+                </div>
+              </div>
+
+              <div id="linux-theme-notice" class="inline-notice is-hidden"></div>
             </div>
 
             <div class="settings-group">
@@ -271,6 +351,19 @@
                   <div class="setting-desc">文件管理器或系统工具打开终端时启动的 Linux 终端</div>
                 </div>
                 <div class="setting-action"><select id="select-terminal" class="select-input" disabled aria-label="默认终端"></select></div>
+              </div>
+            </div>
+
+            <div class="settings-group">
+              <h2 class="group-title">Linux 应用兼容性</h2>
+              <div class="setting-row">
+                <div class="setting-info">
+                  <div class="setting-name">过滤常见 WSL 标识</div>
+                  <div class="setting-desc">过滤应用的 WSL 环境变量、PATH 中的 Windows 路径和部分内核标识，让依赖这些标识的应用使用 Linux 桌面行为。已打开的应用需退出后重开；Windows 互操作可能受影响。</div>
+                </div>
+                <div class="setting-action">
+                  <label class="switch"><input type="checkbox" id="toggle-linux-hide-wsl" aria-label="过滤常见 WSL 标识" disabled /><span class="switch-track"></span></label>
+                </div>
               </div>
             </div>
 
