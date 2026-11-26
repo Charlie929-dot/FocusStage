@@ -75,6 +75,7 @@ struct Preferences {
     browser: Option<String>,
     terminal: Option<String>,
     hide_wsl: bool,
+    han_fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +115,8 @@ pub struct SettingsView {
     #[serde(default)]
     pub hide_wsl: bool,
     #[serde(default)]
+    pub han_fallback: Option<String>,
+    #[serde(default)]
     pub theme: ThemeSettingsView,
 }
 
@@ -132,6 +135,7 @@ pub enum SettingsAction {
     SetIconTheme(String),
     SetCursorTheme(String),
     SetFontName(String),
+    SetHanFallback(String),
     SetTextScale(String),
     ResetTheme,
     SetHideWsl(bool),
@@ -255,11 +259,17 @@ pub fn settings(action: SettingsAction) -> Result<SettingsView> {
         SettingsAction::SetFontName(value) => {
             apply_font_name(&paths, &value)?;
         }
+        SettingsAction::SetHanFallback(value) => {
+            set_han_fallback(&paths, &mut prefs, &value)?;
+        }
         SettingsAction::SetTextScale(value) => {
             apply_text_scale(&value)?;
         }
         SettingsAction::ResetTheme => {
             reset_theme(&paths)?;
+            if prefs.han_fallback.is_some() {
+                set_han_fallback(&paths, &mut prefs, "system")?;
+            }
         }
         SettingsAction::SetHideWsl(enabled) => {
             prefs.hide_wsl = enabled;
@@ -339,6 +349,7 @@ pub fn settings(action: SettingsAction) -> Result<SettingsView> {
             .status()
             .is_ok_and(|s| s.success()),
         hide_wsl: prefs.hide_wsl,
+        han_fallback: prefs.han_fallback,
         theme,
     })
 }
@@ -347,6 +358,35 @@ pub fn hide_wsl_enabled() -> bool {
     Paths::user()
         .and_then(|paths| read_preferences(&paths))
         .is_ok_and(|prefs| prefs.hide_wsl)
+}
+
+fn han_profile(paths: &Paths, language: &str) -> Result<(PathBuf, &'static str)> {
+    let region = match language {
+        "zh-cn" => "SC",
+        "zh-tw" => "TC",
+        "ja" => "JP",
+        _ => bail!("Expected system, zh-cn, zh-tw or ja"),
+    };
+    Ok((paths.config.join(format!("focusstage/fontconfig/{language}.conf")), region))
+}
+
+fn set_han_fallback(paths: &Paths, prefs: &mut Preferences, language: &str) -> Result<()> {
+    prefs.han_fallback = if language == "system" {
+        None
+    } else {
+        let (path, region) = han_profile(paths, language)?;
+        let profile = include_str!("han-fontconfig.xml").replace("@REGION@", region);
+        write_atomic(&path, profile.as_bytes())?;
+        Some(language.to_owned())
+    };
+    write_preferences(paths, prefs)
+}
+
+pub(crate) fn stage_fontconfig_profile() -> Option<PathBuf> {
+    let paths = Paths::user().ok()?;
+    let language = read_preferences(&paths).ok()?.han_fallback?;
+    let (path, _) = han_profile(&paths, &language).ok()?;
+    path.is_file().then_some(path)
 }
 
 fn sync_gsettings_terminal(app: &DesktopEntry) -> Result<()> {
@@ -1585,6 +1625,25 @@ fn decode_path(path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn han_profiles_are_opt_in_and_do_not_write_global_fontconfig() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths { home: temp.path().into(), config: temp.path().join("config"), data: temp.path().join("data") };
+        let mut prefs = read_preferences(&paths).unwrap();
+        assert!(prefs.han_fallback.is_none());
+        for (language, region) in [("zh-cn", "SC"), ("zh-tw", "TC"), ("ja", "JP")] {
+            set_han_fallback(&paths, &mut prefs, language).unwrap();
+            assert_eq!(read_preferences(&paths).unwrap().han_fallback.as_deref(), Some(language));
+            let profile = fs::read_to_string(han_profile(&paths, language).unwrap().0).unwrap();
+            assert!(profile.contains(&format!("Noto Sans CJK {region}</family>")));
+        }
+        assert!(set_han_fallback(&paths, &mut prefs, "../invalid").is_err());
+        assert_eq!(read_preferences(&paths).unwrap().han_fallback.as_deref(), Some("ja"));
+        set_han_fallback(&paths, &mut prefs, "system").unwrap();
+        assert!(read_preferences(&paths).unwrap().han_fallback.is_none());
+        assert!(!paths.config.join("fontconfig").exists());
+    }
 
     #[test]
     fn preserves_other_mimeapps_sections_and_uninstall_fallbacks() {

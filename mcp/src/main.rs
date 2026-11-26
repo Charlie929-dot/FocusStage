@@ -225,6 +225,7 @@ enum SettingsCommand {
     SetIconTheme { id: String },
     SetCursorTheme { id: String },
     SetFontName { value: String },
+    SetHanFallback { #[arg(value_parser = ["system", "zh-cn", "zh-tw", "ja"])] value: String },
     SetTextScale { value: String },
     ResetTheme,
     SetHideWsl { enabled: String },
@@ -343,6 +344,7 @@ fn main() -> anyhow::Result<()> {
             SettingsCommand::SetIconTheme { id } => SettingsAction::SetIconTheme(id),
             SettingsCommand::SetCursorTheme { id } => SettingsAction::SetCursorTheme(id),
             SettingsCommand::SetFontName { value } => SettingsAction::SetFontName(value),
+            SettingsCommand::SetHanFallback { value } => SettingsAction::SetHanFallback(value),
             SettingsCommand::SetTextScale { value } => SettingsAction::SetTextScale(value),
             SettingsCommand::ResetTheme => SettingsAction::ResetTheme,
             SettingsCommand::SetHideWsl { enabled } => {

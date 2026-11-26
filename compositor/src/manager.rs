@@ -852,6 +852,9 @@ fn stage_command(wayland_socket: &str, stage: &Stage, app: &str, args: &[String]
         cmd.env("APPIMAGE_EXTRACT_AND_RUN", "1");
     }
     apply_common_stage_env(&mut cmd, wayland_socket, x11_display);
+    if !stage.run_as_root && !stage.persistent_helper {
+        crate::session_env::apply_font_preferences(&mut cmd, &stage.launch_env);
+    }
     match stage.kind {
         StageKind::Chromium | StageKind::Electron => {
             let platform = chromium_platform(&stage.args, is_wsl2());

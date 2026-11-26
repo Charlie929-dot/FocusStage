@@ -319,6 +319,20 @@
 
               <div class="setting-row">
                 <div class="setting-info">
+                  <label class="setting-name" for="select-han-fallback">汉字备用字形</label>
+                  <div class="setting-desc">仅用于未设置地区语言的托管应用；保留应用字体和界面语言，重新打开应用后生效。</div>
+                </div>
+                <div class="setting-action">
+                  <select id="select-han-fallback" class="select-input" disabled>
+                    <option value="system">跟随系统（默认）</option>
+                    <option value="zh-cn">简体中文</option>
+                    <option value="zh-tw">繁体中文（台湾）</option>
+                    <option value="ja">日文</option>
+                  </select>
+                </div>
+              </div>
+              <div class="setting-row">
+                <div class="setting-info">
                   <div class="setting-name">文字缩放比例</div>
                   <div class="setting-desc">独立调节 Linux 应用界面文字显示倍率（75% – 200%）</div>
                 </div>

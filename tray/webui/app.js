@@ -224,6 +224,7 @@
     selectCursorTheme: $('select-cursor-theme'),
     selectLinuxFontFamily: $('select-linux-font-family'),
     selectLinuxFontSize: $('select-linux-font-size'),
+    selectHanFallback: $('select-han-fallback'),
     rangeLinuxTextScale: $('range-linux-text-scale'),
     outputLinuxTextScale: $('output-linux-text-scale'),
     linuxThemeNotice: $('linux-theme-notice'),
@@ -2216,6 +2217,7 @@
     els.selectLinuxFontSize.disabled = disabled;
     els.rangeLinuxTextScale.disabled = disabled;
     els.toggleLinuxHideWsl.disabled = disabled;
+    els.selectHanFallback.disabled = disabled;
   }
 
   async function loadLinuxSettings(method = 'linuxSettings.get', params = {}, successToast = null) {
@@ -2342,6 +2344,8 @@
     els.selectBrowser.disabled = (data.browsers || []).length === 0;
     els.selectTerminal.disabled = (data.terminals || []).length === 0;
     els.toggleLinuxHideWsl.checked = Boolean(data.hideWsl);
+    els.selectHanFallback.value = data.hanFallback || 'system';
+    els.selectHanFallback.disabled = false;
     els.toggleLinuxHideWsl.disabled = false;
     els.windowsHostHint.classList.toggle('is-hidden', data.browser !== 'windows-host');
 
@@ -2416,6 +2420,9 @@
   }
   els.selectLinuxFontFamily.addEventListener('change', commitLinuxFontChange);
   els.selectLinuxFontSize.addEventListener('change', commitLinuxFontChange);
+  els.selectHanFallback.addEventListener('change', () => {
+    loadLinuxSettings('linuxSettings.setHanFallback', { value: els.selectHanFallback.value }, '已保存汉字字形偏好，重新打开应用后生效');
+  });
   els.rangeLinuxTextScale.addEventListener('input', () => {
     const val = Number(els.rangeLinuxTextScale.value) || 1.0;
     els.outputLinuxTextScale.textContent = `${Math.round(val * 100)}%`;

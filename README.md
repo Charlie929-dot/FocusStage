@@ -165,6 +165,8 @@ focusstage settings get
 - `stage_observe` 可只传 `stage_id`，不会获取租约或更改窗口显隐。`stage_act` 仍需租约；只想发送输入时可用 `observe: false` 跳过截图和默认等待。需要等待时可显式传 `settle: true`，并用 `settle_ms` 覆盖默认的 600 ms 上限。
 - `stage_drop_files` 需要有效租约和 `paths`（Windows 盘符路径或 WSL 绝对路径）。可同时传 `x`、`y` 指定窗口内逻辑坐标，否则使用当前 Stage 指针位置。成功表示已发送拖放，不保证应用接受文件。
 
+**汉字备用字形**：如果 WSL 使用 `C.UTF-8`，而中文菜单中的个别汉字看起来像日文字形，可在 Linux 设置的「汉字备用字形」里选择简体中文，或运行 `focusstage settings set-han-fallback zh-cn`。也支持 `zh-tw`、`ja`；用 `system` 恢复默认。重新打开应用后生效。此选项只给新启动的普通 Stage 提供 Fontconfig 备用字体，不修改 Ubuntu 全局配置、应用界面语言或缩放；已指定的地区语言和 Fontconfig 环境优先，自带字体或不使用 Fontconfig 的应用不一定受影响。
+
 ### 3. 运行 Windows 11 启动器与托盘（`FocusStage.exe`）
 
 源码位于 WSL 时，通过 `./scripts/install.sh --skip-rust-build` 复用已有的 Rust 构建产物。源码位于 Windows 磁盘时也可以直接调试启动器：

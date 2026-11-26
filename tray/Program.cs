@@ -109,7 +109,8 @@ internal sealed record LinuxDesktopSettings(
     bool PortalActive,
     bool MimeappsSynced,
     bool HideWsl = false,
-    LinuxThemeSettings? Theme = null);
+    LinuxThemeSettings? Theme = null,
+    string? HanFallback = null);
 
 internal sealed class StageDto
 {

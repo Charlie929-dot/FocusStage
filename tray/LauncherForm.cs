@@ -757,6 +757,9 @@ internal sealed class LauncherForm : Form
             case "linuxSettings.setFontName":
                 return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("set-font-name", Str("value")));
 
+            case "linuxSettings.setHanFallback":
+                return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("set-han-fallback", Str("value")));
+
             case "linuxSettings.setTextScale":
                 return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("set-text-scale", Str("value")));
 
@@ -1097,6 +1100,7 @@ internal sealed class LauncherForm : Form
             portalActive = s.PortalActive,
             mimeappsSynced = s.MimeappsSynced,
             hideWsl = s.HideWsl,
+            hanFallback = s.HanFallback,
             windowsColorScheme = GetWindowsColorScheme(),
             theme = t is null ? null : new
             {

@@ -153,6 +153,27 @@ pub fn current_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+pub(crate) fn apply_font_preferences(cmd: &mut Command, overrides: &HashMap<String, String>) {
+    let effective = |key: &str| overrides.get(key).cloned().or_else(|| std::env::var(key).ok());
+    if allows_font_fallback(effective) {
+        if let Some(profile) = crate::xdg::stage_fontconfig_profile() {
+            cmd.env("FONTCONFIG_FILE", profile);
+        }
+    }
+}
+
+fn allows_font_fallback(env: impl Fn(&str) -> Option<String>) -> bool {
+    let nonempty = |key| env(key).filter(|value| !value.is_empty());
+    if ["FONTCONFIG_FILE", "FONTCONFIG_PATH", "FC_LANG", "LANGUAGE"]
+        .into_iter().any(|key| nonempty(key).is_some()) {
+        return false;
+    }
+    ["LC_CTYPE", "LC_MESSAGES"].into_iter().all(|category| {
+        ["LC_ALL", category, "LANG"].into_iter().find_map(nonempty)
+            .is_none_or(|locale| matches!(locale.split('.').next(), Some("C" | "POSIX")))
+    })
+}
+
 /// Ensure `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` are populated for `uid` when the
 /// caller was spawned by a minimal `wsl.exe -e` invocation without PAM environment setup.
 pub fn ensure_runtime_env_for_uid(uid: u32) {
@@ -687,6 +708,21 @@ pub fn os_var_nonempty(key: &str) -> Option<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn han_fallback_respects_effective_session_environment() {
+        let allows = |pairs: &[(&str, &str)]| {
+            allows_font_fallback(|key| pairs.iter().find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_owned()))
+        };
+        assert!(allows(&[]));
+        assert!(allows(&[("LANG", "C.UTF-8")]));
+        assert!(allows(&[("LC_ALL", "C.UTF-8"), ("LANG", "ja_JP.UTF-8")]));
+        for key in ["LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LANG", "LANGUAGE", "FC_LANG", "FONTCONFIG_PATH", "FONTCONFIG_FILE"] {
+            assert!(!allows(&[(key, "explicit")]));
+        }
+        assert!(!allows(&[("LC_ALL", ""), ("LANG", "zh_TW.UTF-8")]));
+    }
 
     #[test]
     fn parses_nul_env_ignoring_profile_banner() {
