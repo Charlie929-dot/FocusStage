@@ -139,23 +139,25 @@ focusstage launch --ensure-daemon --kind chromium chromium
 focusstage open --ensure-daemon https://example.com
 focusstage settings get
 
-# MCP 客户端入口（stdio）
-wsl.exe -d Ubuntu -e /usr/local/bin/focusstage mcp
+# Linux MCP 客户端入口（stdio，与 focusstaged 使用同一 Linux 用户）
+/usr/local/bin/focusstage mcp
 ```
 
-仓库根目录已提供项目级 `.mcp.json`；使用非 `Ubuntu` 的 WSL 发行版时，将其中的 `Ubuntu` 替换为对应名称即可。
+仓库自带 Linux 侧的项目级 MCP 配置：Claude Code 使用 `.mcp.json`，Codex（包括 T3 Code 中的 Codex）使用 `.codex/config.toml`。当 Harness 和 `focusstaged` 在同一 Linux 环境运行（包括同一个 WSL 发行版），Harness 可以直接调用 `focusstage`。从 Windows 安装 FocusStage 时，安装器会将这些 Linux 程序部署到 WSL，无需在 WSL 内另行安装。
 
 ```json
 {
   "mcpServers": {
     "focusstage": {
       "type": "stdio",
-      "command": "wsl.exe",
-      "args": ["-d", "Ubuntu", "-e", "/usr/local/bin/focusstage", "mcp"]
+      "command": "/usr/local/bin/focusstage",
+      "args": ["mcp"]
     }
   }
 }
 ```
+
+在 Linux 侧的 Harness 中信任此项目并开启新会话即可加载配置；Claude Code 还需允许项目 MCP。如果 Harness 本身运行在 Windows，则需要通过 `wsl.exe -d Ubuntu -e /usr/local/bin/focusstage mcp` 转接（按需替换发行版名）。Windows 安装器默认只为 Windows 侧的 Claude Code 注册该转接，不会自动注册 Windows 侧的 Codex。
 
 打开已安装的 GUI 应用时，先用 `stage_list_apps` 查目录（可传 `query`），再把返回的 `id` 作为 `stage_launch` 的 `app_id`。也可以传唯一的 `app_name`。目录启动复用启动器登记的命令和参数；`app` 仍可用于显式运行命令。
 
@@ -198,7 +200,7 @@ FocusStage/
 ├── .mcp.json                 # 项目级 MCP 配置示例
 ├── .github/workflows/        # GitHub Actions CI/CD（release.yml 发版流水线）
 ├── compositor/               # [WSL2] focusstaged：Rust + Smithay 合成器、Router、Stage Manager、SessionEnv、XDG/图标解析、DisplaySink
-├── mcp/                      # [WSL2] focusstage：CLI、应用卸载与 MCP 服务（通过 wsl.exe stdio 对外）
+├── mcp/                      # [Linux] focusstage：CLI、应用卸载与 MCP stdio 服务
 ├── tray/                     # [Win11] .NET 8 + WebView2 启动器（应用桌面 + 舞台中心）、托盘热键与 Direct2D 原生 Win32 宿主
 ├── packaging/                # Inno Setup 终端用户安装包配置（FocusStage.iss）
 └── scripts/                  # 开发部署、Release 独立安装、卸载、PAM/Polkit 授权与 MCP/启动辅助脚本
