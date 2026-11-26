@@ -1,0 +1,3 @@
+[mcp_servers.focusstage]
+command = "/usr/local/bin/focusstage"
+args = ["mcp"]

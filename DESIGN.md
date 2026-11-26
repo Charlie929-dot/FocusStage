@@ -245,7 +245,7 @@ FocusStage 要实现的体验：
 
 ## 5. AI 控制接口（MCP）
 
-Windows 上的 Agent 以 **stdio** 方式连接：MCP 配置中把命令设为 `wsl.exe -d Ubuntu -e focusstage mcp` 即可，不需要网络端口，也不涉及跨 VM 的 socket。
+Linux 上的 Agent 通过 **stdio** 直接启动 `/usr/local/bin/focusstage mcp`；MCP 服务再通过本地 Unix socket 连接同一用户的 `focusstaged`，不需要网络端口。Windows 上运行的 Agent 则通过 `wsl.exe -d Ubuntu -e /usr/local/bin/focusstage mcp` 启动 WSL 内的同一服务。
 
 ### 5.1 工具集
 
