@@ -93,6 +93,16 @@ powershell -ExecutionPolicy Bypass -File scripts/install.ps1
 powershell -ExecutionPolicy Bypass -File scripts/install.ps1 -WslRepo ~/src/FocusStage
 ```
 
+若当前就在 WSL 终端中，也可以直接运行封装脚本一键构建并默认部署到 Windows：
+
+```bash
+./scripts/deploy.sh
+# 若在 FocusStage 托管的窗口（如 IDE）中执行，保留当前窗口宿主：
+./scripts/deploy.sh --keep-window-host
+```
+
+如果直接在 Windows 文件资源管理器中从 `\\wsl.localhost\...` 打开安装脚本，请双击运行 `scripts/install.cmd`（会自动绕过 PowerShell UNC 执行策略限制并在结束时保留窗口提示）。
+
 安装完成后：
 - 双击桌面或开始菜单中的 **FocusStage** 打开统一应用启动器。启动器优先使用 Windows Hello，也可通过 Ubuntu 管理员密码验证。验证后会进入 WSL 默认账号的桌面会话。`root` 直接使用现有权限，有复用授权的普通管理员可在启动器打开期间免重复执行 `sudo` 和标准 Polkit 验证。最小化会保留授权，关闭到托盘会撤销。已启动的提权进程会继续运行。
 - 安装器为 WSL 默认的非 `root` 管理员接入 PAM 和 Polkit，并关闭该账号的 `sudo` 密码缓存。若 WSL 默认账号是 `root`，Linux 密码备选会使用此前配置的非 `root` 管理员。没有这个账号时可用 Windows Hello。卸载 FocusStage 时会移除授权设置。

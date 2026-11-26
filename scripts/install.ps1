@@ -4,7 +4,8 @@ param(
     [switch]$SkipRustBuild,
     [switch]$SkipTrayBuild,
     [switch]$NoLaunch,
-    [switch]$SkipMcpConfig
+    [switch]$SkipMcpConfig,
+    [switch]$KeepWindowHost
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,7 +34,7 @@ if (-not [string]::IsNullOrWhiteSpace($WslRepo)) {
     }
     $RepoRoot = $RepoRoot.Trim()
 } else {
-    $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
     if ((-not $PSBoundParameters.ContainsKey('Distro')) -and ($RepoRoot -match '^\\\\(?:wsl\.localhost|wsl\$)\\([^\\]+)\\')) {
         $Distro = $Matches[1]
     }
@@ -109,20 +110,43 @@ function Copy-DirectoryViaWsl {
     }
 }
 
+function Invoke-WslBash {
+    param(
+        [string]$DistroName,
+        [string]$Script,
+        [switch]$AsRoot
+    )
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("set -e`n$Script`n"))
+    $wslArgs = @("-d", $DistroName)
+    if ($AsRoot) {
+        $wslArgs += @("-u", "root")
+    }
+    $wslArgs += @("-e", "bash", "-lc", "printf %s $b64 | base64 -d | bash")
+    & wsl.exe @wslArgs
+    return $LASTEXITCODE
+}
+
 $isVirtualized = Test-PathVirtualized -DistroName $Distro -DirectoryPath $InstallDir
 if ($isVirtualized) {
     Write-Host "Detected MSIX/VFS filesystem redirection on '$InstallDir'; deploying to real NTFS via WSL." -ForegroundColor Yellow
 }
 
 Write-Host "[1/5] Stopping existing FocusStage processes..." -ForegroundColor Cyan
-wsl.exe -d $Distro -e bash -lc "focusstage shutdown >/dev/null 2>&1 || pkill -x focusstaged >/dev/null 2>&1 || true"
-Get-Process -Name "FocusStage", "FocusStageTray" -ErrorAction SilentlyContinue | Stop-Process -Force
+if ($KeepWindowHost) {
+    Get-CimInstance Win32_Process -Filter "name='FocusStage.exe'" |
+        Where-Object { $_.CommandLine -notlike '*--window-host*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Get-Process -Name "FocusStageTray" -ErrorAction SilentlyContinue | Stop-Process -Force
+} else {
+    Invoke-WslBash -DistroName $Distro -Script "focusstage shutdown >/dev/null 2>&1 || pkill -x focusstaged >/dev/null 2>&1 || true" | Out-Null
+    Get-Process -Name "FocusStage", "FocusStageTray" -ErrorAction SilentlyContinue | Stop-Process -Force
+}
 Start-Sleep -Milliseconds 300
 
 if (-not $SkipRustBuild) {
     Write-Host "[2/5] Building focusstaged & focusstage (Release) in WSL '$Distro'..." -ForegroundColor Cyan
-    wsl.exe -d $Distro -e bash -lc "cd '$WslRepo' && cargo build --workspace --release"
-    if ($LASTEXITCODE -ne 0) {
+    $repoEsc = $WslRepo -replace "'", "'\\''"
+    if ((Invoke-WslBash -DistroName $Distro -Script "cd '$repoEsc' && cargo build --workspace --release") -ne 0) {
         throw "cargo build --workspace --release failed."
     }
 } else {
@@ -131,25 +155,31 @@ if (-not $SkipRustBuild) {
 
 Write-Host "[3/5] Installing WSL binaries and desktop helpers..." -ForegroundColor Cyan
 $desktopPackages = 'python3 pkexec gnome-keyring xdg-desktop-portal xdg-desktop-portal-gtk fonts-noto-cjk xwayland xdg-utils desktop-file-utils iproute2 libcap2-bin'
-$installCmd = @(
+$repoEsc = $WslRepo -replace "'", "'\\''"
+$installScript = @(
     "install -d -m 755 /usr/local/libexec",
-    "install -m 755 '$WslRepo/target/release/focusstaged' /usr/local/bin/focusstaged",
-    "install -m 755 '$WslRepo/target/release/focusstage' /usr/local/bin/focusstage",
-    "install -m 755 '$WslRepo/target/release/focusstage-tun' /usr/local/libexec/focusstage-tun",
-    "sed 's/\r`$//' '$WslRepo/scripts/focusstage-launch' > /usr/local/bin/focusstage-launch",
+    "install -m 755 '$repoEsc/target/release/focusstaged' /usr/local/bin/focusstaged",
+    "install -m 755 '$repoEsc/target/release/focusstage' /usr/local/bin/focusstage",
+    "install -m 755 '$repoEsc/target/release/focusstage-tun' /usr/local/libexec/focusstage-tun",
+    "sed 's/\r$//' '$repoEsc/scripts/focusstage-launch' > /usr/local/bin/focusstage-launch",
     "chmod 755 /usr/local/bin/focusstage-launch",
-    "sed 's/\r`$//' '$WslRepo/scripts/focusstage-open' > /usr/local/bin/focusstage-open",
+    "sed 's/\r$//' '$repoEsc/scripts/focusstage-open' > /usr/local/bin/focusstage-open",
     "chmod 755 /usr/local/bin/focusstage-open",
     "if command -v apt-get >/dev/null 2>&1 && ! dpkg -s $desktopPackages >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-upgrade $desktopPackages && fc-cache -f >/dev/null 2>&1; fi",
     "setcap cap_net_admin,cap_dac_override=ep /usr/local/libexec/focusstage-tun",
     "if test -f /usr/local/libexec/focusstage-auth; then /usr/bin/python3 -I /usr/local/libexec/focusstage-auth remove; fi",
     "/usr/local/bin/focusstage --json sync-apps --uid $WslUid >/dev/null"
-) -join " && "
-wsl.exe -d $Distro -u root -e bash -lc $installCmd
-if ($LASTEXITCODE -ne 0) {
+) -join "`n"
+if ((Invoke-WslBash -DistroName $Distro -AsRoot -Script $installScript) -ne 0) {
     throw "Failed to install WSL binaries or run sync-apps."
 }
-wsl.exe -d $Distro -e bash -lc "if command -v gsettings >/dev/null 2>&1; then if gsettings writable org.gnome.desktop.wm.preferences button-layout 2>/dev/null | grep -qx true; then gsettings set org.gnome.desktop.wm.preferences button-layout ':minimize,maximize,close'; fi; if gsettings writable org.gnome.desktop.interface toolkit-accessibility 2>/dev/null | grep -qx true; then gsettings set org.gnome.desktop.interface toolkit-accessibility true; fi; fi" | Out-Null
+$gsettingsScript = @(
+    "if command -v gsettings >/dev/null 2>&1; then",
+    "  if gsettings writable org.gnome.desktop.wm.preferences button-layout 2>/dev/null | grep -qx true; then gsettings set org.gnome.desktop.wm.preferences button-layout ':minimize,maximize,close'; fi",
+    "  if gsettings writable org.gnome.desktop.interface toolkit-accessibility 2>/dev/null | grep -qx true; then gsettings set org.gnome.desktop.interface toolkit-accessibility true; fi",
+    "fi"
+) -join "`n"
+Invoke-WslBash -DistroName $Distro -Script $gsettingsScript | Out-Null
 
 $exePath = Join-Path $InstallDir "FocusStage.exe"
 $stagedExePath = $null
@@ -218,7 +248,24 @@ if (-not $SkipTrayBuild) {
         Copy-DirectoryViaWsl -DistroName $Distro -SourceDir $PublishDir -DestinationDir $InstallDir
     } else {
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-        Copy-Item -Path (Join-Path $PublishDir "*") -Destination $InstallDir -Recurse -Force
+        Get-ChildItem -Path $InstallDir -Filter '*.old.*' -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+        $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        foreach ($item in (Get-ChildItem -Path $PublishDir)) {
+            $dst = Join-Path $InstallDir $item.Name
+            if ($item.PSIsContainer) {
+                Copy-Item -Path $item.FullName -Destination $InstallDir -Recurse -Force
+                continue
+            }
+            try {
+                Copy-Item -LiteralPath $item.FullName -Destination $dst -Force
+            } catch {
+                if (Test-Path -LiteralPath $dst) {
+                    Move-Item -LiteralPath $dst -Destination "$dst.old.$stamp" -Force
+                }
+                Copy-Item -LiteralPath $item.FullName -Destination $dst -Force
+            }
+        }
     }
 } else {
     Write-Host "[4/5] Skipping Windows Launcher & Tray build (-SkipTrayBuild)." -ForegroundColor Yellow
@@ -248,9 +295,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 $shortcutRunner = if ($stagedExePath) { $stagedExePath } elseif (-not $isVirtualized) { $exePath } else { $null }
 if ($shortcutRunner) {
-    & $shortcutRunner --sync-shortcuts --distro $Distro
-    if ($LASTEXITCODE -ne 0) {
-        throw "FocusStage --sync-shortcuts failed."
+    $syncProc = Start-Process -FilePath $shortcutRunner -ArgumentList @("--sync-shortcuts", "--distro", $Distro) -Wait -PassThru
+    if ($syncProc.ExitCode -ne 0) {
+        throw "FocusStage --sync-shortcuts failed (exit code $($syncProc.ExitCode))."
     }
     if ($isVirtualized -and $stagedExePath) {
         $virtualIconsDir = Join-Path $InstallDir "icons"
