@@ -5,6 +5,13 @@ All notable changes to FocusStage are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Replaced OS-specific repository-level `.mcp.json` and `.codex/config.toml` with unified dual-side user-level global MCP registration (`scripts/mcp-config.py`) across Windows (`wsl.exe` bridge) and WSL (native `/usr/local/bin/focusstage`) for both Claude Code and Codex, preventing Windows clients from being overridden when opened in the repository directory.
+- Updated `scripts/uninstall.ps1` to cleanly remove `focusstage` MCP entries from both Windows and WSL Claude Code / Codex user configs.
+
 ## [0.1.0] - 2026-11-27
 
 First public release of **FocusStage**.

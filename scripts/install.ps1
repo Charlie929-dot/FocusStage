@@ -320,15 +320,14 @@ if ($shortcutRunner) {
 }
 
 if (-not $SkipMcpConfig) {
-    Write-Host "Registering FocusStage with Claude Code MCP..." -ForegroundColor Cyan
-    $claudeConfig = Join-Path $HOME ".claude.json"
-    $wslConfig = wsl.exe -d $Distro -e wslpath -a ($claudeConfig -replace '\\', '/')
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($wslConfig)) {
-        throw "Failed to resolve the Claude Code configuration path in WSL."
+    Write-Host "Registering FocusStage MCP for Claude Code and Codex (Windows & WSL)..." -ForegroundColor Cyan
+    $wslWinHome = wsl.exe -d $Distro -e wslpath -a ($HOME -replace '\\', '/')
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($wslWinHome)) {
+        throw "Failed to resolve the Windows user profile path in WSL."
     }
-    wsl.exe -d $Distro -e python3 -I "$WslRepo/scripts/claude-mcp.py" $wslConfig.Trim() --distro $Distro
+    wsl.exe -d $Distro -e python3 -I "$WslRepo/scripts/mcp-config.py" --windows-home $wslWinHome.Trim() --distro $Distro
     if ($LASTEXITCODE -ne 0) {
-        throw "Failed to register the Claude Code MCP server."
+        throw "Failed to register the FocusStage MCP server."
     }
 }
 

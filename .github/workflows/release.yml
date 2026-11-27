@@ -151,7 +151,7 @@ jobs:
           Copy-Item scripts/install-release.ps1 dist/payload/install-release.ps1 -Force
           Copy-Item scripts/focusstage-launch dist/payload/scripts/focusstage-launch -Force
           Copy-Item scripts/focusstage-open dist/payload/scripts/focusstage-open -Force
-          Copy-Item scripts/claude-mcp.py dist/payload/scripts/claude-mcp.py -Force
+          Copy-Item scripts/mcp-config.py dist/payload/scripts/mcp-config.py -Force
           Copy-Item scripts/49-focusstage-gvfs-admin.rules dist/payload/scripts/49-focusstage-gvfs-admin.rules -Force
           Copy-Item scripts/uninstall.ps1 dist/payload/scripts/uninstall.ps1 -Force
 

@@ -41,22 +41,23 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "Removing FocusStage desktop wrappers..." -ForegroundColor Cyan
 wsl.exe -d $Distro -u root -e bash -lc "/usr/local/bin/focusstage sync-apps --remove >/dev/null 2>&1 || true; rm -f /usr/local/bin/focusstaged /usr/local/bin/focusstage /usr/local/libexec/focusstage-tun /usr/local/bin/focusstage-launch /usr/local/bin/focusstage-open /etc/polkit-1/rules.d/49-focusstage-gvfs-admin.rules"
 
-$claudeConfig = Join-Path $HOME ".claude.json"
-if (Test-Path -LiteralPath $claudeConfig) {
-    Write-Host "Removing FocusStage from Claude Code MCP configuration..." -ForegroundColor Cyan
-    $wslConfig = wsl.exe -d $Distro -e wslpath -a ($claudeConfig -replace '\\', '/')
-    $mcpHelper = Join-Path $PSScriptRoot "claude-mcp.py"
-    if (-not (Test-Path -LiteralPath $mcpHelper)) {
-        $mcpHelper = Join-Path $installDir "claude-mcp.py"
-    }
-    $wslHelper = wsl.exe -d $Distro -e wslpath -a ($mcpHelper -replace '\\', '/')
-    if ([string]::IsNullOrWhiteSpace($wslConfig) -or [string]::IsNullOrWhiteSpace($wslHelper)) {
-        Write-Warning "Failed to resolve the Claude Code configuration or helper path in WSL."
-    } else {
-        wsl.exe -d $Distro -e python3 -I $wslHelper.Trim() $wslConfig.Trim() --remove
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "The FocusStage entry could not be removed from Claude Code."
-        }
+Write-Host "Removing FocusStage from Claude Code and Codex MCP configurations..." -ForegroundColor Cyan
+$wslWinHome = wsl.exe -d $Distro -e wslpath -a ($HOME -replace '\\', '/')
+$mcpHelper = Join-Path $PSScriptRoot "mcp-config.py"
+if (-not (Test-Path -LiteralPath $mcpHelper)) {
+    $mcpHelper = Join-Path $installDir "mcp-config.py"
+}
+$wslHelper = if (Test-Path -LiteralPath $mcpHelper) {
+    wsl.exe -d $Distro -e wslpath -a ($mcpHelper -replace '\\', '/')
+} else {
+    ""
+}
+if ([string]::IsNullOrWhiteSpace($wslWinHome) -or [string]::IsNullOrWhiteSpace($wslHelper)) {
+    Write-Warning "Failed to resolve the MCP configuration or helper path in WSL."
+} else {
+    wsl.exe -d $Distro -e python3 -I $wslHelper.Trim() --windows-home $wslWinHome.Trim() --remove
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "The FocusStage MCP entries could not be fully removed."
     }
 }
 

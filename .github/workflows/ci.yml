@@ -34,6 +34,9 @@ jobs:
       - name: Run workspace unit tests
         run: cargo test --workspace --locked
 
+      - name: Run MCP config helper tests
+        run: python3 -I scripts/test_mcp_config.py -v
+
   build-windows:
     name: Windows Launcher & Host Build (.NET 8)
     runs-on: windows-latest

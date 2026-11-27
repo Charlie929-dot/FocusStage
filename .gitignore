@@ -4,5 +4,7 @@ tray/obj/
 dist/
 .tmp_test/
 .claude/
+__pycache__/
+*.pyc
 *.user
 *.suo

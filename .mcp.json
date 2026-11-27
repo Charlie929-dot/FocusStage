@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "focusstage": {
-      "type": "stdio",
-      "command": "/usr/local/bin/focusstage",
-      "args": ["mcp"]
-    }
-  }
-}

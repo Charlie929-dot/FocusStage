@@ -25,7 +25,7 @@ Options:
   --skip-rust-build     Skip cargo build --workspace --release
   --skip-tray-build     Skip dotnet publish of Windows tray/launcher
   --no-launch           Do not launch FocusStage.exe after deploying
-  --skip-mcp-config     Do not update ~/.claude.json MCP configuration
+  --skip-mcp-config     Do not update Claude Code / Codex MCP configurations
   -h, --help            Show this help message
 EOF
 }
@@ -146,7 +146,7 @@ if ((! SKIP_TRAY_BUILD || ! SKIP_MCP_CONFIG)); then
 fi
 if ((! SKIP_MCP_CONFIG)); then
   windows_home=$(windows_env USERPROFILE) || fail 'Cannot read the Windows USERPROFILE directory.'
-  claude_config="$(wslpath -u "$windows_home")/.claude.json"
+  windows_home_wsl=$(wslpath -u "$windows_home")
 fi
 if ((SKIP_TRAY_BUILD)); then
   [[ -f "$HOST_EXE" ]] || fail "No installed Windows host at $HOST_EXE. Run without --skip-tray-build first."
@@ -244,7 +244,7 @@ WSL_USER
     "$HOST_EXE" --sync-shortcuts --distro "$DISTRO" </dev/null
 )
 if ((! SKIP_MCP_CONFIG)); then
-  python3 -I "$SCRIPT_DIR/claude-mcp.py" "$claude_config" --distro "$DISTRO"
+  python3 -I "$SCRIPT_DIR/mcp-config.py" --windows-home "$windows_home_wsl" --distro "$DISTRO"
 fi
 
 printf '\nFocusStage installed: %s\n' "$HOST_EXE"

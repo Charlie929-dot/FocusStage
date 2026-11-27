@@ -33,7 +33,7 @@ try {
         (Join-Path $LinuxPayloadDir "focusstage-tun"),
         (Join-Path $ScriptsPayloadDir "focusstage-launch"),
         (Join-Path $ScriptsPayloadDir "focusstage-open"),
-        (Join-Path $ScriptsPayloadDir "claude-mcp.py"),
+        (Join-Path $ScriptsPayloadDir "mcp-config.py"),
         (Join-Path $ScriptsPayloadDir "uninstall.ps1")
     )
     foreach ($file in $requiredFiles) {
@@ -303,7 +303,7 @@ try {
     try {
         Copy-Item -Path (Join-Path $WinPayloadDir "*") -Destination $deployStage -Recurse -Force
         Copy-Item -LiteralPath (Join-Path $ScriptsPayloadDir "uninstall.ps1") -Destination (Join-Path $deployStage "uninstall.ps1") -Force
-        Copy-Item -LiteralPath (Join-Path $ScriptsPayloadDir "claude-mcp.py") -Destination (Join-Path $deployStage "claude-mcp.py") -Force
+        Copy-Item -LiteralPath (Join-Path $ScriptsPayloadDir "mcp-config.py") -Destination (Join-Path $deployStage "mcp-config.py") -Force
         [IO.File]::WriteAllText((Join-Path $deployStage "distro.txt"), $Distro + "`n")
 
         if ($isVirtualized) {
@@ -354,13 +354,12 @@ try {
     }
 
     if (-not $SkipMcpConfig) {
-        Write-Host "Registering FocusStage with Claude Code MCP..." -ForegroundColor Cyan
-        $claudeConfig = Join-Path $HOME ".claude.json"
-        $wslConfig = Convert-ToWslPath -DistroName $Distro -WinPath $claudeConfig
-        $wslMcpHelper = Convert-ToWslPath -DistroName $Distro -WinPath (Join-Path $ScriptsPayloadDir "claude-mcp.py")
-        wsl.exe -d $Distro -e python3 -I $wslMcpHelper $wslConfig --distro $Distro
+        Write-Host "Registering FocusStage MCP for Claude Code and Codex (Windows & WSL)..." -ForegroundColor Cyan
+        $wslWinHome = Convert-ToWslPath -DistroName $Distro -WinPath $HOME
+        $wslMcpHelper = Convert-ToWslPath -DistroName $Distro -WinPath (Join-Path $ScriptsPayloadDir "mcp-config.py")
+        wsl.exe -d $Distro -e python3 -I $wslMcpHelper --windows-home $wslWinHome --distro $Distro
         if ($LASTEXITCODE -ne 0) {
-            throw "Failed to register the Claude Code MCP server."
+            throw "Failed to register the FocusStage MCP server."
         }
     }
 

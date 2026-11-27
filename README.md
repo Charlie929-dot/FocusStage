@@ -88,7 +88,7 @@ WSL2
 
 - 自动检测本机 WSL2 与 Ubuntu 发行版（不写死发行版名称，缺失时可引导安装 `Ubuntu-24.04`，多发行版时支持选择）；
 - 通过 `apt-get install --no-upgrade` 仅补齐缺失的桌面组件与运行库（`libpixman-1-0`、`libwayland-server0`、`libxkbcommon0`、`libffi8` 等）；
-- 部署预编译 `focusstaged` / `focusstage` 与自包含 `FocusStage.exe` 到 `%LOCALAPPDATA%\FocusStage`（自动旁路 MSIX 文件系统虚拟化），登记宿主路径、同步快捷方式并注册 Claude Code MCP，支持在 Windows「应用和功能」中直接卸载。
+- 部署预编译 `focusstaged` / `focusstage` 与自包含 `FocusStage.exe` 到 `%LOCALAPPDATA%\FocusStage`（自动旁路 MSIX 文件系统虚拟化），登记宿主路径、同步快捷方式并自动为 Windows 与 WSL 双侧的 Claude Code / Codex 注册全局 MCP，支持在 Windows「应用和功能」中直接卸载。
 
 #### 方式 B：从源码一键构建部署（开发者）
 
@@ -114,8 +114,11 @@ Windows 安装器可用 `-Distro` 选择发行版，或用 `-WslRepo` 指定该�
 - 双击桌面或开始菜单中的 **FocusStage** 打开统一应用启动器（包含「应用桌面」与「舞台中心」两个顶层视图）。
 - 需要提权或解锁密钥环时，FocusStage 会弹出原生 Win32 Polkit / 解锁弹窗；你也可以在 **舞台中心 → 账号与凭据** 中管理 WSL Ubuntu 账号，并通过 **Windows Hello（DPAPI 加密托管）** 保护 Linux / GNOME Keyring 密码（不会明文写入 WSL），实现刷脸/指纹/PIN 一键授权与解锁。
 - 开始菜单 `Programs\FocusStage\` 下会自动生成全部 Linux 应用的独立快捷方式（按 Linux 图标主题解析并带图标），可右键“固定到开始屏幕”或“固定到任务栏”。
-- 安装器会把 `focusstage` 注册到 Windows 用户的 Claude Code MCP 配置 `~/.claude.json`，指向安装所用的 WSL 发行版。`install.sh` 默认使用当前发行版，可用 `--distro` 指定；如不需要 MCP 注册，可用 `--skip-mcp-config`（Windows 安装器用 `-SkipMcpConfig`）。
-- 运行 `powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1` 会自动读取部署时记录的 `distro.txt`（或使用 `-Distro`），清理 `~/.claude.json` MCP 条目、移除协议关联、授权配置与快捷方式并删除安装目录（Inno Setup 卸载器传入 `-KeepInstallDir` 后由安装器自身清理目录）。
+- 安装器会自动将 `focusstage` 注册为用户级全局 MCP（无需仓库级 `.mcp.json` / `.codex/config.toml`，在任意工作目录均可使用）：
+  - **Windows 侧**（`%USERPROFILE%\.claude.json`、`%USERPROFILE%\.codex\config.toml`）：通过 `wsl.exe -d <发行版> -e /usr/local/bin/focusstage mcp` 转接；
+  - **WSL 侧**（`~/.claude.json`、`~/.codex/config.toml`）：直接调用原生 `/usr/local/bin/focusstage mcp`。
+  `install.sh` 默认使用当前发行版，可用 `--distro` 指定；如不需要自动写入 MCP 配置，可用 `--skip-mcp-config`（Windows 安装器用 `-SkipMcpConfig`）。
+- 运行 `powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1` 会自动读取部署时记录的 `distro.txt`（或使用 `-Distro`），同步清理 Windows 与 WSL 双侧 Claude Code / Codex 的 `focusstage` MCP 条目、移除协议关联、授权配置与快捷方式并删除安装目录（Inno Setup 卸载器传入 `-KeepInstallDir` 后由安装器自身清理目录）。
 
 ### 2. 手动构建与 CLI / MCP 用法
 
@@ -149,21 +152,32 @@ focusstage settings get
 /usr/local/bin/focusstage mcp
 ```
 
-仓库自带 Linux 侧的项目级 MCP 配置：Claude Code 使用 `.mcp.json`，Codex（包括 T3 Code 中的 Codex）使用 `.codex/config.toml`。当 Harness 和 `focusstaged` 在同一 Linux 环境运行（包括同一个 WSL 发行版），Harness 可以直接调用 `focusstage`。从 Windows 安装 FocusStage 时，安装器会将这些 Linux 程序部署到 WSL，无需在 WSL 内另行安装。
+安装器会自动将 `focusstage` 注册到 Windows 侧和 WSL 侧的用户级全局配置（Claude Code 的 `~/.claude.json` 与 Codex 的 `~/.codex/config.toml`），安装完成后新开会话即可在任意目录使用。如需手动接入其他 MCP 客户端，可按运行环境选择对应命令：
 
-```json
-{
-  "mcpServers": {
-    "focusstage": {
-      "type": "stdio",
-      "command": "/usr/local/bin/focusstage",
-      "args": ["mcp"]
+- **Linux / WSL 侧客户端**（与 `focusstaged` 同属同一 WSL 发行版与用户）：
+  ```json
+  {
+    "mcpServers": {
+      "focusstage": {
+        "type": "stdio",
+        "command": "/usr/local/bin/focusstage",
+        "args": ["mcp"]
+      }
     }
   }
-}
-```
-
-在 Linux 侧的 Harness 中信任此项目并开启新会话即可加载配置；Claude Code 还需允许项目 MCP。如果 Harness 本身运行在 Windows，则需要通过 `wsl.exe -d Ubuntu -e /usr/local/bin/focusstage mcp` 转接（按需替换发行版名）。Windows 安装器默认只为 Windows 侧的 Claude Code 注册该转接，不会自动注册 Windows 侧的 Codex。
+  ```
+- **Windows 侧客户端**（按需替换 `Ubuntu` 为实际发行版名）：
+  ```json
+  {
+    "mcpServers": {
+      "focusstage": {
+        "type": "stdio",
+        "command": "wsl.exe",
+        "args": ["-d", "Ubuntu", "-e", "/usr/local/bin/focusstage", "mcp"]
+      }
+    }
+  }
+  ```
 
 打开已安装的 GUI 应用时，先用 `stage_list_apps` 查目录（可传 `query`），再把返回的 `id` 作为 `stage_launch` 的 `app_id`。也可以传唯一的 `app_name`。目录启动复用启动器登记的命令和参数；`app` 仍可用于显式运行命令。
 
@@ -212,8 +226,6 @@ FocusStage/
 ├── CONTRIBUTING.md           # 参与贡献与本地开发指南
 ├── SECURITY.md               # 安全策略与漏洞反馈方式
 ├── LICENSE                   # MIT 开源许可协议
-├── .mcp.json                 # Linux 侧 Claude Code 项目级 MCP 配置
-├── .codex/config.toml        # Linux 侧 Codex 项目级 MCP 配置
 ├── .github/workflows/        # GitHub Actions（ci.yml 与 release.yml）
 ├── compositor/               # [WSL2] focusstaged 与 focusstage-tun：Rust + Smithay 合成器、Router、Stage Manager、SessionEnv、XDG/图标解析、DisplaySink、透明代理桥
 ├── mcp/                      # [Linux] focusstage：CLI、应用卸载与 MCP stdio 服务
