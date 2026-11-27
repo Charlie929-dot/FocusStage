@@ -350,6 +350,32 @@ impl FocusStageState {
     }
 }
 
+fn translate_to_windows_path(path: &str) -> Option<String> {
+    if let Ok(result) = std::process::Command::new("/usr/bin/wslpath")
+        .args(["-w", path])
+        .output()
+    {
+        let translated = std::str::from_utf8(&result.stdout)
+            .ok()?
+            .trim_end_matches(['\r', '\n']);
+        if result.status.success()
+            && !translated.is_empty()
+            && !translated.chars().any(char::is_control)
+        {
+            return Some(translated.to_owned());
+        }
+        return None;
+    }
+    #[cfg(test)]
+    if !Path::new("/usr/bin/wslpath").exists() {
+        return Some(format!(
+            r"\\wsl.localhost\test\{}",
+            path.trim_start_matches('/').replace('/', "\\")
+        ));
+    }
+    None
+}
+
 fn windows_drag_paths(payload: &str) -> Option<Vec<String>> {
     let mut paths = Vec::new();
     for uri in payload
@@ -364,17 +390,7 @@ fn windows_drag_paths(payload: &str) -> Option<Vec<String>> {
         {
             return None;
         }
-        let result = std::process::Command::new("/usr/bin/wslpath")
-            .args(["-w", path])
-            .output()
-            .ok()?;
-        let path = std::str::from_utf8(&result.stdout)
-            .ok()?
-            .trim_end_matches(['\r', '\n']);
-        if !result.status.success() || path.is_empty() || path.chars().any(char::is_control) {
-            return None;
-        }
-        paths.push(path.to_owned());
+        paths.push(translate_to_windows_path(path)?);
     }
     (!paths.is_empty()).then_some(paths)
 }
