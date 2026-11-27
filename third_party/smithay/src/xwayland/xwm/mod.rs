@@ -113,7 +113,7 @@ use std::{
     sync::{atomic::Ordering, Arc},
 };
 use tracing::{debug, debug_span, error, info, trace, warn};
-use wayland_server::Resource;
+use wayland_server::{backend::ClientId, Resource};
 
 pub use x11rb::protocol::xproto::Window as X11Window;
 use x11rb::{
@@ -400,6 +400,7 @@ pub trait XwmHandler {
 #[derive(Debug)]
 pub struct X11Wm {
     id: XwmId,
+    client_id: ClientId,
     conn: Arc<RustConnection>,
     client_scale: Arc<AtomicF64>,
     screen: Screen,
@@ -868,6 +869,8 @@ impl X11Wm {
         let conn = Arc::new(conn);
         let source = X11Source::new(Arc::clone(&conn), win, atoms._SMITHAY_CLOSE_CONNECTION);
 
+        let client_id = client.id();
+        let source_client_id = client_id.clone();
         let client_data = client.get_data::<XWaylandClientData>().unwrap();
         let client_scale = client_data.compositor_state.clone_client_scale();
 
@@ -889,6 +892,7 @@ impl X11Wm {
         drop(_guard);
         let wm = Self {
             id,
+            client_id,
             conn,
             client_scale,
             screen,
@@ -915,6 +919,8 @@ impl X11Wm {
                 }
             }
             calloop::channel::Event::Closed => {
+                xwayland_shell::XWaylandShellHandler::xwayland_shell_state(data)
+                    .remove_client(&source_client_id);
                 data.disconnected(id);
             }
         })?;
@@ -1680,6 +1686,7 @@ where
         }
         Event::UnmapNotify(n) => {
             if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window).cloned() {
+                xwm.unpaired_surfaces.retain(|_, w| *w != surface.window_id());
                 xwm.client_list.retain(|w| *w != surface.window_id());
                 xwm.client_list_stacking.retain(|w| *w != surface.window_id());
                 {
@@ -1763,6 +1770,7 @@ where
 
             if let Some(pos) = xwm.windows.iter().position(|x| x.window_id() == n.window) {
                 let surface = xwm.windows.remove(pos);
+                xwm.unpaired_surfaces.retain(|_, w| *w != surface.window_id());
                 surface.state.lock().unwrap().alive = false;
                 drop(_guard);
                 state.destroyed_window(xwm_id, surface);
@@ -2295,6 +2303,7 @@ where
                         .find(|x| x.window_id() == msg.window || x.mapped_window_id() == Some(msg.window))
                         .cloned()
                     {
+                        let client_id = xwm.client_id.clone();
                         drop(_guard);
 
                         let serial_lo = msg.data.as_data32()[0];
@@ -2307,8 +2316,7 @@ where
 
                         if let Some(wl_surface) =
                             xwayland_shell::XWaylandShellHandler::xwayland_shell_state(state)
-                                .surface_for_serial(serial)
-                                .clone()
+                                .take_surface_for_serial(&client_id, serial)
                         {
                             debug!(
                                 window = ?xsurface.window_id(),

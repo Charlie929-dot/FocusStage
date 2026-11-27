@@ -380,18 +380,30 @@ impl ClientData for XWaylandClientData {
             error!("Xwayland disconnected: {}", err);
         }
 
-        let mut child = self.child.lock().unwrap().take().unwrap();
-        thread::spawn(move || {
-            if let Ok(status) = child.wait() {
-                if !status.success() {
-                    error!("Xwayland terminated: {}", status);
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            thread::spawn(move || {
+                if let Ok(status) = child.wait() {
+                    if !status.success() {
+                        error!("Xwayland terminated: {}", status);
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 }
 
 impl XWaylandClientData {
+    /// Construct an isolated client-data entry without an Xwayland child process (for tests).
+    #[doc(hidden)]
+    pub fn new_detached() -> Self {
+        Self {
+            #[cfg(feature = "wayland_frontend")]
+            compositor_state: CompositorClientState::default(),
+            data_map: UserDataMap::new(),
+            child: Mutex::new(None),
+        }
+    }
+
     /// Access user_data map for a xwayland client
     pub fn user_data(&self) -> &UserDataMap {
         &self.data_map

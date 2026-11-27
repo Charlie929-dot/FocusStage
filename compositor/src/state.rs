@@ -687,6 +687,7 @@ mod tests {
         xdg_positioner as c_pos, xdg_popup as c_popup, xdg_surface as c_surface,
         xdg_toplevel as c_toplevel, xdg_wm_base as c_wm,
     };
+    use wayland_protocols::xwayland::shell::v1::client::{xwayland_shell_v1, xwayland_surface_v1};
 
     #[test]
     fn popup_constraint_target_flips_direct_and_nested_popups_within_stage() {
@@ -2823,5 +2824,239 @@ mod tests {
             log.lock().unwrap().cursors,
             vec![(w1_id.clone(), NativeCursor::Named("default"))]
         );
+    }
+
+    #[derive(Default)]
+    struct MiniXwaylandClient {
+        compositor: Option<wl_compositor::WlCompositor>,
+        xwayland_shell: Option<xwayland_shell_v1::XwaylandShellV1>,
+    }
+
+    impl wayland_client::Dispatch<wl_registry::WlRegistry, ()> for MiniXwaylandClient {
+        fn event(
+            state: &mut Self,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            _: &wayland_client::Connection,
+            qh: &wayland_client::QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } = event
+            {
+                match interface.as_str() {
+                    "wl_compositor" => {
+                        state.compositor = Some(
+                            registry.bind::<wl_compositor::WlCompositor, _, _>(
+                                name,
+                                version.min(6),
+                                qh,
+                                (),
+                            ),
+                        );
+                    }
+                    "xwayland_shell_v1" => {
+                        state.xwayland_shell = Some(
+                            registry.bind::<xwayland_shell_v1::XwaylandShellV1, _, _>(
+                                name,
+                                version.min(1),
+                                qh,
+                                (),
+                            ),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    wayland_client::delegate_noop!(MiniXwaylandClient: ignore wl_compositor::WlCompositor);
+    wayland_client::delegate_noop!(MiniXwaylandClient: ignore wl_surface::WlSurface);
+    wayland_client::delegate_noop!(MiniXwaylandClient: ignore xwayland_shell_v1::XwaylandShellV1);
+    wayland_client::delegate_noop!(MiniXwaylandClient: ignore xwayland_surface_v1::XwaylandSurfaceV1);
+
+    fn pump_mini(
+        display: &mut Display<FocusStageState>,
+        state: &mut FocusStageState,
+        conn: &wayland_client::Connection,
+        queue: &mut wayland_client::EventQueue<MiniXwaylandClient>,
+        client: &mut MiniXwaylandClient,
+    ) {
+        for _ in 0..4 {
+            let _ = conn.flush();
+            display.dispatch_clients(state).unwrap();
+            display.flush_clients().unwrap();
+            if let Some(guard) = conn.prepare_read() {
+                let _ = guard.read();
+            }
+            queue.dispatch_pending(client).unwrap();
+        }
+    }
+
+    #[test]
+    fn xwayland_shell_serials_are_isolated_per_client_and_cleaned_up() {
+        use std::os::unix::net::UnixStream;
+        use std::sync::Arc;
+        use smithay::wayland::compositor::with_states;
+        use smithay::wayland::xwayland_shell::XWaylandShellCachedState;
+        use smithay::xwayland::XWaylandClientData;
+
+        let event_loop = smithay::reexports::calloop::EventLoop::<FocusStageState>::try_new().unwrap();
+        let mut display = Display::<FocusStageState>::new().unwrap();
+        let mut dh = display.handle();
+        let mut state = FocusStageState::new(
+            &dh,
+            event_loop.handle(),
+            "focusstage-test-xwayland-shell".to_string(),
+            1.0,
+            60,
+            SavedRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            None,
+        );
+
+        let (server_a, client_a_sock) = UnixStream::pair().unwrap();
+        let (server_b, client_b_sock) = UnixStream::pair().unwrap();
+        client_a_sock.set_nonblocking(true).unwrap();
+        client_b_sock.set_nonblocking(true).unwrap();
+
+        let client_a = dh
+            .insert_client(server_a, Arc::new(XWaylandClientData::new_detached()))
+            .unwrap();
+        let client_b = dh
+            .insert_client(server_b, Arc::new(XWaylandClientData::new_detached()))
+            .unwrap();
+
+        let conn_a = wayland_client::Connection::from_socket(client_a_sock).unwrap();
+        let mut queue_a = conn_a.new_event_queue::<MiniXwaylandClient>();
+        let qh_a = queue_a.handle();
+        let mut mini_a = MiniXwaylandClient::default();
+        let _reg_a = conn_a.display().get_registry(&qh_a, ());
+
+        let conn_b = wayland_client::Connection::from_socket(client_b_sock).unwrap();
+        let mut queue_b = conn_b.new_event_queue::<MiniXwaylandClient>();
+        let qh_b = queue_b.handle();
+        let mut mini_b = MiniXwaylandClient::default();
+        let _reg_b = conn_b.display().get_registry(&qh_b, ());
+
+        pump_mini(&mut display, &mut state, &conn_a, &mut queue_a, &mut mini_a);
+        pump_mini(&mut display, &mut state, &conn_b, &mut queue_b, &mut mini_b);
+
+        let comp_a = mini_a.compositor.as_ref().expect("client A wl_compositor");
+        let shell_a = mini_a.xwayland_shell.as_ref().expect("client A xwayland_shell_v1");
+        let comp_b = mini_b.compositor.as_ref().expect("client B wl_compositor");
+        let shell_b = mini_b.xwayland_shell.as_ref().expect("client B xwayland_shell_v1");
+
+        // Client A creates surf_a1 (serial 1) and surf_a2 (serial 2) and commits both.
+        let surf_a1 = comp_a.create_surface(&qh_a, ());
+        let xsurf_a1 = shell_a.get_xwayland_surface(&surf_a1, &qh_a, ());
+        xsurf_a1.set_serial(1, 0);
+        surf_a1.commit();
+
+        let surf_a2 = comp_a.create_surface(&qh_a, ());
+        let xsurf_a2 = shell_a.get_xwayland_surface(&surf_a2, &qh_a, ());
+        xsurf_a2.set_serial(2, 0);
+        surf_a2.commit();
+
+        pump_mini(&mut display, &mut state, &conn_a, &mut queue_a, &mut mini_a);
+
+        assert!(state
+            .xwayland_shell_state
+            .surface_for_client_serial(&client_a.id(), 1)
+            .is_some());
+        assert!(state
+            .xwayland_shell_state
+            .surface_for_client_serial(&client_a.id(), 2)
+            .is_some());
+        assert!(state
+            .xwayland_shell_state
+            .surface_for_client_serial(&client_b.id(), 1)
+            .is_none());
+        assert!(state
+            .xwayland_shell_state
+            .surface_for_client_serial(&client_b.id(), 2)
+            .is_none());
+
+        // Taking serial 1 for client B must fail without evicting client A's surface.
+        assert!(state
+            .xwayland_shell_state
+            .take_surface_for_serial(&client_b.id(), 1)
+            .is_none());
+        assert!(state
+            .xwayland_shell_state
+            .surface_for_client_serial(&client_a.id(), 1)
+            .is_some());
+
+        // Client B creates surf_b1 (serial 1) and surf_b2 (serial 2) and commits both.
+        let surf_b1 = comp_b.create_surface(&qh_b, ());
+        let xsurf_b1 = shell_b.get_xwayland_surface(&surf_b1, &qh_b, ());
+        xsurf_b1.set_serial(1, 0);
+        surf_b1.commit();
+
+        let surf_b2 = comp_b.create_surface(&qh_b, ());
+        let xsurf_b2 = shell_b.get_xwayland_surface(&surf_b2, &qh_b, ());
+        xsurf_b2.set_serial(2, 0);
+        surf_b2.commit();
+
+        pump_mini(&mut display, &mut state, &conn_b, &mut queue_b, &mut mini_b);
+
+        // Consuming serial 1 on client B returns client B's surface once and consumes pending serial.
+        let taken_b1 = state
+            .xwayland_shell_state
+            .take_surface_for_serial(&client_b.id(), 1)
+            .expect("client B serial 1 should resolve");
+        assert_eq!(
+            taken_b1.client().map(|c| c.id()),
+            Some(client_b.id()),
+            "serial 1 for client B must belong to client B"
+        );
+        assert!(state
+            .xwayland_shell_state
+            .take_surface_for_serial(&client_b.id(), 1)
+            .is_none());
+
+        // Subsequent commit on surf_b1 must not re-insert serial 1 while current().serial remains Some(1).
+        surf_b1.commit();
+        pump_mini(&mut display, &mut state, &conn_b, &mut queue_b, &mut mini_b);
+        assert!(state
+            .xwayland_shell_state
+            .surface_for_client_serial(&client_b.id(), 1)
+            .is_none());
+        let committed_serial = with_states(&taken_b1, |states| {
+            states
+                .cached_state
+                .get::<XWaylandShellCachedState>()
+                .current()
+                .serial
+        });
+        assert_eq!(committed_serial, Some(1));
+
+        // Destroying surf_a2 cleans up client A's serial 2 entry.
+        xsurf_a2.destroy();
+        surf_a2.destroy();
+        pump_mini(&mut display, &mut state, &conn_a, &mut queue_a, &mut mini_a);
+        assert!(state
+            .xwayland_shell_state
+            .surface_for_client_serial(&client_a.id(), 2)
+            .is_none());
+
+        // Removing client A clears its remaining serials without touching client B's serial 2.
+        state.xwayland_shell_state.remove_client(&client_a.id());
+        assert!(state
+            .xwayland_shell_state
+            .surface_for_client_serial(&client_a.id(), 1)
+            .is_none());
+        assert!(state
+            .xwayland_shell_state
+            .surface_for_client_serial(&client_b.id(), 2)
+            .is_some());
     }
 }

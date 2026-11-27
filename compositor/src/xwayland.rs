@@ -53,6 +53,11 @@ impl XWaylandShellHandler for FocusStageState {
     fn surface_associated(&mut self, xwm_id: XwmId, surface: WlSurface, window: X11Surface) {
         if let Some(id) = self.window_id_for_toplevel(&StageToplevel::X11(window)) {
             self.set_window_mapped(&id, true);
+            if let Some((stage_id, _)) = id.rsplit_once('/') {
+                if let Some(stage) = self.stages.get_mut(stage_id) {
+                    stage.bump_window_frame(&id);
+                }
+            }
         } else if let Some(stage_id) = self.xwm_to_stage.get(&xwm_id) {
             if let Some(stage) = self.stages.get_mut(stage_id) {
                 stage.bump_frame();

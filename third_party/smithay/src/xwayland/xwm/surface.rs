@@ -20,7 +20,7 @@ use std::{
     sync::{atomic::Ordering, Arc, Mutex, Weak},
 };
 use tracing::warn;
-use wayland_server::protocol::wl_surface::WlSurface;
+use wayland_server::{protocol::wl_surface::WlSurface, Resource};
 
 use x11rb::{
     connection::Connection as _,
@@ -981,6 +981,20 @@ impl X11Relatable for X11Surface {
 
 impl X11Relatable for WlSurface {
     fn is_window(&self, window: &X11Surface) -> bool {
+        let Some(xwm_id) = window.xwm_id() else {
+            return false;
+        };
+        let same_xwm = self
+            .client()
+            .and_then(|client| {
+                client
+                    .get_data::<crate::xwayland::XWaylandClientData>()
+                    .and_then(|data| data.user_data().get::<XwmId>().copied())
+            })
+            .is_some_and(|surface_xwm| surface_xwm == xwm_id);
+        if !same_xwm {
+            return false;
+        }
         let serial = compositor::with_states(self, |states| {
             states
                 .cached_state
@@ -989,7 +1003,7 @@ impl X11Relatable for WlSurface {
                 .serial
         });
 
-        window.wl_surface_serial() == serial
+        serial.is_some() && window.wl_surface_serial() == serial
     }
 }
 

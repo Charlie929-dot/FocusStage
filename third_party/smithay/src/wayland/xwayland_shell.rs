@@ -67,7 +67,7 @@ use wayland_protocols::xwayland::shell::v1::server::{
     xwayland_surface_v1::{self, XwaylandSurfaceV1},
 };
 use wayland_server::{
-    backend::GlobalId,
+    backend::{ClientId, GlobalId},
     protocol::wl_surface::{self, WlSurface},
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
@@ -86,7 +86,7 @@ const VERSION: u32 = 1;
 #[derive(Debug, Clone)]
 pub struct XWaylandShellState {
     global: GlobalId,
-    by_serial: HashMap<u64, WlSurface>,
+    by_serial: HashMap<(ClientId, u64), WlSurface>,
 }
 
 impl XWaylandShellState {
@@ -113,7 +113,29 @@ impl XWaylandShellState {
 
     /// Retrieves the surface for a given serial.
     pub fn surface_for_serial(&self, serial: u64) -> Option<WlSurface> {
-        self.by_serial.get(&serial).cloned()
+        self.by_serial
+            .iter()
+            .find_map(|((_, s), surface)| (*s == serial && surface.is_alive()).then(|| surface.clone()))
+    }
+
+    /// Retrieves the surface for a given XWayland client and serial.
+    pub fn surface_for_client_serial(&self, client_id: &ClientId, serial: u64) -> Option<WlSurface> {
+        self.by_serial
+            .get(&(client_id.clone(), serial))
+            .filter(|surface| surface.is_alive())
+            .cloned()
+    }
+
+    /// Consume and return the alive `wl_surface` associated with `(client_id, serial)`, if any.
+    pub fn take_surface_for_serial(&mut self, client_id: &ClientId, serial: u64) -> Option<WlSurface> {
+        self.by_serial
+            .remove(&(client_id.clone(), serial))
+            .filter(|surface| surface.is_alive())
+    }
+
+    /// Remove all tracked pending serials belonging to `client_id`.
+    pub fn remove_client(&mut self, client_id: &ClientId) {
+        self.by_serial.retain(|(cid, _), _| cid != client_id);
     }
 }
 
@@ -145,11 +167,15 @@ pub struct XWaylandShellCachedState {
 
 impl compositor::Cacheable for XWaylandShellCachedState {
     fn commit(&mut self, _dh: &DisplayHandle) -> Self {
-        *self
+        Self {
+            serial: self.serial.take(),
+        }
     }
 
     fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
-        *into = self;
+        if self.serial.is_some() {
+            into.serial = self.serial;
+        }
     }
 }
 
@@ -184,7 +210,7 @@ where
 {
     fn request(
         _state: &mut D,
-        _client: &Client,
+        client: &Client,
         resource: &XwaylandShellV1,
         request: <XwaylandShellV1 as Resource>::Request,
         _data: &(),
@@ -198,7 +224,24 @@ where
                     return;
                 }
 
+                let client_id = client.id();
                 compositor::add_pre_commit_hook::<D, _>(&surface, serial_commit_hook);
+                compositor::add_destruction_hook::<D, _>(&surface, move |state, surface| {
+                    let serial = compositor::with_states(surface, |states| {
+                        let mut cached = states.cached_state.get::<XWaylandShellCachedState>();
+                        cached.pending().serial.or(cached.current().serial)
+                    });
+                    if let Some(serial) = serial {
+                        let shell_state = XWaylandShellHandler::xwayland_shell_state(state);
+                        if let std::collections::hash_map::Entry::Occupied(entry) =
+                            shell_state.by_serial.entry((client_id.clone(), serial))
+                        {
+                            if entry.get() == surface {
+                                entry.remove();
+                            }
+                        }
+                    }
+                });
 
                 data_init.init(id, XWaylandSurfaceUserData { wl_surface: surface });
                 // We call the handler callback once the serial is set.
@@ -264,44 +307,49 @@ fn serial_commit_hook<D: XWaylandShellHandler + XwmHandler + 'static>(
     }) {
         if let Some(client) = surface.client() {
             // We only care about surfaces created by XWayland.
-            if let Some(xwm_id) = client
-                .get_data::<XWaylandClientData>()
-                .and_then(|data| data.user_data().get::<XwmId>())
-            {
-                let xwm = XwmHandler::xwm_state(state, *xwm_id);
+            if let Some(xwayland_data) = client.get_data::<XWaylandClientData>() {
+                if let Some(xwm_id) = xwayland_data.user_data().get::<XwmId>().copied() {
+                    let xwm = XwmHandler::xwm_state(state, xwm_id);
 
-                // This handles the case that the serial was set on the X11
-                // window before surface. To handle the other case, we look for
-                // a matching surface when the WL_SURFACE_SERIAL atom is sent.
-                if let Some(window) = xwm.unpaired_surfaces.remove(&serial) {
-                    if let Some(xsurface) = xwm
-                        .windows
-                        .iter()
-                        .find(|x| x.window_id() == window || x.mapped_window_id() == Some(window))
-                        .cloned()
-                    {
-                        debug!(
-                            window = xsurface.window_id(),
-                            wl_surface = ?surface.id().protocol_id(),
-                            "associated X11 window to wl_surface in commit hook",
-                        );
+                    // This handles the case that the serial was set on the X11
+                    // window before surface. To handle the other case, we look for
+                    // a matching surface when the WL_SURFACE_SERIAL atom is sent.
+                    if let Some(window) = xwm.unpaired_surfaces.remove(&serial) {
+                        if let Some(xsurface) = xwm
+                            .windows
+                            .iter()
+                            .find(|x| x.window_id() == window || x.mapped_window_id() == Some(window))
+                            .cloned()
+                        {
+                            debug!(
+                                window = xsurface.window_id(),
+                                wl_surface = ?surface.id().protocol_id(),
+                                "associated X11 window to wl_surface in commit hook",
+                            );
 
-                        xsurface.state.lock().unwrap().wl_surface = Some(surface.clone());
+                            xsurface.state.lock().unwrap().wl_surface = Some(surface.clone());
 
-                        XWaylandShellHandler::surface_associated(state, *xwm_id, surface.clone(), xsurface);
-                    } else {
-                        warn!(
-                            window,
-                            wl_surface = ?surface.id().protocol_id(),
-                            "Unknown X11 window associated to wl_surface in commit hook"
-                        )
+                            XWaylandShellHandler::surface_associated(
+                                state,
+                                xwm_id,
+                                surface.clone(),
+                                xsurface,
+                            );
+                        } else {
+                            warn!(
+                                window,
+                                wl_surface = ?surface.id().protocol_id(),
+                                "Unknown X11 window associated to wl_surface in commit hook"
+                            );
+                        }
+                        return;
                     }
-                } else {
-                    // this is necessary for the atom-handler to look up the matching surface
-                    XWaylandShellHandler::xwayland_shell_state(state)
-                        .by_serial
-                        .insert(serial, surface.clone());
                 }
+
+                // this is necessary for the atom-handler to look up the matching surface
+                XWaylandShellHandler::xwayland_shell_state(state)
+                    .by_serial
+                    .insert((client.id(), serial), surface.clone());
             }
         }
     }
