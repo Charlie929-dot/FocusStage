@@ -430,18 +430,52 @@ impl FocusStageState {
     pub fn spawn_xwayland_for_stage(&mut self, stage_id: String) -> Result<(), String> {
         let stage = self.stages.get_mut(&stage_id).ok_or("Stage no longer exists")?;
         let scale = stage.default_scale;
-        let driver = stage.launch_env.get("GALLIUM_DRIVER").map(std::ffi::OsString::from)
-            .or_else(crate::manager::wsl_gallium_driver);
+        // FocusStage uses a wl_shm Pixman compositor without dmabuf/wl_drm, so Xwayland
+        // runs without Glamor and does not need GALLIUM_DRIVER=d3d12; X11 clients configure
+        // their own Mesa driver and D3D12 adapter in stage_command().
+        let (stderr_read, stderr_stdio) = match create_x11_pipe() {
+            Ok((read_fd, write_fd)) => (Some(read_fd), Stdio::from(write_fd)),
+            Err(err) => {
+                warn!(stage = stage_id, "Could not create XWayland stderr pipe: {err}");
+                (None, Stdio::null())
+            }
+        };
         let (xwayland, client) = XWayland::spawn(
             &self.display_handle,
             None,
-            driver.map(|driver| ("GALLIUM_DRIVER", driver)),
+            std::iter::empty::<(&str, std::ffi::OsString)>(),
             true,
             Stdio::null(),
-            Stdio::null(),
+            stderr_stdio,
             |_| (),
         )
         .map_err(|e| format!("spawn XWayland: {e}"))?;
+
+        if let Some(read_fd) = stderr_read {
+            let sid = stage_id.clone();
+            let _ = std::thread::Builder::new()
+                .name("xwayland-stderr".into())
+                .spawn(move || {
+                    use std::io::{BufRead, BufReader};
+                    let reader = BufReader::new(std::fs::File::from(read_fd));
+                    for line in reader.lines().map_while(Result::ok) {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let lower = trimmed.to_ascii_lowercase();
+                        if lower.contains("fatal")
+                            || lower.contains("error")
+                            || lower.contains("failed")
+                            || trimmed.starts_with("(EE)")
+                        {
+                            warn!(stage = sid, "Xwayland: {trimmed}");
+                        } else {
+                            debug!(stage = sid, "Xwayland: {trimmed}");
+                        }
+                    }
+                });
+        }
 
         // X11 windows and their buffers use physical pixels. Smithay maps their
         // geometry and pointer coordinates to the compositor's logical space.

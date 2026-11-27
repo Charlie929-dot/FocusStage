@@ -231,6 +231,8 @@
     selectBrowser: $('select-browser'),
     selectTerminal: $('select-terminal'),
     toggleLinuxHideWsl: $('toggle-linux-hide-wsl'),
+    selectGraphicsDriver: $('select-graphics-driver'),
+    selectD3d12Adapter: $('select-d3d12-adapter'),
     windowsHostHint: $('windows-host-hint'),
     healthXdg: $('health-xdg'),
     healthPortal: $('health-portal'),
@@ -2218,6 +2220,8 @@
     els.rangeLinuxTextScale.disabled = disabled;
     els.toggleLinuxHideWsl.disabled = disabled;
     els.selectHanFallback.disabled = disabled;
+    els.selectGraphicsDriver.disabled = disabled;
+    els.selectD3d12Adapter.disabled = disabled;
   }
 
   async function loadLinuxSettings(method = 'linuxSettings.get', params = {}, successToast = null) {
@@ -2347,6 +2351,26 @@
     els.selectHanFallback.value = data.hanFallback || 'system';
     els.selectHanFallback.disabled = false;
     els.toggleLinuxHideWsl.disabled = false;
+
+    const driverVal = data.graphicsDriver === 'llvmpipe' ? 'llvmpipe' : 'auto';
+    els.selectGraphicsDriver.value = driverVal;
+    els.selectGraphicsDriver.disabled = false;
+
+    const adapterItems = [{ id: 'auto', name: '自动选择（系统默认）' }];
+    const seenAdapters = new Set(['auto']);
+    for (const gpu of (data.windowsGpuAdapters || [])) {
+      if (gpu && !seenAdapters.has(gpu.toLowerCase())) {
+        seenAdapters.add(gpu.toLowerCase());
+        adapterItems.push({ id: gpu, name: gpu });
+      }
+    }
+    const selectedAdapter = (data.d3d12Adapter || '').trim() || 'auto';
+    if (selectedAdapter !== 'auto' && !seenAdapters.has(selectedAdapter.toLowerCase())) {
+      adapterItems.push({ id: selectedAdapter, name: `${selectedAdapter}（自定义）` });
+    }
+    populateSelect(els.selectD3d12Adapter, adapterItems, selectedAdapter);
+    els.selectD3d12Adapter.disabled = driverVal === 'llvmpipe';
+
     els.windowsHostHint.classList.toggle('is-hidden', data.browser !== 'windows-host');
 
     els.healthXdg.textContent = data.xdgOpenInstalled ? '已安装' : '缺少 xdg-open';
@@ -2449,6 +2473,26 @@
       'linuxSettings.setHideWsl',
       { enabled },
       enabled ? '已开启 WSL 标识过滤（重启目标应用后生效）' : '已关闭 WSL 标识过滤（重启目标应用后生效）'
+    );
+  });
+  els.selectGraphicsDriver.addEventListener('change', () => {
+    const value = els.selectGraphicsDriver.value;
+    loadLinuxSettings(
+      'linuxSettings.setGraphicsDriver',
+      { value },
+      value === 'llvmpipe'
+        ? '已切换为软件渲染（llvmpipe），重新打开应用后生效'
+        : '已切换为 D3D12 硬件加速（默认），重新打开应用后生效'
+    );
+  });
+  els.selectD3d12Adapter.addEventListener('change', () => {
+    const value = els.selectD3d12Adapter.value;
+    loadLinuxSettings(
+      'linuxSettings.setD3d12Adapter',
+      { value },
+      value === 'auto'
+        ? '已恢复自动选择 D3D12 显卡，重新打开应用后生效'
+        : `已指定 D3D12 显卡为 ${value}，重新打开应用后生效`
     );
   });
   els.btnLinuxSync.addEventListener('click', () => loadLinuxSettings('linuxSettings.syncHandlers', {}, '已同步协议关联'));

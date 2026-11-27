@@ -76,8 +76,19 @@ struct Preferences {
     terminal: Option<String>,
     hide_wsl: bool,
     han_fallback: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    graphics_driver: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    d3d12_adapter: Option<String>,
     #[serde(flatten)]
     extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GraphicsPreferences {
+    pub driver: Option<String>,
+    pub d3d12_adapter: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +130,10 @@ pub struct SettingsView {
     #[serde(default)]
     pub han_fallback: Option<String>,
     #[serde(default)]
+    pub graphics_driver: Option<String>,
+    #[serde(default)]
+    pub d3d12_adapter: Option<String>,
+    #[serde(default)]
     pub theme: ThemeSettingsView,
 }
 
@@ -138,6 +153,8 @@ pub enum SettingsAction {
     SetCursorTheme(String),
     SetFontName(String),
     SetHanFallback(String),
+    SetGraphicsDriver(String),
+    SetD3d12Adapter(String),
     SetTextScale(String),
     ResetTheme,
     SetHideWsl(bool),
@@ -264,6 +281,12 @@ pub fn settings(action: SettingsAction) -> Result<SettingsView> {
         SettingsAction::SetHanFallback(value) => {
             set_han_fallback(&paths, &mut prefs, &value)?;
         }
+        SettingsAction::SetGraphicsDriver(value) => {
+            set_graphics_driver(&paths, &mut prefs, &value)?;
+        }
+        SettingsAction::SetD3d12Adapter(value) => {
+            set_d3d12_adapter(&paths, &mut prefs, &value)?;
+        }
         SettingsAction::SetTextScale(value) => {
             apply_text_scale(&value)?;
         }
@@ -357,6 +380,8 @@ pub fn settings(action: SettingsAction) -> Result<SettingsView> {
             .is_ok_and(|s| s.success()),
         hide_wsl: prefs.hide_wsl,
         han_fallback: prefs.han_fallback,
+        graphics_driver: prefs.graphics_driver,
+        d3d12_adapter: prefs.d3d12_adapter,
         theme,
     })
 }
@@ -365,6 +390,40 @@ pub fn hide_wsl_enabled() -> bool {
     Paths::user()
         .and_then(|paths| read_preferences(&paths))
         .is_ok_and(|prefs| prefs.hide_wsl)
+}
+
+pub fn graphics_preferences() -> GraphicsPreferences {
+    Paths::user()
+        .and_then(|paths| read_preferences(&paths))
+        .map(|prefs| GraphicsPreferences {
+            driver: prefs.graphics_driver,
+            d3d12_adapter: prefs.d3d12_adapter,
+        })
+        .unwrap_or_default()
+}
+
+fn set_graphics_driver(paths: &Paths, prefs: &mut Preferences, value: &str) -> Result<()> {
+    let normalized = value.trim().to_ascii_lowercase();
+    prefs.graphics_driver = match normalized.as_str() {
+        "" | "auto" => None,
+        "d3d12" => Some("d3d12".to_owned()),
+        "llvmpipe" => Some("llvmpipe".to_owned()),
+        _ => bail!("Expected auto, d3d12 or llvmpipe"),
+    };
+    write_preferences(paths, prefs)
+}
+
+fn set_d3d12_adapter(paths: &Paths, prefs: &mut Preferences, value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        prefs.d3d12_adapter = None;
+    } else {
+        if trimmed.len() > 128 || trimmed.chars().any(char::is_control) {
+            bail!("无效的 D3D12 显卡适配器名称");
+        }
+        prefs.d3d12_adapter = Some(trimmed.to_owned());
+    }
+    write_preferences(paths, prefs)
 }
 
 fn han_profile(paths: &Paths, language: &str) -> Result<(PathBuf, &'static str)> {
@@ -1685,6 +1744,39 @@ mod tests {
         assert_eq!(saved["han_fallback"], "zh-tw");
         assert_eq!(saved["future_flag"], "keep-me");
         assert_eq!(saved["nested_setting"]["enabled"], true);
+    }
+
+    #[test]
+    fn graphics_preferences_validate_and_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: temp.path().into(),
+            config: temp.path().join("config"),
+            data: temp.path().join("data"),
+        };
+        let mut prefs = read_preferences(&paths).unwrap();
+        assert!(prefs.graphics_driver.is_none());
+        assert!(prefs.d3d12_adapter.is_none());
+
+        set_graphics_driver(&paths, &mut prefs, "llvmpipe").unwrap();
+        assert_eq!(read_preferences(&paths).unwrap().graphics_driver.as_deref(), Some("llvmpipe"));
+
+        set_graphics_driver(&paths, &mut prefs, "d3d12").unwrap();
+        assert_eq!(read_preferences(&paths).unwrap().graphics_driver.as_deref(), Some("d3d12"));
+
+        set_graphics_driver(&paths, &mut prefs, "auto").unwrap();
+        assert!(read_preferences(&paths).unwrap().graphics_driver.is_none());
+        assert!(set_graphics_driver(&paths, &mut prefs, "vulkan").is_err());
+
+        set_d3d12_adapter(&paths, &mut prefs, "NVIDIA GeForce MX450").unwrap();
+        assert_eq!(
+            read_preferences(&paths).unwrap().d3d12_adapter.as_deref(),
+            Some("NVIDIA GeForce MX450")
+        );
+
+        set_d3d12_adapter(&paths, &mut prefs, "auto").unwrap();
+        assert!(read_preferences(&paths).unwrap().d3d12_adapter.is_none());
+        assert!(set_d3d12_adapter(&paths, &mut prefs, "bad\nname").is_err());
     }
 
     #[test]

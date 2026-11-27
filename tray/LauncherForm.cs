@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -760,6 +761,12 @@ internal sealed class LauncherForm : Form
             case "linuxSettings.setHanFallback":
                 return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("set-han-fallback", Str("value")));
 
+            case "linuxSettings.setGraphicsDriver":
+                return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("set-graphics-driver", Str("value")));
+
+            case "linuxSettings.setD3d12Adapter":
+                return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("set-d3d12-adapter", Str("value")));
+
             case "linuxSettings.setTextScale":
                 return BuildLinuxSettingsPayload(await _ctx.LinuxSettingsAsync("set-text-scale", Str("value")));
 
@@ -1086,6 +1093,96 @@ internal sealed class LauncherForm : Form
         return "prefer-light";
     }
 
+    private const uint DxgiAdapterFlagSoftware = 0x2;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct DxgiAdapterDesc1
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string Description;
+        public uint VendorId;
+        public uint DeviceId;
+        public uint SubSysId;
+        public uint Revision;
+        public UIntPtr DedicatedVideoMemory;
+        public UIntPtr DedicatedSystemMemory;
+        public UIntPtr SharedSystemMemory;
+        public long AdapterLuid;
+        public uint Flags;
+    }
+
+    [ComImport, Guid("770aae78-f26f-4dba-a829-253c83d1b387"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IDxgiFactory1
+    {
+        void SetPrivateData();
+        void SetPrivateDataInterface();
+        void GetPrivateData();
+        void GetParent();
+        [PreserveSig] int EnumAdapters(uint adapter, out IntPtr ppAdapter);
+        void MakeWindowAssociation();
+        void GetWindowAssociation();
+        void CreateSwapChain();
+        void CreateSoftwareAdapter();
+        [PreserveSig] int EnumAdapters1(uint adapter, out IDxgiAdapter1 ppAdapter);
+        [PreserveSig] int IsCurrent();
+    }
+
+    [ComImport, Guid("29038f61-3839-4626-91fd-086879011a05"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IDxgiAdapter1
+    {
+        void SetPrivateData();
+        void SetPrivateDataInterface();
+        void GetPrivateData();
+        void GetParent();
+        [PreserveSig] int EnumOutputs(uint output, out IntPtr ppOutput);
+        void GetDesc();
+        void CheckInterfaceSupport();
+        [PreserveSig] int GetDesc1(out DxgiAdapterDesc1 pDesc);
+    }
+
+    [DllImport("dxgi.dll")]
+    private static extern int CreateDXGIFactory1(ref Guid riid, out IDxgiFactory1 ppFactory);
+
+    private static string[] GetWindowsGpuAdapters()
+    {
+        var result = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var iid = new Guid("770aae78-f26f-4dba-a829-253c83d1b387");
+            if (CreateDXGIFactory1(ref iid, out var factory) != 0 || factory is null)
+                return Array.Empty<string>();
+            try
+            {
+                for (uint i = 0; factory.EnumAdapters1(i, out var adapter) == 0; i++)
+                {
+                    try
+                    {
+                        if (adapter.GetDesc1(out var desc) == 0 && (desc.Flags & DxgiAdapterFlagSoftware) == 0)
+                        {
+                            var name = desc.Description?.Trim();
+                            if (!string.IsNullOrEmpty(name) && seen.Add(name))
+                                result.Add(name);
+                        }
+                    }
+                    finally
+                    {
+                        Marshal.ReleaseComObject(adapter);
+                    }
+                }
+            }
+            finally
+            {
+                Marshal.ReleaseComObject(factory);
+            }
+        }
+        catch
+        {
+            // Fall back to empty list if DXGI enumeration is unavailable.
+        }
+        return result.ToArray();
+    }
+
     private static object BuildLinuxSettingsPayload(LinuxDesktopSettings s)
     {
         var t = s.Theme;
@@ -1101,6 +1198,9 @@ internal sealed class LauncherForm : Form
             mimeappsSynced = s.MimeappsSynced,
             hideWsl = s.HideWsl,
             hanFallback = s.HanFallback,
+            graphicsDriver = s.GraphicsDriver,
+            d3d12Adapter = s.D3d12Adapter,
+            windowsGpuAdapters = GetWindowsGpuAdapters(),
             windowsColorScheme = GetWindowsColorScheme(),
             theme = t is null ? null : new
             {

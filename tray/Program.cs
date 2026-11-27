@@ -110,7 +110,9 @@ internal sealed record LinuxDesktopSettings(
     bool MimeappsSynced,
     bool HideWsl = false,
     LinuxThemeSettings? Theme = null,
-    string? HanFallback = null);
+    string? HanFallback = null,
+    string? GraphicsDriver = null,
+    string? D3d12Adapter = null);
 
 internal sealed class StageDto
 {

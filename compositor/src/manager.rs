@@ -649,12 +649,34 @@ fn is_wsl2() -> bool {
     release.contains("wsl2") || release.contains("microsoft-standard")
 }
 
-pub(crate) fn wsl_gallium_driver() -> Option<OsString> {
-    if is_wsl2() && Path::new("/dev/dxg").exists() {
-        Some(std::env::var_os("GALLIUM_DRIVER").unwrap_or_else(|| "d3d12".into()))
+fn resolve_wsl_graphics_env(
+    wsl2: bool,
+    has_dxg: bool,
+    prefs: &xdg::GraphicsPreferences,
+    env: impl Fn(&str) -> Option<OsString>,
+) -> (Option<OsString>, Option<OsString>) {
+    if !wsl2 {
+        return (None, None);
+    }
+    let env_non_empty = |key: &str| env(key).filter(|v| !v.is_empty());
+    let driver = env_non_empty("GALLIUM_DRIVER").or_else(|| match prefs.driver.as_deref() {
+        Some("llvmpipe") => Some(OsString::from("llvmpipe")),
+        _ if has_dxg => Some(OsString::from("d3d12")),
+        _ => None,
+    });
+    let adapter = if driver.as_deref() == Some(std::ffi::OsStr::new("d3d12")) {
+        env_non_empty("MESA_D3D12_DEFAULT_ADAPTER_NAME").or_else(|| {
+            prefs
+                .d3d12_adapter
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(OsString::from)
+        })
     } else {
         None
-    }
+    };
+    (driver, adapter)
 }
 
 pub(crate) fn wsl_gsk_renderer() -> Option<OsString> {
@@ -1149,8 +1171,17 @@ fn apply_common_stage_env(cmd: &mut Command, wayland_socket: &str, x11_display: 
         // Launching a Linux desktop app here is intentional and stdin is closed.
         cmd.env("DONT_PROMPT_WSL_INSTALL", "1");
     }
-    if let Some(driver) = wsl_gallium_driver() {
+    let (driver, adapter) = resolve_wsl_graphics_env(
+        is_wsl2(),
+        Path::new("/dev/dxg").exists(),
+        &xdg::graphics_preferences(),
+        |key| std::env::var_os(key),
+    );
+    if let Some(driver) = driver {
         cmd.env("GALLIUM_DRIVER", driver);
+    }
+    if let Some(adapter) = adapter {
+        cmd.env("MESA_D3D12_DEFAULT_ADAPTER_NAME", adapter);
     }
     if let Some(renderer) = wsl_gsk_renderer() {
         cmd.env("GSK_RENDERER", renderer);
@@ -1702,6 +1733,61 @@ mod tests {
         assert_eq!(
             custom_envs.get(std::ffi::OsStr::new("GSK_RENDERER")),
             Some(&Some(std::ffi::OsStr::new("gl")))
+        );
+    }
+
+    #[test]
+    fn resolves_wsl_graphics_driver_and_d3d12_adapter_with_env_precedence() {
+        let default_prefs = xdg::GraphicsPreferences::default();
+        let no_env = |_: &str| None;
+
+        // Non-WSL2 leaves Mesa env untouched.
+        assert_eq!(
+            resolve_wsl_graphics_env(false, true, &default_prefs, no_env),
+            (None, None)
+        );
+
+        // Default WSL2 with /dev/dxg picks d3d12 and no adapter override.
+        assert_eq!(
+            resolve_wsl_graphics_env(true, true, &default_prefs, no_env),
+            (Some(OsString::from("d3d12")), None)
+        );
+
+        // Configured D3D12 adapter applies when driver resolves to d3d12.
+        let nvidia_prefs = xdg::GraphicsPreferences {
+            driver: None,
+            d3d12_adapter: Some("NVIDIA GeForce MX450".into()),
+        };
+        assert_eq!(
+            resolve_wsl_graphics_env(true, true, &nvidia_prefs, no_env),
+            (
+                Some(OsString::from("d3d12")),
+                Some(OsString::from("NVIDIA GeForce MX450")),
+            )
+        );
+
+        // Software llvmpipe omits D3D12 adapter even when one is configured.
+        let sw_prefs = xdg::GraphicsPreferences {
+            driver: Some("llvmpipe".into()),
+            d3d12_adapter: Some("NVIDIA GeForce MX450".into()),
+        };
+        assert_eq!(
+            resolve_wsl_graphics_env(true, true, &sw_prefs, no_env),
+            (Some(OsString::from("llvmpipe")), None)
+        );
+
+        // Explicit daemon environment variables take precedence over settings.json.
+        let custom_env = |key: &str| match key {
+            "GALLIUM_DRIVER" => Some(OsString::from("d3d12")),
+            "MESA_D3D12_DEFAULT_ADAPTER_NAME" => Some(OsString::from("CustomGPU")),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_wsl_graphics_env(true, true, &sw_prefs, custom_env),
+            (
+                Some(OsString::from("d3d12")),
+                Some(OsString::from("CustomGPU")),
+            )
         );
     }
 }
