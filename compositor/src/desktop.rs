@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 pub const WRAPPER_PREFIX: &str = "focusstage-";
 
-/// Resolve the Windows user profile that owns this WSL session (e.g. `/mnt/c/Users/HP`).
+/// Resolve the Windows user profile that owns this WSL session (e.g. `/mnt/c/Users/<username>`).
 ///
 /// Read the Windows environment instead of guessing a directory under `/mnt/c/Users`.
 pub fn windows_user_home() -> Option<PathBuf> {

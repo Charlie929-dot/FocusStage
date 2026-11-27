@@ -37,6 +37,9 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Run workspace unit tests
+        run: cargo test --workspace --locked
+
       - name: Build focusstaged and focusstage (release)
         run: |
           cargo build --workspace --release --locked
@@ -144,6 +147,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist/payload/scripts | Out-Null
+          Copy-Item LICENSE dist/payload/LICENSE -Force
           Copy-Item scripts/install-release.ps1 dist/payload/install-release.ps1 -Force
           Copy-Item scripts/focusstage-launch dist/payload/scripts/focusstage-launch -Force
           Copy-Item scripts/focusstage-open dist/payload/scripts/focusstage-open -Force

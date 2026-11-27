@@ -1,10 +1,19 @@
 # FocusStage
 
+[![Release](https://img.shields.io/github/v/release/Charlie929-dot/FocusStage?style=flat-square)](https://github.com/Charlie929-dot/FocusStage/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/Charlie929-dot/FocusStage/ci.yml?branch=master&label=CI&style=flat-square)](https://github.com/Charlie929-dot/FocusStage/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Windows%2011%20%2B%20WSL2-0078D4?style=flat-square)](#运行环境)
+
 **FocusStage** 让人和 AI 同时使用同一台电脑、互不抢焦点。
+
+> *Run Linux GUI apps natively on Windows 11 with per-app virtual focus — let humans and AI agents share the same desktop concurrently without stealing focus.*
 
 它是一个跑在 WSL2 里的 **Wayland 合成器**：被它托管的应用平时像普通窗口一样出现在 Win11 桌面上；需要时一键「收入后台」交给 AI，AI 独立操作它，而你的鼠标、键盘、正在打字的窗口和剪贴板**完全不受影响**。
 
 > **正常使用（桌面窗口） → 一键收入后台 → AI 独立操作（可多窗口并发） → 按热键接管，窗口原位恢复**
+
+**普通用户直接上手**：前往 [GitHub Releases](https://github.com/Charlie929-dot/FocusStage/releases/latest) 下载 `FocusStage-Setup-v*.exe` 双击安装即可，无需配置 Rust 或 `.NET SDK`（详见下方 [快速开始](#快速开始)）。
 
 ---
 
@@ -73,9 +82,9 @@ WSL2
 
 ### 1. 安装与部署
 
-#### 方式 A：直接安装预编译发行版（终端用户）
+#### 方式 A：直接安装预编译发行版（推荐给普通用户）
 
-若不想在本地安装 Rust 与 `.NET SDK`，可从 GitHub Releases 下载 `FocusStage-Setup-<tag>.exe` 安装包（或解压 `FocusStage-<tag>-win-x64.zip` 后运行 `install-release.ps1`）：
+无需在本地安装 Rust 或 `.NET SDK`，前往 [GitHub Releases](https://github.com/Charlie929-dot/FocusStage/releases/latest) 下载 `FocusStage-Setup-<tag>.exe` 双击运行即可（也可解压绿色包 `FocusStage-<tag>-win-x64.zip` 后运行 `install-release.ps1`）：
 
 - 自动检测本机 WSL2 与 Ubuntu 发行版（不写死发行版名称，缺失时可引导安装 `Ubuntu-24.04`，多发行版时支持选择）；
 - 通过 `apt-get install --no-upgrade` 仅补齐缺失的桌面组件与运行库（`libpixman-1-0`、`libwayland-server0`、`libxkbcommon0`、`libffi8` 等）；
@@ -102,8 +111,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
 Windows 安装器可用 `-Distro` 选择发行版，或用 `-WslRepo` 指定该发行版里的源码路径。
 
 安装完成后：
-- 双击桌面或开始菜单中的 **FocusStage** 打开统一应用启动器。启动器优先使用 Windows Hello，也可通过 Ubuntu 管理员密码验证。验证后会进入 WSL 默认账号的桌面会话。`root` 直接使用现有权限，有复用授权的普通管理员可在启动器打开期间免重复执行 `sudo` 和标准 Polkit 验证。最小化会保留授权，关闭到托盘会撤销。已启动的提权进程会继续运行。
-- 安装器为 WSL 默认的非 `root` 管理员接入 PAM 和 Polkit，并关闭该账号的 `sudo` 密码缓存。若 WSL 默认账号是 `root`，Linux 密码备选会使用此前配置的非 `root` 管理员。没有这个账号时可用 Windows Hello。卸载 FocusStage 时会移除授权设置。
+- 双击桌面或开始菜单中的 **FocusStage** 打开统一应用启动器（包含「应用桌面」与「舞台中心」两个顶层视图）。
+- 需要提权或解锁密钥环时，FocusStage 会弹出原生 Win32 Polkit / 解锁弹窗；你也可以在 **舞台中心 → 账号与凭据** 中管理 WSL Ubuntu 账号，并通过 **Windows Hello（DPAPI 加密托管）** 保护 Linux / GNOME Keyring 密码（不会明文写入 WSL），实现刷脸/指纹/PIN 一键授权与解锁。
 - 开始菜单 `Programs\FocusStage\` 下会自动生成全部 Linux 应用的独立快捷方式（按 Linux 图标主题解析并带图标），可右键“固定到开始屏幕”或“固定到任务栏”。
 - 安装器会把 `focusstage` 注册到 Windows 用户的 Claude Code MCP 配置 `~/.claude.json`，指向安装所用的 WSL 发行版。`install.sh` 默认使用当前发行版，可用 `--distro` 指定；如不需要 MCP 注册，可用 `--skip-mcp-config`（Windows 安装器用 `-SkipMcpConfig`）。
 - 运行 `powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1` 会自动读取部署时记录的 `distro.txt`（或使用 `-Distro`），清理 `~/.claude.json` MCP 条目、移除协议关联、授权配置与快捷方式并删除安装目录（Inno Setup 卸载器传入 `-KeepInstallDir` 后由安装器自身清理目录）。
@@ -199,14 +208,33 @@ Chromium、Electron 和 Gecko 使用各自的 WSL 用户配置目录，关闭并
 FocusStage/
 ├── README.md                 # 项目概述与快速开始
 ├── DESIGN.md                 # 架构设计与收敛路线
-├── .mcp.json                 # 项目级 MCP 配置示例
-├── .github/workflows/        # GitHub Actions CI/CD（release.yml 发版流水线）
-├── compositor/               # [WSL2] focusstaged：Rust + Smithay 合成器、Router、Stage Manager、SessionEnv、XDG/图标解析、DisplaySink
+├── CHANGELOG.md              # 版本变更记录
+├── CONTRIBUTING.md           # 参与贡献与本地开发指南
+├── SECURITY.md               # 安全策略与漏洞反馈方式
+├── LICENSE                   # MIT 开源许可协议
+├── .mcp.json                 # Linux 侧 Claude Code 项目级 MCP 配置
+├── .codex/config.toml        # Linux 侧 Codex 项目级 MCP 配置
+├── .github/workflows/        # GitHub Actions（ci.yml 与 release.yml）
+├── compositor/               # [WSL2] focusstaged 与 focusstage-tun：Rust + Smithay 合成器、Router、Stage Manager、SessionEnv、XDG/图标解析、DisplaySink、透明代理桥
 ├── mcp/                      # [Linux] focusstage：CLI、应用卸载与 MCP stdio 服务
-├── tray/                     # [Win11] .NET 8 + WebView2 启动器（应用桌面 + 舞台中心）、托盘热键与 Direct2D 原生 Win32 宿主
+├── tray/                     # [Win11] .NET 8 + WebView2 启动器（应用桌面 + 舞台中心）、托盘热键、Windows Hello 凭据托管与 Direct2D 原生 Win32 宿主
+├── third_party/smithay/      # 内嵌 Smithay 合成器库（MIT 许可）
 ├── packaging/                # Inno Setup 终端用户安装包配置（FocusStage.iss）
-└── scripts/                  # 开发部署、Release 独立安装、卸载、PAM/Polkit 授权与 MCP/启动辅助脚本
+└── scripts/                  # 开发部署、Release 独立安装、卸载、Polkit 规则与 MCP/启动辅助脚本
 ```
+
+---
+
+## 常见问题（FAQ）
+
+- **双击安装器时 Windows SmartScreen 提示“已保护你的电脑”？**
+  个人开源项目尚未购买商业 EV 代码签名证书，首次下载的 `.exe` 安装包可能触发 SmartScreen 警告。可先核对 Release 页面附带的 `SHA256SUMS.txt` 校验值（在 PowerShell 运行 `Get-FileHash FocusStage-Setup-*.exe -Algorithm SHA256`），确认一致后点击「更多信息 → 仍要运行」；也可以从源码自行构建。
+- **双显卡笔记本出现黑屏、卡顿或渲染异常？**
+  打开启动器 **舞台中心 → Linux 系统设置 → Linux 应用兼容性**，可在「D3D12 显卡适配器」中显式指定宿主显卡，或将「WSL2 图形渲染后端」切换为软件渲染（`llvmpipe`），重新打开对应 Linux 应用即生效。
+- **中文界面出现部分日文字形？**
+  在 **舞台中心 → Linux 系统设置** 中将「汉字备用字形」设为简体中文（`zh-cn`）或繁体中文（`zh-tw`），重新打开应用生效。
+- **如何在 WSL2 中安装 Linux 桌面应用？**
+  在 Ubuntu 终端直接通过 `sudo apt install ...`、`.deb` 安装包、Flatpak 或 Snap 安装即可，FocusStage 会自动识别标准 `.desktop` 入口并同步到启动器和 Windows 开始菜单。
 
 ---
 
@@ -215,3 +243,11 @@ FocusStage/
 - **终端用户运行环境**：Windows 10 / 11（64 位）+ WSL2 + Ubuntu（推荐 Ubuntu 22.04 / 24.04 / 26.04 LTS；Release 安装器自动补齐缺失的 Linux 运行库与桌面组件，无需预装 Rust 或 `.NET SDK`）
 - **开发者构建环境**：Windows 11 具备 `.NET 8 SDK`、`Git`（打包 `.exe` 安装器可选 Inno Setup 6）；WSL2 Ubuntu 具备 `Rust` 工具链与 `libwayland-dev` / `libpixman-1-dev` / `libxkbcommon-dev` / `pkg-config`
 - **架构与收敛细节**：见 [DESIGN.md](DESIGN.md)
+
+---
+
+## 参与贡献与许可协议
+
+- 欢迎提交 [Issue](https://github.com/Charlie929-dot/FocusStage/issues) 或 Pull Request，开发与测试指引见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+- 如发现安全漏洞，请遵循 [SECURITY.md](SECURITY.md) 私密上报。
+- 本项目基于 [MIT License](LICENSE) 开源；内嵌的 [Smithay](https://github.com/Smithay/smithay) 合成器库同样遵循 MIT 许可（见 [third_party/smithay/LICENSE.txt](third_party/smithay/LICENSE.txt)）。

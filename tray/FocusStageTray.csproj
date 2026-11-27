@@ -10,6 +10,13 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>FocusStage</AssemblyName>
     <RootNamespace>FocusStageTray</RootNamespace>
+    <Version>0.1.0</Version>
+    <Product>FocusStage</Product>
+    <Authors>Charlie929-dot</Authors>
+    <Description>Windows 11 launcher, tray, and native Direct2D window host for FocusStage WSL2 Wayland compositor</Description>
+    <Copyright>Copyright (c) 2026 Charlie929-dot</Copyright>
+    <RepositoryUrl>https://github.com/Charlie929-dot/FocusStage</RepositoryUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
   </PropertyGroup>
 
   <ItemGroup>

@@ -3,5 +3,6 @@ tray/bin/
 tray/obj/
 dist/
 .tmp_test/
+.claude/
 *.user
 *.suo

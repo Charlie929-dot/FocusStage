@@ -1,0 +1,42 @@
+name: Bug Report / 问题反馈
+description: 反馈 FocusStage 的安装、窗口显示、输入或 AI MCP 相关故障
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述 / What happened?
+      description: 清晰描述遇到的现象以及预期行为。
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤 / Steps to reproduce
+      placeholder: |
+        1. 启动 FocusStage...
+        2. 打开应用...
+        3. 执行操作...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境信息 / Environment
+      placeholder: |
+        - FocusStage 版本（如 v0.1.0 或 commit hash）:
+        - Windows 版本（如 Windows 11 24H2）:
+        - WSL2 发行版（如 Ubuntu 24.04）:
+        - 显卡型号（如 Intel Iris Xe / NVIDIA）:
+        - 出问题的 Linux 应用及版本:
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志或截图 / Logs or screenshots
+      description: 如有 `focusstage --json ping`、终端输出或错误截图，请粘贴在这里（注意先脱敏隐私信息）。
