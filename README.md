@@ -183,7 +183,7 @@ dotnet run --project tray/FocusStageTray.csproj -c Release
 
 启动器的 **舞台中心 → Linux 设置** 可选择默认浏览器和终端、同步用户级协议关联。Linux 应用通过 `xdg-open`、`gio open` 或 `focusstage open --ensure-daemon <URI>` 打开链接时，会复用已有的 Human Stage，或者启动目标应用。目标 Stage 被 Agent 租用、冻结或无法唯一确定时会返回错误。Windows 默认浏览器选项只接收 HTTP(S)。需要处理 `vscode://` 等 Linux 应用回调时，请使用 Linux 浏览器。
 
-同一页面的 **过滤常见 WSL 标识** 默认关闭。开启后，FocusStage 为新启动的非提权动态链接应用过滤 `uname`、`/proc/version` 和 `/proc/sys/kernel/osrelease` 中的 WSL 内核标识。这可让依赖这些标识的应用选择 Linux 桌面行为，例如用默认 Linux 文件管理器打开目录。`PATH`、WSL 环境变量和互操作文件保持不变，原本可用的 Windows 命令仍可执行；通过其他信号探测的应用仍可能识别 WSL。此设置不修改系统文件关联或全局 WSL 配置，Snap 不加载兼容库。已运行的应用需要退出后重开。
+同一页面的 **过滤常见 WSL 标识** 默认关闭。开启后，FocusStage 从新启动的普通应用及其子进程的环境中移除 `WSL_DISTRO_NAME` 和 `WSL_INTEROP`，并为支持兼容库的应用过滤 `uname`、`/proc/version` 和 `/proc/sys/kernel/osrelease` 中的 WSL 内核标识。依赖这些标识的应用可以使用 Linux 桌面行为，例如用默认 Linux 文件管理器打开目录。过滤仅作用于应用进程，系统文件关联、全局 WSL 配置、`PATH` 和互操作文件保留原样。Snap 应用只应用环境变量过滤。已运行的应用需要退出后重开。
 
 Chromium、Electron 和 Gecko 使用各自的 WSL 用户配置目录，关闭并重开后可以从原目录读取设置和 Cookie。再次启动已经由 FocusStage 托管的同款单实例应用时，会复用已有的 Human Stage。显式传入的 profile 参数会保留。
 

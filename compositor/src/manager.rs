@@ -889,7 +889,7 @@ fn stage_command(wayland_socket: &str, stage: &Stage, app: &str, args: &[String]
             .get("LD_PRELOAD")
             .cloned()
             .or_else(|| std::env::var("LD_PRELOAD").ok());
-        apply_wsl_kernel_mask(&mut cmd, &resolved_app, existing_preload.as_deref());
+        apply_wsl_mask(&mut cmd, &resolved_app, existing_preload.as_deref());
     }
     if let Some(dir) = &stage.launch_cwd {
         cmd.current_dir(dir);
@@ -933,7 +933,8 @@ fn ensure_wsl_mask_so() -> Option<PathBuf> {
     }).clone()
 }
 
-fn apply_wsl_kernel_mask(cmd: &mut Command, resolved_app: &str, existing_preload: Option<&str>) {
+fn apply_wsl_mask(cmd: &mut Command, resolved_app: &str, existing_preload: Option<&str>) {
+    cmd.env_remove("WSL_DISTRO_NAME").env_remove("WSL_INTEROP");
     let is_snap = resolved_app.starts_with("/snap/") || resolved_app.starts_with("/var/lib/snapd/")
         || resolved_app == "/usr/bin/snap" || resolved_app == "snap" || is_snap_launcher(resolved_app);
     if !is_snap {
@@ -1330,47 +1331,31 @@ mod tests {
     }
 
     #[test]
-    fn wsl_kernel_mask_preserves_explicit_interop_environment() {
-        let interop_env = [
-            ("PATH", "/usr/bin:/mnt/c/Windows/System32/WindowsPowerShell/v1.0"),
-            ("WSL_DISTRO_NAME", "Ubuntu-24.04"),
-            ("WSL_INTEROP", "/run/WSL/42_interop"),
-            ("WSL2_GUI_APPS_ENABLED", "1"),
-            ("WSLENV", "EXAMPLE/p"),
-            ("DONT_PROMPT_WSL_INSTALL", "1"),
-        ];
+    fn wsl_mask_hides_detection_variables_and_preserves_windows_path() {
+        let path = "/usr/bin:/mnt/c/Windows/System32/WindowsPowerShell/v1.0";
         let mut cmd = Command::new("/usr/bin/env");
-        cmd.envs(interop_env);
-        apply_wsl_kernel_mask(&mut cmd, "/opt/T3 Code/t3code", None);
+        cmd.env("PATH", path)
+            .env("WSL_DISTRO_NAME", "Ubuntu-24.04")
+            .env("WSL_INTEROP", "/run/WSL/42_interop");
+        apply_wsl_mask(&mut cmd, "/opt/T3 Code/t3code", None);
         let envs: HashMap<_, _> = cmd.get_envs().collect();
-        for (key, value) in interop_env {
-            assert_eq!(envs[std::ffi::OsStr::new(key)], Some(std::ffi::OsStr::new(value)));
-        }
+        assert_eq!(envs[std::ffi::OsStr::new("WSL_DISTRO_NAME")], None);
+        assert_eq!(envs[std::ffi::OsStr::new("WSL_INTEROP")], None);
+        assert_eq!(envs[std::ffi::OsStr::new("PATH")], Some(std::ffi::OsStr::new(path)));
         let mask = ensure_wsl_mask_so().unwrap();
         assert_eq!(envs[std::ffi::OsStr::new("LD_PRELOAD")], Some(mask.as_os_str()));
-        assert!(mask.is_file());
     }
 
     #[test]
-    fn wsl_kernel_mask_leaves_environment_inherited() {
-        let mut cmd = Command::new("/usr/bin/env");
-        apply_wsl_kernel_mask(&mut cmd, "/usr/bin/env", None);
-        let mask = ensure_wsl_mask_so().unwrap();
-        assert_eq!(
-            cmd.get_envs().collect::<Vec<_>>(),
-            vec![(std::ffi::OsStr::new("LD_PRELOAD"), Some(mask.as_os_str()))]
-        );
-    }
-
-    #[test]
-    fn wsl_kernel_mask_does_not_replace_snap_preload() {
+    fn wsl_mask_removes_inherited_detection_variables_for_snap_without_replacing_preload() {
         let mut cmd = Command::new("/usr/bin/snap");
-        cmd.env("LD_PRELOAD", "/usr/lib/existing.so");
-        apply_wsl_kernel_mask(&mut cmd, "/usr/bin/snap", Some("/usr/lib/existing.so"));
-        assert_eq!(
-            cmd.get_envs().collect::<Vec<_>>(),
-            vec![(std::ffi::OsStr::new("LD_PRELOAD"), Some(std::ffi::OsStr::new("/usr/lib/existing.so")))]
-        );
+        let preload = "/usr/lib/existing.so";
+        cmd.env("LD_PRELOAD", preload);
+        apply_wsl_mask(&mut cmd, "/usr/bin/snap", Some(preload));
+        let envs: HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(envs[std::ffi::OsStr::new("WSL_DISTRO_NAME")], None);
+        assert_eq!(envs[std::ffi::OsStr::new("WSL_INTEROP")], None);
+        assert_eq!(envs[std::ffi::OsStr::new("LD_PRELOAD")], Some(std::ffi::OsStr::new(preload)));
     }
 
     #[test]

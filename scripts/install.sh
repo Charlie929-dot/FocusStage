@@ -233,7 +233,7 @@ if command -v gsettings >/dev/null; then
     gsettings set org.gnome.desktop.interface toolkit-accessibility true || true
   fi
 fi
-/usr/local/bin/focusstage --json settings init-defaults >/dev/null
+FOCUSSTAGE_SOCKET=/dev/null /usr/local/bin/focusstage --json settings init-defaults >/dev/null
 WSL_USER
 (
   cd -- "$INSTALL_DIR"

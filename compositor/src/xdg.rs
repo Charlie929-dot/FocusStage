@@ -76,6 +76,8 @@ struct Preferences {
     terminal: Option<String>,
     hide_wsl: bool,
     han_fallback: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,9 +285,14 @@ pub fn settings(action: SettingsAction) -> Result<SettingsView> {
                 }
                 browser = id;
             }
+            let needs_write = overwrite
+                || prefs.browser.as_deref() != Some(browser.as_str())
+                || !paths.settings().is_file();
             mimeapps = sync_handlers(&paths, &catalog, &mimeapps, &browser, overwrite)?;
             prefs.browser = Some(browser.clone());
-            write_preferences(&paths, &prefs)?;
+            if needs_write {
+                write_preferences(&paths, &prefs)?;
+            }
         }
     }
     let defaults = associations(&mimeapps);
@@ -1643,6 +1650,41 @@ mod tests {
         set_han_fallback(&paths, &mut prefs, "system").unwrap();
         assert!(read_preferences(&paths).unwrap().han_fallback.is_none());
         assert!(!paths.config.join("fontconfig").exists());
+    }
+
+    #[test]
+    fn preferences_round_trip_preserves_unknown_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: temp.path().into(),
+            config: temp.path().join("config"),
+            data: temp.path().join("data"),
+        };
+        let initial = serde_json::json!({
+            "browser": "firefox_firefox",
+            "terminal": "org.gnome.Ptyxis",
+            "hide_wsl": true,
+            "han_fallback": "zh-cn",
+            "future_flag": "keep-me",
+            "nested_setting": { "enabled": true }
+        });
+        write_atomic(&paths.settings(), &serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+
+        let mut prefs = read_preferences(&paths).unwrap();
+        assert_eq!(prefs.browser.as_deref(), Some("firefox_firefox"));
+        assert_eq!(prefs.terminal.as_deref(), Some("org.gnome.Ptyxis"));
+        assert!(prefs.hide_wsl);
+        assert_eq!(prefs.han_fallback.as_deref(), Some("zh-cn"));
+
+        set_han_fallback(&paths, &mut prefs, "zh-tw").unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(paths.settings()).unwrap()).unwrap();
+        assert_eq!(saved["browser"], "firefox_firefox");
+        assert_eq!(saved["terminal"], "org.gnome.Ptyxis");
+        assert_eq!(saved["hide_wsl"], true);
+        assert_eq!(saved["han_fallback"], "zh-tw");
+        assert_eq!(saved["future_flag"], "keep-me");
+        assert_eq!(saved["nested_setting"]["enabled"], true);
     }
 
     #[test]
