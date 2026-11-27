@@ -197,8 +197,7 @@ where
             }
         });
 
-        let sessions: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<(Vec<u8>, SocketAddr)>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let sessions = Arc::new(Mutex::new(HashMap::<_, mpsc::Sender<Vec<u8>>>::new()));
 
         loop {
             let msg = tokio::select! {
@@ -218,9 +217,12 @@ where
                 continue;
             }
 
+            // A relay may reply with a resolved IP instead of the requested domain.
+            // Give each original endpoint pair its own association so replies stay attributable.
+            let flow = (src_addr, dst_addr);
             let existing_tx = {
                 let guard = sessions.lock().unwrap();
-                guard.get(&src_addr).filter(|tx| !tx.is_closed()).cloned()
+                guard.get(&flow).filter(|tx| !tx.is_closed()).cloned()
             };
 
             let tx = if let Some(tx) = existing_tx {
@@ -230,11 +232,14 @@ where
                     tracing::warn!(%src_addr, "session limit reached; dropping UDP session");
                     continue;
                 };
-                let (sess_tx, sess_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(128);
-                sessions.lock().unwrap().insert(src_addr, sess_tx.clone());
+                let (sess_tx, sess_rx) = mpsc::channel(128);
+                sessions.lock().unwrap().insert(flow, sess_tx.clone());
 
                 let sessions_map = sessions.clone();
-                let sess_dns = udp_dns.clone();
+                let target = match udp_dns.lock().unwrap().resolve_ip(dst_addr.ip(), Instant::now()) {
+                    Some(domain) => TargetAddr::Domain(domain, dst_addr.port()),
+                    None => TargetAddr::Ip(dst_addr),
+                };
                 let sess_reply = reply_tx.clone();
                 let sess_cancel = udp_cancel.clone();
                 let sess_tx_cmp = sess_tx.clone();
@@ -243,25 +248,25 @@ where
                     let _permit = permit;
                     run_udp_session(
                         proxy_addr,
-                        src_addr,
+                        flow,
+                        target,
                         sess_rx,
                         sess_reply,
-                        sess_dns,
                         udp_mtu,
                         udp_idle_timeout,
                         sess_cancel,
                     )
                     .await;
                     let mut guard = sessions_map.lock().unwrap();
-                    if guard.get(&src_addr).is_some_and(|cur| cur.same_channel(&sess_tx_cmp)) {
-                        guard.remove(&src_addr);
+                    if guard.get(&flow).is_some_and(|cur| cur.same_channel(&sess_tx_cmp)) {
+                        guard.remove(&flow);
                     }
                 });
 
                 sess_tx
             };
 
-            let _ = tx.try_send((payload, dst_addr));
+            let _ = tx.try_send(payload);
         }
 
         reply_writer.abort();
@@ -298,10 +303,10 @@ fn flatten_join_res(res: Result<io::Result<()>, tokio::task::JoinError>) -> io::
 #[allow(clippy::too_many_arguments)]
 async fn run_udp_session(
     proxy_addr: SocketAddr,
-    src_addr: SocketAddr,
-    mut rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    (src_addr, dst_addr): (SocketAddr, SocketAddr),
+    target: TargetAddr,
+    mut rx: mpsc::Receiver<Vec<u8>>,
     reply_tx: mpsc::Sender<(Vec<u8>, SocketAddr, SocketAddr)>,
-    dns: Arc<Mutex<VirtualDns>>,
     mtu: u16,
     idle_timeout: Duration,
     shutdown: CancellationToken,
@@ -336,8 +341,6 @@ async fn run_udp_session(
         return;
     }
 
-    let mut target_to_orig: HashMap<String, SocketAddr> = HashMap::new();
-    let mut last_orig_dst: Option<SocketAddr> = None;
     let mut ctrl_buf = [0u8; 64];
     let mut recv_buf = vec![0u8; (mtu as usize).max(4096) + 256];
     let idle_sleep = tokio::time::sleep(idle_timeout);
@@ -354,23 +357,10 @@ async fn run_udp_session(
                 }
             }
             pkt = rx.recv() => {
-                let Some((data, orig_dst)) = pkt else {
+                let Some(data) = pkt else {
                     break;
                 };
                 idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
-
-                let target = {
-                    let mut dns_guard = dns.lock().unwrap();
-                    match dns_guard.resolve_ip(orig_dst.ip(), Instant::now()) {
-                        Some(domain) => TargetAddr::Domain(domain, orig_dst.port()),
-                        None => TargetAddr::Ip(orig_dst),
-                    }
-                };
-                if target_to_orig.len() >= 512 {
-                    target_to_orig.clear();
-                }
-                target_to_orig.insert(target_key(&target), orig_dst);
-                last_orig_dst = Some(orig_dst);
 
                 let encoded = socks5::encode_udp_packet(&target, &data);
                 if udp.send(&encoded).await.is_err() {
@@ -386,31 +376,16 @@ async fn run_udp_session(
                 let Some((from_target, payload)) = socks5::decode_udp_packet(&recv_buf[..n]) else {
                     continue;
                 };
-                let remote_addr = target_to_orig
-                    .get(&target_key(&from_target))
-                    .copied()
-                    .or_else(|| match &from_target {
-                        TargetAddr::Domain(dom, port) => dns
-                            .lock()
-                            .unwrap()
-                            .lookup_fake_ip_for_name(dom, src_addr.is_ipv6(), Instant::now())
-                            .map(|ip| SocketAddr::new(ip, *port)),
-                        TargetAddr::Ip(addr) => Some(*addr),
-                    })
-                    .or(last_orig_dst);
-
-                if let Some(remote) = remote_addr {
-                    let _ = reply_tx.try_send((payload.to_vec(), remote, src_addr));
-                }
+                let remote = match (&target, from_target) {
+                    // Keep the virtual IP the application addressed, including its IP family.
+                    (TargetAddr::Domain(..), TargetAddr::Ip(addr)) => SocketAddr::new(dst_addr.ip(), addr.port()),
+                    (_, TargetAddr::Domain(_, port)) => SocketAddr::new(dst_addr.ip(), port),
+                    (_, TargetAddr::Ip(addr)) if addr.is_ipv4() == src_addr.is_ipv4() => addr,
+                    _ => continue,
+                };
+                let _ = reply_tx.try_send((payload.to_vec(), remote, src_addr));
             }
         }
-    }
-}
-
-fn target_key(target: &TargetAddr) -> String {
-    match target {
-        TargetAddr::Ip(addr) => addr.to_string(),
-        TargetAddr::Domain(dom, port) => format!("{}:{}", dom.to_ascii_lowercase(), port),
     }
 }
 
@@ -772,7 +747,11 @@ mod tests {
                                         udp_targets.lock().unwrap().push(dst.clone());
                                         let mut out_payload = b"echo:".to_vec();
                                         out_payload.extend_from_slice(payload);
-                                        let reply = socks5::encode_udp_packet(&dst, &out_payload);
+                                        let sender = match dst {
+                                            TargetAddr::Domain(_, port) => TargetAddr::Ip(SocketAddr::from(([192, 0, 2, 1], port))),
+                                            ip => ip,
+                                        };
+                                        let reply = socks5::encode_udp_packet(&sender, &out_payload);
                                         let _ = udp.send_to(&reply, peer).await;
                                     }
                                 }
@@ -962,47 +941,39 @@ mod tests {
         sockets.get_mut::<udp::Socket>(udp_handle).bind(50000).unwrap();
 
         let dns_server: IpAddress = Ipv4Address::new(10, 255, 255, 254).into();
-        let q_a = crate::dns::tests::encode_query_wire(201, "udp.test", 1, false);
-        sockets
-            .get_mut::<udp::Socket>(udp_handle)
-            .send_slice(&q_a, (dns_server, 53))
-            .unwrap();
+        for (query_type, name) in [(28, "v6.test"), (1, "v4.test")] {
+            let query = crate::dns::tests::encode_query_wire(201, name, query_type, false);
+            sockets.get_mut::<udp::Socket>(udp_handle).send_slice(&query, (dns_server, 53)).unwrap();
 
-        let mut fake_v4 = None;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while fake_v4.is_none() && Instant::now() < deadline {
-            pump_device(&mut dev, &mut iface, &mut sockets, &to_engine_tx, &mut from_engine_rx).await;
-            let u = sockets.get_mut::<udp::Socket>(udp_handle);
-            let mut rbuf = [0u8; 1024];
-            if let Ok((n, _)) = u.recv_slice(&mut rbuf) {
-                fake_v4 = Some(Ipv4Addr::new(rbuf[n - 4], rbuf[n - 3], rbuf[n - 2], rbuf[n - 1]));
-            }
+            let dns_reply = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    pump_device(&mut dev, &mut iface, &mut sockets, &to_engine_tx, &mut from_engine_rx).await;
+                    if let Ok((data, _)) = sockets.get_mut::<udp::Socket>(udp_handle).recv() {
+                        break data.to_vec();
+                    }
+                }
+            }).await.expect("virtual DNS reply");
+            let ip = if query_type == 28 {
+                let bytes: [u8; 16] = dns_reply[dns_reply.len() - 16..].try_into().unwrap();
+                IpAddress::from(Ipv6Addr::from(bytes))
+            } else {
+                let bytes: [u8; 4] = dns_reply[dns_reply.len() - 4..].try_into().unwrap();
+                IpAddress::from(Ipv4Addr::from(bytes))
+            };
+            let endpoint = (ip, 9999u16);
+            sockets.get_mut::<udp::Socket>(udp_handle).send_slice(b"hello-udp", endpoint).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    pump_device(&mut dev, &mut iface, &mut sockets, &to_engine_tx, &mut from_engine_rx).await;
+                    if let Ok((data, meta)) = sockets.get_mut::<udp::Socket>(udp_handle).recv() {
+                        assert_eq!(data, b"echo:hello-udp");
+                        assert_eq!(meta.endpoint, endpoint.into());
+                        break;
+                    }
+                }
+            }).await.expect("UDP reply from the original virtual endpoint");
+            assert!(udp_targets.lock().unwrap().contains(&TargetAddr::Domain(name.into(), 9999)));
         }
-        let fake_v4 = fake_v4.expect("Fake-IPv4 for udp.test");
-        let dst_ep = (IpAddress::from(fake_v4), 9999u16);
-        sockets
-            .get_mut::<udp::Socket>(udp_handle)
-            .send_slice(b"hello-udp", dst_ep)
-            .unwrap();
-
-        let mut reply = None;
-        let udp_deadline = Instant::now() + Duration::from_secs(5);
-        while reply.is_none() && Instant::now() < udp_deadline {
-            pump_device(&mut dev, &mut iface, &mut sockets, &to_engine_tx, &mut from_engine_rx).await;
-            let u = sockets.get_mut::<udp::Socket>(udp_handle);
-            let mut rbuf = [0u8; 1024];
-            if let Ok((n, meta)) = u.recv_slice(&mut rbuf) {
-                reply = Some((rbuf[..n].to_vec(), meta.endpoint));
-            }
-        }
-        let (data, from_ep) = reply.expect("UDP reply from SOCKS5 relay");
-        assert_eq!(data, b"echo:hello-udp");
-        assert_eq!(from_ep.addr, IpAddress::from(fake_v4));
-        assert_eq!(from_ep.port, 9999);
-        assert!(udp_targets
-            .lock()
-            .unwrap()
-            .contains(&TargetAddr::Domain("udp.test".to_string(), 9999)));
 
         engine_cancel.cancel();
         mock_cancel.cancel();

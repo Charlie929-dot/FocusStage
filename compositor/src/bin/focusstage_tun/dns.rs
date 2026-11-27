@@ -99,20 +99,6 @@ impl VirtualDns {
         Some(entry.name.clone())
     }
 
-    pub fn lookup_fake_ip_for_name(&mut self, raw_name: &str, v6: bool, now: Instant) -> Option<IpAddr> {
-        let name = canonicalize_domain(raw_name);
-        let &id = self.name_to_id.get(&name)?;
-        if let Some(entry) = self.id_to_entry.get_mut(&id) {
-            entry.expires_at = now + DNS_MAPPING_TTL;
-            return Some(if v6 {
-                IpAddr::V6(id_to_ipv6(id))
-            } else {
-                IpAddr::V4(id_to_ipv4(id))
-            });
-        }
-        None
-    }
-
     pub fn handle_query(&mut self, query: &[u8]) -> Option<Vec<u8>> {
         let parsed = parse_dns_query(query)?;
         let now = Instant::now();
