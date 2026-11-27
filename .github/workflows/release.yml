@@ -148,6 +148,7 @@ jobs:
           Copy-Item scripts/focusstage-launch dist/payload/scripts/focusstage-launch -Force
           Copy-Item scripts/focusstage-open dist/payload/scripts/focusstage-open -Force
           Copy-Item scripts/claude-mcp.py dist/payload/scripts/claude-mcp.py -Force
+          Copy-Item scripts/49-focusstage-gvfs-admin.rules dist/payload/scripts/49-focusstage-gvfs-admin.rules -Force
           Copy-Item scripts/uninstall.ps1 dist/payload/scripts/uninstall.ps1 -Force
 
           $zipName = "FocusStage-${{ steps.meta.outputs.release_tag }}-win-x64.zip"

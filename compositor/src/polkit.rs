@@ -1043,8 +1043,22 @@ fn handle_begin_auth(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let (program_name, command_line, icon_details, effective_message) =
-        normalize_focusstage_elevation_display(&details, raw_command_line.as_deref(), &message);
-    let icon_png = resolve_auth_icon_png(&action_id, &icon_name, &icon_details);
+        normalize_focusstage_elevation_display(
+            &action_id,
+            &details,
+            raw_command_line.as_deref(),
+            &message,
+        );
+    let effective_icon_name = if icon_name.trim().is_empty()
+        && matches!(
+            action_id.as_str(),
+            "org.gtk.vfs.file-operations" | "org.gtk.vfs.file-operations-helper"
+        ) {
+        "org.gnome.Nautilus"
+    } else {
+        icon_name.as_str()
+    };
+    let icon_png = resolve_auth_icon_png(&action_id, effective_icon_name, &icon_details);
 
     let attempt = 1u64;
     let helper = match HelperProcess::start(&cookie, &current_user, attempt, helper_tx.clone()) {
@@ -1330,6 +1344,7 @@ fn restart_helper_for_retry(
 }
 
 fn normalize_focusstage_elevation_display(
+    action_id: &str,
     details: &HashMap<String, String>,
     raw_command_line: Option<&str>,
     raw_message: &str,
@@ -1366,6 +1381,21 @@ fn normalize_focusstage_elevation_display(
                 "需要管理员权限以 root 身份打开终端".to_string(),
             );
         }
+    }
+
+    if raw_command_line.is_none()
+        && matches!(
+            action_id,
+            "org.gtk.vfs.file-operations" | "org.gtk.vfs.file-operations-helper"
+        )
+    {
+        icon_details.insert("program".to_string(), "/usr/bin/nautilus".to_string());
+        return (
+            Some("Files".to_string()),
+            Some("nautilus admin:///".to_string()),
+            icon_details,
+            "需要管理员权限以 root 身份浏览和管理文件".to_string(),
+        );
     }
 
     let program_name = details
@@ -1434,6 +1464,7 @@ mod tests {
         let mut details = HashMap::new();
         details.insert("program".to_string(), "/usr/local/bin/focusstage".to_string());
         let (prog, cmd, icon_details, msg) = normalize_focusstage_elevation_display(
+            "org.freedesktop.policykit.exec",
             &details,
             Some("/usr/local/bin/focusstage root-exec -- /usr/bin/nautilus --new-window"),
             "Authentication is needed to run",
@@ -1445,5 +1476,23 @@ mod tests {
             Some("/usr/bin/nautilus")
         );
         assert!(msg.contains("nautilus"));
+    }
+
+    #[test]
+    fn normalizes_gvfs_admin_polkit_details() {
+        let details = HashMap::new();
+        let (prog, cmd, icon_details, msg) = normalize_focusstage_elevation_display(
+            "org.gtk.vfs.file-operations",
+            &details,
+            None,
+            "Authentication is required to perform file operations",
+        );
+        assert_eq!(prog.as_deref(), Some("Files"));
+        assert_eq!(cmd.as_deref(), Some("nautilus admin:///"));
+        assert_eq!(
+            icon_details.get("program").map(String::as_str),
+            Some("/usr/bin/nautilus")
+        );
+        assert!(msg.contains("管理员权限"));
     }
 }

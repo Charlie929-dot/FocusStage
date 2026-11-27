@@ -1,0 +1,14 @@
+// Allow privileged WSL users (whose logind session has no physical seat)
+// to mount GVfs admin:/// locations (used by GNOME Files / Nautilus 47+)
+// after authenticating via the FocusStage Polkit agent.
+polkit.addRule(function(action, subject) {
+    if (!(subject.isInGroup("sudo") || subject.isInGroup("wheel") || subject.isInGroup("admin"))) {
+        return;
+    }
+    if (action.id == "org.gtk.vfs.file-operations-helper") {
+        return polkit.Result.YES;
+    }
+    if (action.id == "org.gtk.vfs.file-operations") {
+        return polkit.Result.AUTH_ADMIN_KEEP;
+    }
+});

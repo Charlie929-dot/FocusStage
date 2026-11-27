@@ -199,6 +199,9 @@ for helper in focusstage-launch focusstage-open; do
   sed 's/\r$//' "$repo/scripts/$helper" > "/usr/local/bin/$helper"
   chmod 755 "/usr/local/bin/$helper"
 done
+install -d -m 755 /etc/polkit-1/rules.d
+sed 's/\r$//' "$repo/scripts/49-focusstage-gvfs-admin.rules" > /etc/polkit-1/rules.d/49-focusstage-gvfs-admin.rules
+chmod 644 /etc/polkit-1/rules.d/49-focusstage-gvfs-admin.rules
 packages=(python3 pkexec gnome-keyring xdg-desktop-portal xdg-desktop-portal-gtk xdg-utils desktop-file-utils xwayland fonts-noto-cjk iproute2 libcap2-bin)
 if command -v apt-get >/dev/null && ! dpkg -s "${packages[@]}" >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive

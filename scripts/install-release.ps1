@@ -253,6 +253,7 @@ try {
         "chmod 755 /usr/local/bin/focusstage-launch",
         "sed 's/\r`$//' '$scriptsEsc/focusstage-open' > /usr/local/bin/focusstage-open",
         "chmod 755 /usr/local/bin/focusstage-open",
+        "if test -f '$scriptsEsc/49-focusstage-gvfs-admin.rules'; then install -d -m 755 /etc/polkit-1/rules.d && sed 's/\r`$//' '$scriptsEsc/49-focusstage-gvfs-admin.rules' > /etc/polkit-1/rules.d/49-focusstage-gvfs-admin.rules && chmod 644 /etc/polkit-1/rules.d/49-focusstage-gvfs-admin.rules; fi",
         "if test -f /usr/local/libexec/focusstage-auth; then /usr/bin/python3 -I /usr/local/libexec/focusstage-auth remove; fi",
         "/usr/local/bin/focusstage --json sync-apps --uid $WslUid >/dev/null"
     ) -join "`n"

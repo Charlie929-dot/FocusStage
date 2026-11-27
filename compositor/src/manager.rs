@@ -41,9 +41,35 @@ impl FocusStageState {
         wait_for_handoff: Option<bool>,
         run_as_root: bool,
     ) -> Result<StageLaunch, String> {
+        let (app, args, wm_class, effective_run_as_root, nautilus_admin) =
+            if run_as_root && is_nautilus_app(&app) {
+                if let Some(root_fm) = resolve_root_file_manager() {
+                    (
+                        root_fm.to_string(),
+                        root_file_manager_args(root_fm, &args),
+                        Some(root_file_manager_wm_class(root_fm).to_string()),
+                        true,
+                        false,
+                    )
+                } else {
+                    (
+                        app,
+                        nautilus_admin_args(&args),
+                        wm_class,
+                        false,
+                        true,
+                    )
+                }
+            } else {
+                (app, args, wm_class, run_as_root, false)
+            };
+
         if run_as_root {
             if !Path::new("/usr/bin/pkexec").is_file() {
                 return Err("未找到 /usr/bin/pkexec，无法以 root 身份启动应用。".into());
+            }
+            if nautilus_admin && !has_gvfs_admin_backend() {
+                return Err("未找到 GVfs admin 后端（请安装 gvfs-backends），无法以管理员模式打开 Files。".into());
             }
             let _ = self.ensure_polkit_agent_stage();
         }
@@ -52,8 +78,11 @@ impl FocusStageState {
         let kind = kind_opt.unwrap_or(inferred_kind);
         let show = show_on_desktop.unwrap_or(self.display_sink.is_some());
         let wm_class = wm_class.as_deref().map(str::trim).filter(|class| !class.is_empty());
-        if is_single_instance(kind) || is_single_instance(inferred_kind) {
-            let existing = self.find_handoff_stage(&app, None, wm_class, run_as_root).map_err(|err| err.to_string())?;
+        let single_instance_app = is_single_instance(kind)
+            || is_single_instance(inferred_kind)
+            || (!effective_run_as_root && is_nautilus_app(&app));
+        if single_instance_app {
+            let existing = self.find_handoff_stage(&app, None, wm_class, effective_run_as_root).map_err(|err| err.to_string())?;
             if let Some(stage_id) = existing {
                 let stage = &self.stages[&stage_id];
                 if extra_env.iter().any(|(key, value)| stage.launch_env.get(key) != Some(value)) {
@@ -102,7 +131,7 @@ impl FocusStageState {
         stage.launch_token = Some(new_launch_token().map_err(|err| format!("create Stage launch token: {err}"))?);
         stage.launch_env = extra_env;
         stage.launch_cwd = cwd;
-        stage.run_as_root = run_as_root;
+        stage.run_as_root = effective_run_as_root;
 
         if is_single_instance(kind) {
             self.a11y.prepare_for_launch();
@@ -628,6 +657,15 @@ pub(crate) fn wsl_gallium_driver() -> Option<OsString> {
     }
 }
 
+pub(crate) fn wsl_gsk_renderer() -> Option<OsString> {
+    if is_wsl2() {
+        // Default GTK4 to Cairo on WSL2 so wl_shm readback avoids blank d3d12 EGL buffers.
+        Some(std::env::var_os("GSK_RENDERER").unwrap_or_else(|| "cairo".into()))
+    } else {
+        None
+    }
+}
+
 fn profile_arguments(kind: StageKind, args: &[String]) -> anyhow::Result<Vec<&str>> {
     let mut profile = Vec::new();
     let mut args = args.iter().map(String::as_str).take_while(|arg| *arg != "--").peekable();
@@ -758,6 +796,133 @@ fn resolve_launch_executable(app: &str) -> String {
         }
     }
     app.to_string()
+}
+
+fn is_nautilus_app(app: &str) -> bool {
+    let matches_name = |candidate: &str| {
+        Path::new(candidate)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.eq_ignore_ascii_case("nautilus")
+                    || name.eq_ignore_ascii_case("org.gnome.nautilus")
+            })
+    };
+    matches_name(app) || matches_name(&resolve_launch_executable(app))
+}
+
+fn resolve_root_file_manager() -> Option<&'static str> {
+    resolve_root_file_manager_with(|path| path.is_file())
+}
+
+fn resolve_root_file_manager_with(exists: impl Fn(&Path) -> bool) -> Option<&'static str> {
+    const CANDIDATES: &[&str] = &["/usr/bin/nemo", "/usr/bin/thunar"];
+    CANDIDATES.iter().copied().find(|candidate| exists(Path::new(candidate)))
+}
+
+fn root_file_manager_wm_class(target_app: &str) -> &'static str {
+    let is_thunar = Path::new(target_app)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("thunar"));
+    if is_thunar {
+        "focusstage-thunar"
+    } else {
+        "focusstage-nemo"
+    }
+}
+
+fn translate_admin_location(arg: &str) -> String {
+    let lower = arg.to_ascii_lowercase();
+    let rest = if lower.starts_with("admin://") {
+        &arg["admin://".len()..]
+    } else if lower.starts_with("file://localhost/") {
+        &arg["file://localhost/".len()..]
+    } else if lower.starts_with("file://") {
+        &arg["file://".len()..]
+    } else {
+        return arg.to_string();
+    };
+    format!("/{}", rest.trim_start_matches('/'))
+}
+
+fn root_file_manager_args(target_app: &str, args: &[String]) -> Vec<String> {
+    let is_nemo = Path::new(target_app)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("nemo"));
+    let mut out = Vec::with_capacity(args.len() + 2);
+    if is_nemo {
+        out.push("--no-desktop".to_string());
+    }
+    let mut has_location = false;
+    let mut after_double_dash = false;
+    for arg in args {
+        if !after_double_dash && arg == "--" {
+            after_double_dash = true;
+            continue;
+        }
+        if !after_double_dash && arg.starts_with('-') {
+            continue;
+        }
+        has_location = true;
+        out.push(translate_admin_location(arg));
+    }
+    if !has_location {
+        out.push("/".to_string());
+    }
+    out
+}
+
+fn has_gvfs_admin_backend() -> bool {
+    Path::new("/usr/share/gvfs/mounts/admin.mount").is_file()
+        && (Path::new("/usr/libexec/gvfsd-admin").is_file()
+            || Path::new("/usr/lib/gvfs/gvfsd-admin").is_file())
+}
+
+fn nautilus_admin_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 2);
+    let mut has_new_window = false;
+    let mut has_location = false;
+    let mut after_double_dash = false;
+
+    for arg in args {
+        if !after_double_dash && arg == "--" {
+            after_double_dash = true;
+            out.push(arg.clone());
+            continue;
+        }
+        if !after_double_dash && arg.starts_with('-') {
+            if arg == "-w" || arg == "--new-window" {
+                has_new_window = true;
+            }
+            out.push(arg.clone());
+            continue;
+        }
+        has_location = true;
+        let lower = arg.to_ascii_lowercase();
+        if lower.starts_with("admin://") {
+            out.push(arg.clone());
+        } else if lower.starts_with("file://localhost/") {
+            let rest = &arg["file://localhost/".len()..];
+            out.push(format!("admin:///{rest}"));
+        } else if lower.starts_with("file://") {
+            let rest = &arg["file://".len()..];
+            out.push(format!("admin://{rest}"));
+        } else if arg.starts_with('/') {
+            out.push(format!("admin://{arg}"));
+        } else {
+            out.push(arg.clone());
+        }
+    }
+
+    if !has_new_window {
+        out.insert(0, "--new-window".to_string());
+    }
+    if !has_location {
+        out.push("admin:///".to_string());
+    }
+    out
 }
 
 fn resolve_focusstage_cli_path() -> PathBuf {
@@ -986,6 +1151,9 @@ fn apply_common_stage_env(cmd: &mut Command, wayland_socket: &str, x11_display: 
     }
     if let Some(driver) = wsl_gallium_driver() {
         cmd.env("GALLIUM_DRIVER", driver);
+    }
+    if let Some(renderer) = wsl_gsk_renderer() {
+        cmd.env("GSK_RENDERER", renderer);
     }
 
     // Chinese IME support (Fcitx5)
@@ -1418,5 +1586,122 @@ mod tests {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(output.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
         }
+    }
+
+    #[test]
+    fn recognizes_nautilus_app_names() {
+        assert!(is_nautilus_app("nautilus"));
+        assert!(is_nautilus_app("/usr/bin/nautilus"));
+        assert!(is_nautilus_app("org.gnome.Nautilus"));
+        assert!(!is_nautilus_app("ptyxis"));
+        assert!(!is_nautilus_app("/usr/share/code/code"));
+    }
+
+    #[test]
+    fn rewrites_nautilus_root_args_to_admin_uri() {
+        let to_vec = |items: &[&str]| items.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(nautilus_admin_args(&[]), to_vec(&["--new-window", "admin:///"]));
+        assert_eq!(
+            nautilus_admin_args(&to_vec(&["--new-window"])),
+            to_vec(&["--new-window", "admin:///"])
+        );
+        assert_eq!(
+            nautilus_admin_args(&to_vec(&["-w", "/etc"])),
+            to_vec(&["-w", "admin:///etc"])
+        );
+        assert_eq!(
+            nautilus_admin_args(&to_vec(&["--new-window", "file:///var/log"])),
+            to_vec(&["--new-window", "admin:///var/log"])
+        );
+        assert_eq!(
+            nautilus_admin_args(&to_vec(&["--new-window", "admin:///etc"])),
+            to_vec(&["--new-window", "admin:///etc"])
+        );
+    }
+
+    #[test]
+    fn resolves_root_file_manager_priority() {
+        assert_eq!(
+            resolve_root_file_manager_with(|p| p == Path::new("/usr/bin/nemo") || p == Path::new("/usr/bin/thunar")),
+            Some("/usr/bin/nemo")
+        );
+        assert_eq!(
+            resolve_root_file_manager_with(|p| p == Path::new("/usr/bin/thunar")),
+            Some("/usr/bin/thunar")
+        );
+        assert_eq!(resolve_root_file_manager_with(|_| false), None);
+        assert_eq!(root_file_manager_wm_class("/usr/bin/nemo"), "focusstage-nemo");
+        assert_eq!(root_file_manager_wm_class("/usr/bin/thunar"), "focusstage-thunar");
+    }
+
+    #[test]
+    fn maps_nautilus_args_for_root_file_manager() {
+        let to_vec = |items: &[&str]| items.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            root_file_manager_args("/usr/bin/nemo", &[]),
+            to_vec(&["--no-desktop", "/"])
+        );
+        assert_eq!(
+            root_file_manager_args("/usr/bin/nemo", &to_vec(&["--new-window", "admin:///etc"])),
+            to_vec(&["--no-desktop", "/etc"])
+        );
+        assert_eq!(
+            root_file_manager_args("/usr/bin/nemo", &to_vec(&["-w", "--", "file:///var/log"])),
+            to_vec(&["--no-desktop", "/var/log"])
+        );
+        assert_eq!(
+            root_file_manager_args("/usr/bin/nemo", &to_vec(&["file://localhost/opt"])),
+            to_vec(&["--no-desktop", "/opt"])
+        );
+        assert_eq!(
+            root_file_manager_args("/usr/bin/thunar", &to_vec(&["--new-window"])),
+            to_vec(&["/"])
+        );
+        assert_eq!(
+            root_file_manager_args("/usr/bin/thunar", &to_vec(&["/etc"])),
+            to_vec(&["/etc"])
+        );
+    }
+
+    #[test]
+    fn wsl_stages_default_gsk_renderer_to_cairo_and_allow_override() {
+        if !is_wsl2() {
+            return;
+        }
+        let stage = Stage::new(
+            "stage-1".into(),
+            "nautilus".into(),
+            Vec::new(),
+            StageKind::Wayland,
+            1280,
+            800,
+            DisplayState::Desktop,
+            1.0,
+        );
+        let expected = std::env::var_os("GSK_RENDERER").unwrap_or_else(|| "cairo".into());
+        let cmd = stage_command("unused", &stage, &stage.app, &[], None);
+        let envs: HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GSK_RENDERER")),
+            Some(&Some(expected.as_os_str()))
+        );
+
+        let mut custom = Stage::new(
+            "stage-2".into(),
+            "nautilus".into(),
+            Vec::new(),
+            StageKind::Wayland,
+            1280,
+            800,
+            DisplayState::Desktop,
+            1.0,
+        );
+        custom.launch_env.insert("GSK_RENDERER".into(), "gl".into());
+        let custom_cmd = stage_command("unused", &custom, &custom.app, &[], None);
+        let custom_envs: HashMap<_, _> = custom_cmd.get_envs().collect();
+        assert_eq!(
+            custom_envs.get(std::ffi::OsStr::new("GSK_RENDERER")),
+            Some(&Some(std::ffi::OsStr::new("gl")))
+        );
     }
 }
