@@ -379,6 +379,31 @@
                   <label class="switch"><input type="checkbox" id="toggle-linux-hide-wsl" aria-label="过滤常见 WSL 标识" disabled /><span class="switch-track"></span></label>
                 </div>
               </div>
+
+              <div class="setting-row">
+                <div class="setting-info">
+                  <label class="setting-name" for="select-graphics-driver">WSL2 图形渲染后端</label>
+                  <div class="setting-desc">控制 WSL2 应用的 Mesa 渲染后端（GALLIUM_DRIVER）；切换后重新打开应用生效。</div>
+                </div>
+                <div class="setting-action">
+                  <select id="select-graphics-driver" class="select-input" disabled>
+                    <option value="auto">D3D12 硬件加速（默认）</option>
+                    <option value="llvmpipe">软件渲染（llvmpipe）</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="setting-row">
+                <div class="setting-info">
+                  <label class="setting-name" for="select-d3d12-adapter">D3D12 显卡适配器</label>
+                  <div class="setting-desc">指定 WSL2 应用经 Mesa D3D12 使用的宿主显卡（MESA_D3D12_DEFAULT_ADAPTER_NAME），双显卡设备可用于规避特定驱动异常；重新打开应用生效。</div>
+                </div>
+                <div class="setting-action">
+                  <select id="select-d3d12-adapter" class="select-input" disabled aria-label="D3D12 显卡适配器">
+                    <option value="auto">自动选择（系统默认）</option>
+                  </select>
+                </div>
+              </div>
             </div>
 
             <div class="settings-group">

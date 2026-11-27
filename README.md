@@ -167,6 +167,8 @@ focusstage settings get
 
 **汉字备用字形**：如果 WSL 使用 `C.UTF-8`，而中文菜单中的个别汉字看起来像日文字形，可在 Linux 设置的「汉字备用字形」里选择简体中文，或运行 `focusstage settings set-han-fallback zh-cn`。也支持 `zh-tw`、`ja`；用 `system` 恢复默认。重新打开应用后生效。此选项只给新启动的普通 Stage 提供 Fontconfig 备用字体，不修改 Ubuntu 全局配置、应用界面语言或缩放；已指定的地区语言和 Fontconfig 环境优先，自带字体或不使用 Fontconfig 的应用不一定受影响。
 
+**WSL2 图形渲染与 D3D12 显卡选择**：WSL2 检测到 `/dev/dxg` 时默认向 Stage 注入 `GALLIUM_DRIVER=d3d12`。在双显卡设备或遇到特定显卡驱动兼容问题时，可在 Linux 设置中切换「WSL2 图形渲染后端」（`auto` / `llvmpipe`）和「D3D12 显卡适配器」（映射到 `MESA_D3D12_DEFAULT_ADAPTER_NAME`），或使用 CLI：`focusstage settings set-graphics-driver <auto|d3d12|llvmpipe>`、`focusstage settings set-d3d12-adapter <auto|显卡名称>`。重新打开应用后生效；显式环境变量与单 Stage `launch_env` 覆盖优先。
+
 ### 3. 运行 Windows 11 启动器与托盘（`FocusStage.exe`）
 
 源码位于 WSL 时，通过 `./scripts/install.sh --skip-rust-build` 复用已有的 Rust 构建产物。源码位于 Windows 磁盘时也可以直接调试启动器：

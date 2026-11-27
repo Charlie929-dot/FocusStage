@@ -215,6 +215,7 @@ FocusStage 要实现的体验：
 ### 4.8 文件与外部集成
 
 - **会话字体回退**：普通 Stage 的共同启动路径由 `SessionEnv` 解析应用覆盖值和继承的地区设置。默认完全使用 Ubuntu 的 Fontconfig；仅当用户选择了备用字形且没有明确的语言或字体配置时，向子进程传入包含系统规则的 `FONTCONFIG_FILE`。此设置不按应用名分支、不改系统 locale、不导入用户总线，也不作用于提权程序和持久服务。字形选择发生在应用侧，不在合成器或 Windows 宿主中重绘文字。
+- **WSL2 图形后端与 D3D12 适配器**：`settings.json` 支持 `graphics_driver`（`auto`/`d3d12`/`llvmpipe`）与 `d3d12_adapter`（`MESA_D3D12_DEFAULT_ADAPTER_NAME`），在 `stage_command` 中统一应用到新启动的 Stage（显式环境与单 Stage `launch_env` 优先）；Windows 启动器通过 DXGI 枚举宿主硬件显卡供下拉选择。XWayland 本身不启用 Glamor，不额外注入 `GALLIUM_DRIVER`，其 stderr 通过管道接入合成器日志。
 - 引导应用的默认目录（XDG User Dirs）指向 `/mnt/c/Users/<user>/` 下的桌面、下载、文档与图片目录；
 - 已知限制：`/mnt/c` 走 9P 文件系统，大量小文件读写（如大仓库构建）明显变慢，对性能敏感的项目建议放在 WSL 原生文件系统中；
 - 从资源管理器拖文件到宿主窗口（或 AI 调用 `stage_drop_files`）：路径 `C:\...` 转为 `/mnt/c/...`，经 `wl_data_device` 投递拖放；

@@ -226,6 +226,8 @@ enum SettingsCommand {
     SetCursorTheme { id: String },
     SetFontName { value: String },
     SetHanFallback { #[arg(value_parser = ["system", "zh-cn", "zh-tw", "ja"])] value: String },
+    SetGraphicsDriver { #[arg(value_parser = ["auto", "d3d12", "llvmpipe"])] value: String },
+    SetD3d12Adapter { value: String },
     SetTextScale { value: String },
     ResetTheme,
     SetHideWsl { enabled: String },
@@ -345,6 +347,8 @@ fn main() -> anyhow::Result<()> {
             SettingsCommand::SetCursorTheme { id } => SettingsAction::SetCursorTheme(id),
             SettingsCommand::SetFontName { value } => SettingsAction::SetFontName(value),
             SettingsCommand::SetHanFallback { value } => SettingsAction::SetHanFallback(value),
+            SettingsCommand::SetGraphicsDriver { value } => SettingsAction::SetGraphicsDriver(value),
+            SettingsCommand::SetD3d12Adapter { value } => SettingsAction::SetD3d12Adapter(value),
             SettingsCommand::SetTextScale { value } => SettingsAction::SetTextScale(value),
             SettingsCommand::ResetTheme => SettingsAction::ResetTheme,
             SettingsCommand::SetHideWsl { enabled } => {
