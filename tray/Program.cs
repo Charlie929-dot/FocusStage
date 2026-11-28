@@ -213,6 +213,7 @@ internal sealed class HotkeyWindow : NativeWindow, IDisposable
 internal sealed class FocusStageTrayContext : ApplicationContext
 {
     private readonly string _distro;
+    private readonly WslControlBridge _bridge;
     private readonly NotifyIcon _notifyIcon;
     private readonly ContextMenuStrip _menu;
     private readonly HotkeyWindow _hotkeyWindow;
@@ -250,6 +251,7 @@ internal sealed class FocusStageTrayContext : ApplicationContext
     public FocusStageTrayContext(string distro, bool startMinimized, EventWaitHandle showEvent)
     {
         _distro = distro;
+        _bridge = new WslControlBridge(distro);
         _trayIcon = CreateTrayIcon();
         _menu = new ContextMenuStrip();
         _menu.Opening += (_, _) => _ = RefreshAndRebuildMenuAsync();
@@ -487,7 +489,7 @@ internal sealed class FocusStageTrayContext : ApplicationContext
             }
             status.Text = "正在读取 Linux 浏览器…";
             status.Visible = true;
-            var (ok, apps, _) = await ShortcutManager.FetchLinuxAppsAsync(_distro);
+            var (ok, apps, _) = await FetchLinuxAppsViaBridgeAsync();
             loading = false;
             if (menu.IsDisposed || menu.Owner is null) return;
 
@@ -747,10 +749,64 @@ internal sealed class FocusStageTrayContext : ApplicationContext
         }
     }
 
+    internal async Task<(bool Ok, List<LinuxAppDto> Apps, string Error)> FetchLinuxAppsViaBridgeAsync()
+    {
+        var (ok, stdout) = await CallBridgeOrLegacyAsync(
+            JsonSerializer.Serialize(new { op = "list_apps" }),
+            "--json", "list-apps");
+        if (!ok)
+        {
+            return _bridge.IsUnsupported
+                ? (false, new(), "focusstage list-apps failed")
+                : (false, new(), "focusstage control-bridge unavailable");
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(stdout);
+            if (doc.RootElement.TryGetProperty("status", out var st) && st.GetString() == "error")
+            {
+                var msg = doc.RootElement.TryGetProperty("message", out var msgEl)
+                    ? msgEl.GetString() ?? "control-bridge error"
+                    : "control-bridge error";
+                return (false, new(), msg);
+            }
+            if (doc.RootElement.TryGetProperty("apps", out var arr))
+            {
+                var apps = JsonSerializer.Deserialize<List<LinuxAppDto>>(arr.GetRawText()) ?? new();
+                return (true, apps, "");
+            }
+            return (false, new(), "Unexpected response from focusstage control-bridge");
+        }
+        catch (Exception ex)
+        {
+            return (false, new(), ex.Message);
+        }
+    }
+
+    private async Task<(bool Ok, string Stdout)> CallBridgeOrLegacyAsync(string bridgeRequestJson, params string[] legacyArgs)
+    {
+        if (!_bridge.IsUnsupported)
+        {
+            var (ok, stdout) = await _bridge.CallAsync(bridgeRequestJson);
+            if (ok && !string.IsNullOrWhiteSpace(stdout))
+            {
+                return (true, stdout);
+            }
+            if (!_bridge.IsUnsupported)
+            {
+                return (false, "");
+            }
+        }
+
+        var (code, legacyStdout) = await RunFocusStageAsync(legacyArgs);
+        return (code == 0 && !string.IsNullOrWhiteSpace(legacyStdout), legacyStdout);
+    }
+
     private async Task RefreshStateAsync()
     {
-        var (code, stdout) = await RunFocusStageAsync("--json", "list");
-        if (code == 0 && !string.IsNullOrWhiteSpace(stdout))
+        var (ok, stdout) = await CallBridgeOrLegacyAsync("{\"op\":\"list\"}", "--json", "list");
+        if (ok && !string.IsNullOrWhiteSpace(stdout))
         {
             try
             {
@@ -791,7 +847,8 @@ internal sealed class FocusStageTrayContext : ApplicationContext
                     if (!string.IsNullOrEmpty(currentWin) && currentWin != _lastWinClipboard)
                     {
                         _lastWinClipboard = currentWin;
-                        await RunFocusStageAsync("--json", "host-clipboard-sync", currentWin);
+                        var syncJson = JsonSerializer.Serialize(new { op = "sync_host_clipboard", text = currentWin });
+                        await CallBridgeOrLegacyAsync(syncJson, "--json", "host-clipboard-sync", currentWin);
                     }
                 }
                 else
@@ -799,8 +856,8 @@ internal sealed class FocusStageTrayContext : ApplicationContext
                     _lastWinClipboard = "";
                 }
 
-                var (code, stdout) = await RunFocusStageAsync("--json", "host-clipboard-get");
-                if (code == 0 && !string.IsNullOrWhiteSpace(stdout))
+                var (ok, stdout) = await CallBridgeOrLegacyAsync("{\"op\":\"get_host_clipboard\"}", "--json", "host-clipboard-get");
+                if (ok && !string.IsNullOrWhiteSpace(stdout))
                 {
                     using var doc = JsonDocument.Parse(stdout);
                     if (doc.RootElement.TryGetProperty("text", out var txtEl) && txtEl.ValueKind == JsonValueKind.String)
@@ -885,6 +942,7 @@ internal sealed class FocusStageTrayContext : ApplicationContext
                 _signalCts.Dispose();
                 _syncTimer.Stop();
                 _syncTimer.Dispose();
+                _bridge.Dispose();
                 _launcherForm?.Dispose();
                 _notifyIcon.Visible = false;
                 _notifyIcon.Dispose();

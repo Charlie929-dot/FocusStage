@@ -928,7 +928,7 @@ internal sealed class LauncherForm : Form
         _loadingApps = true;
         try
         {
-            var (ok, apps, err) = await ShortcutManager.FetchLinuxAppsAsync(_distro);
+            var (ok, apps, err) = await _ctx.FetchLinuxAppsViaBridgeAsync();
             if (!ok)
             {
                 if (forceRender && _webViewReady)

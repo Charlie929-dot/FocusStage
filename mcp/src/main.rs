@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
@@ -207,6 +207,8 @@ enum Commands {
         y: Option<f64>,
         paths: Vec<String>,
     },
+    /// Persistent line-delimited JSON control bridge on stdin/stdout
+    ControlBridge,
     /// Stop focusstaged
     Shutdown,
 }
@@ -276,6 +278,9 @@ fn main() -> anyhow::Result<()> {
 
     if matches!(cli.command, Commands::Mcp) {
         return run_mcp_stdio(sock);
+    }
+    if matches!(cli.command, Commands::ControlBridge) {
+        return run_control_bridge(sock);
     }
 
     if let Commands::EnsureDaemon { native_host } = cli.command {
@@ -451,6 +456,7 @@ fn main() -> anyhow::Result<()> {
     let client = ControlClient::new(sock);
     let req = match cli.command {
         Commands::Mcp
+        | Commands::ControlBridge
         | Commands::EnsureDaemon { .. }
         | Commands::EnsurePolkitAgent
         | Commands::RootTerminal
@@ -1114,6 +1120,65 @@ fn shell_quote_desktop(arg: &str) -> String {
     out
 }
 
+fn run_control_bridge(sock: std::path::PathBuf) -> anyhow::Result<()> {
+    let client = ControlClient::new(sock);
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+
+    for line_res in stdin.lock().lines() {
+        let line = line_res?;
+        if let Some(resp) = handle_control_bridge_line(&line, &client) {
+            let encoded = serde_json::to_string(&resp)?;
+            writeln!(out, "{encoded}")?;
+            out.flush()?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_control_bridge_line(line: &str, client: &ControlClient) -> Option<ControlResponse> {
+    handle_control_bridge_line_with(line, |req| client.call(req))
+}
+
+fn handle_control_bridge_line_with<F>(line: &str, call_fn: F) -> Option<ControlResponse>
+where
+    F: FnOnce(&ControlRequest) -> anyhow::Result<ControlResponse>,
+{
+    let trimmed = line.trim().trim_start_matches('\u{feff}').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let req: ControlRequest = match serde_json::from_str(trimmed) {
+        Ok(req) => req,
+        Err(err) => {
+            return Some(ControlResponse::Error {
+                code: "bad_request".to_string(),
+                message: format!("invalid control request JSON: {err}"),
+            });
+        }
+    };
+
+    match call_fn(&req) {
+        Ok(resp) => Some(resp),
+        Err(err) => {
+            if matches!(req, ControlRequest::ListApps) {
+                session_env::init_cli_environment(None);
+                let apps = desktop::discover_launcher_apps(true);
+                return Some(ControlResponse::Apps {
+                    count: apps.len(),
+                    apps,
+                });
+            }
+            Some(ControlResponse::Error {
+                code: "daemon_offline".to_string(),
+                message: err.to_string(),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use focusstage_compositor::desktop;
@@ -1163,5 +1228,88 @@ Exec=/snap/bin/chromium
         let parsed_arr = super::parse_sync_apps_json(array).unwrap();
         assert_eq!(parsed_arr.len(), 1);
         assert_eq!(parsed_arr[0].source, "appimage");
+    }
+
+    #[test]
+    fn control_bridge_skips_empty_and_whitespace_lines() {
+        let mut called = false;
+        let res = super::handle_control_bridge_line_with("   \t  ", |_| {
+            called = true;
+            Ok(super::ControlResponse::Ok)
+        });
+        assert!(res.is_none());
+        assert!(!called);
+    }
+
+    #[test]
+    fn control_bridge_reports_bad_request_for_invalid_json() {
+        let res = super::handle_control_bridge_line_with("{not-json", |_| {
+            unreachable!("call_fn should not be invoked for invalid JSON")
+        });
+        match res {
+            Some(super::ControlResponse::Error { code, message }) => {
+                assert_eq!(code, "bad_request");
+                assert!(message.contains("invalid control request JSON"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_bridge_reports_daemon_offline_for_list_error() {
+        let res = super::handle_control_bridge_line_with(r#"{"op":"list"}"#, |_| {
+            anyhow::bail!("connection refused")
+        });
+        match res {
+            Some(super::ControlResponse::Error { code, message }) => {
+                assert_eq!(code, "daemon_offline");
+                assert!(message.contains("connection refused"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_bridge_falls_back_to_local_discovery_for_list_apps() {
+        let res = super::handle_control_bridge_line_with(r#"{"op":"list_apps"}"#, |_| {
+            anyhow::bail!("daemon offline")
+        });
+        match res {
+            Some(super::ControlResponse::Apps { count, apps }) => {
+                assert_eq!(count, apps.len());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_bridge_forwards_clipboard_and_list_requests() {
+        let res_sync = super::handle_control_bridge_line_with(
+            r#"{"op":"sync_host_clipboard","text":"hello\nworld"}"#,
+            |req| {
+                assert!(matches!(
+                    req,
+                    super::ControlRequest::SyncHostClipboard { text } if text == "hello\nworld"
+                ));
+                Ok(super::ControlResponse::Ok)
+            },
+        );
+        assert!(matches!(res_sync, Some(super::ControlResponse::Ok)));
+
+        let res_get =
+            super::handle_control_bridge_line_with(r#"{"op":"get_host_clipboard"}"#, |req| {
+                assert!(matches!(req, super::ControlRequest::GetHostClipboard));
+                Ok(super::ControlResponse::Clipboard {
+                    text: Some("clip".to_string()),
+                    seq: 1,
+                })
+            });
+        match res_get {
+            Some(super::ControlResponse::Clipboard { text, seq }) => {
+                assert_eq!(text.as_deref(), Some("clip"));
+                assert_eq!(seq, 1);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 }
