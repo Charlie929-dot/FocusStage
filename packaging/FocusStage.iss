@@ -1,8 +1,8 @@
 #ifndef AppVersion
-  #define AppVersion "0.1.1"
+  #define AppVersion "0.1.2"
 #endif
 #ifndef ReleaseTag
-  #define ReleaseTag "v0.1.1"
+  #define ReleaseTag "v0.1.2"
 #endif
 #ifndef PayloadDir
   #define PayloadDir "..\dist\payload"

@@ -5,6 +5,12 @@ All notable changes to FocusStage are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-11-28
+
+### Fixed
+
+- Added persistent stdio `focusstage control-bridge` subcommand (`mcp/src/main.rs`) and `WslControlBridge` (`tray/WslControlBridge.cs`) to replace periodic 1.2s `wsl.exe` spawning in the Windows tray (`RefreshStateAsync`, clipboard sync, quick-launch menu, and launcher app discovery), eliminating continuous WSL `/init` spawns and `/etc/resolv.conf` unlink/recreate churn while preserving automatic fallback for older `focusstage` binaries.
+
 ## [0.1.1] - 2026-11-27
 
 ### Changed
